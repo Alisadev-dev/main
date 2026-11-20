@@ -149,6 +149,7 @@ from capture_attestation import (
 from c2pa import (
     C2paParseError,
     C2paTrustStatus,
+    compute_privacy_flags,
     corroborate_binding,
     export_c2pa_manifest,
     parse_c2pa_manifest,
@@ -2475,6 +2476,7 @@ def create_app() -> Flask:
             "hashes_verified": bool(corroboration is not None and corroboration.ok),
             "hashes_compared": list(corroboration.compared_fields) if corroboration else [],
             "unknown_assertions": unknown,
+            "privacy_flags": compute_privacy_flags(parsed).to_dict(),
             "note": (
                 "C2PA trust status is independent of Harpocrates on-chain and ZK "
                 "verification. A matching 'expected' block is integrity "
