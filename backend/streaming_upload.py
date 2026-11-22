@@ -43,6 +43,111 @@ MIN_CHUNK_BYTES = 4_096  # 4 KiB
 MAX_CHUNK_BYTES = 1_048_576  # 1 MiB
 
 
+def _sanitize_progress_error(exc: Exception) -> str:
+    """Return a stable, path-free error message for client progress responses."""
+    if isinstance(exc, RequestEntityTooLarge):
+        return "Upload exceeds size limit"
+    return "Upload hashing failed"
+
+
+class UploadHashingProgress:
+    """Thread-safe bounded byte counter and completion state for upload hashing.
+
+    This object intentionally excludes all server filesystem locations
+    (temporary paths, destination paths, and raw OS error strings) so
+    snapshots can be safely returned in client responses.
+    """
+
+    def __init__(self, max_bytes: int = 0) -> None:
+        self._lock = threading.Lock()
+        self._max_bytes = max(0, int(max_bytes))
+        self._bytes_hashed = 0
+        self._chunks_processed = 0
+        self._completed = False
+        self._failed = False
+        self._digest: Optional[str] = None
+        self._error: Optional[str] = None
+
+    @property
+    def bytes_hashed(self) -> int:
+        with self._lock:
+            return self._bytes_hashed
+
+    @property
+    def max_bytes(self) -> int:
+        with self._lock:
+            return self._max_bytes
+
+    @property
+    def chunks_processed(self) -> int:
+        with self._lock:
+            return self._chunks_processed
+
+    @property
+    def completed(self) -> bool:
+        with self._lock:
+            return self._completed
+
+    @property
+    def failed(self) -> bool:
+        with self._lock:
+            return self._failed
+
+    @property
+    def digest(self) -> Optional[str]:
+        with self._lock:
+            return self._digest
+
+    @property
+    def error(self) -> Optional[str]:
+        with self._lock:
+            return self._error
+
+    def record_chunk(self, chunk_bytes: int) -> Dict[str, Any]:
+        """Record a hashed chunk, clamping ``bytes_hashed`` to ``max_bytes`` if set."""
+        with self._lock:
+            next_bytes = self._bytes_hashed + max(0, int(chunk_bytes))
+            if self._max_bytes > 0 and next_bytes > self._max_bytes:
+                next_bytes = self._max_bytes
+            self._bytes_hashed = next_bytes
+            self._chunks_processed += 1
+            return self._snapshot_locked()
+
+    def mark_completed(self, digest: str) -> Dict[str, Any]:
+        """Mark hashing as completed with the final hex digest."""
+        with self._lock:
+            self._completed = True
+            self._failed = False
+            self._digest = digest
+            self._error = None
+            return self._snapshot_locked()
+
+    def mark_failed(self, exc: Exception) -> Dict[str, Any]:
+        """Mark hashing as failed with a sanitized, path-free error message."""
+        with self._lock:
+            self._completed = False
+            self._failed = True
+            self._digest = None
+            self._error = _sanitize_progress_error(exc)
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> Dict[str, Any]:
+        return {
+            "bytes_hashed": self._bytes_hashed,
+            "max_bytes": self._max_bytes,
+            "chunks_processed": self._chunks_processed,
+            "completed": self._completed,
+            "failed": self._failed,
+            "digest": self._digest,
+            "error": self._error,
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-serializable snapshot without any filesystem paths."""
+        with self._lock:
+            return self._snapshot_locked()
+
+
 def clamp_chunk_bytes(value: int | None, *, enforce_min: bool = False) -> int:
     """Return a positive chunk size capped at ``MAX_CHUNK_BYTES``.
 
@@ -129,6 +234,9 @@ def hash_stream_to_path(
     expected = max(0, int(expected_size)) if expected_size is not None else None
     dest = Path(destination)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    tracker = progress or (
+        UploadHashingProgress(max_bytes=limit) if progress_callback is not None else None
+    )
 
     hasher = hashlib.sha256()
     bytes_written = 0
@@ -167,8 +275,17 @@ def hash_stream_to_path(
         # Atomic-ish replace into the final destination.
         shutil.move(str(tmp_path), str(dest))
         tmp_path = None
-        return hasher.hexdigest(), bytes_written
-    except Exception:
+        digest = hasher.hexdigest()
+        if tracker is not None:
+            snapshot = tracker.mark_completed(digest)
+            if progress_callback is not None:
+                progress_callback(snapshot)
+        return digest, bytes_written
+    except Exception as exc:
+        if tracker is not None:
+            snapshot = tracker.mark_failed(exc)
+            if progress_callback is not None:
+                progress_callback(snapshot)
         if tmp_path is not None and tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
         if dest.exists():
@@ -186,12 +303,17 @@ def hash_paths_concat(
     *,
     chunk_size: int | None = None,
     max_size: int | None = None,
+    progress: Optional[UploadHashingProgress] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[str, int]:
     """Concatenate *paths* into *destination* with bounded-chunk SHA-256 hashing."""
     bounded = resolve_chunk_bytes(chunk_size)
     limit = resolve_max_bytes(max_size)
     dest = Path(destination)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    tracker = progress or (
+        UploadHashingProgress(max_bytes=limit) if progress_callback is not None else None
+    )
 
     hasher = hashlib.sha256()
     bytes_written = 0
@@ -212,12 +334,25 @@ def hash_paths_concat(
                         out.write(chunk)
                         hasher.update(chunk)
                         bytes_written += len(chunk)
+                        if tracker is not None:
+                            snapshot = tracker.record_chunk(len(chunk))
+                            if progress_callback is not None:
+                                progress_callback(snapshot)
             out.flush()
             os.fsync(out.fileno())
         shutil.move(str(tmp_path), str(dest))
         tmp_path = None
-        return hasher.hexdigest(), bytes_written
-    except Exception:
+        digest = hasher.hexdigest()
+        if tracker is not None:
+            snapshot = tracker.mark_completed(digest)
+            if progress_callback is not None:
+                progress_callback(snapshot)
+        return digest, bytes_written
+    except Exception as exc:
+        if tracker is not None:
+            snapshot = tracker.mark_failed(exc)
+            if progress_callback is not None:
+                progress_callback(snapshot)
         if tmp_path is not None and tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
         if dest.exists():
@@ -267,6 +402,7 @@ class StreamingFileStorage(FileStorage):
         self._bytes_written = 0
         self._hash_computed = False
         self._digest: Optional[str] = None
+        self._progress = UploadHashingProgress(max_bytes=max_size)
 
     @property
     def chunk_size(self) -> int:
@@ -281,8 +417,23 @@ class StreamingFileStorage(FileStorage):
         """Hex SHA-256 digest once the stream has been fully consumed."""
         return self._digest if self._hash_computed else None
 
+    @property
+    def progress(self) -> UploadHashingProgress:
+        """Bounded upload hashing progress tracker (path-free)."""
+        return self._progress
+
+    def progress_snapshot(self) -> Dict[str, Any]:
+        """Return a JSON-serializable progress snapshot without filesystem paths."""
+        return self._progress.to_dict()
+
     
-    def save(self, dst, buffer_size: int = 16384) -> None:  # noqa: ARG002
+    def save(
+        self,
+        dst,
+        buffer_size: int = 16384,  # noqa: ARG002
+        *,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
         """Stream the upload to *dst* with bounded chunks and concurrent hashing.
 
         ``buffer_size`` is accepted for FileStorage API compatibility but the
