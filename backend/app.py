@@ -1126,8 +1126,46 @@ def create_app() -> Flask:
         if chunk_index < 0:
             return jsonify({"error": "chunk_index must be non-negative"}), 400
 
-        session_token, owner = _extract_upload_session_auth()
-        chunk_sha256 = (request.headers.get("X-Chunk-Sha256") or "").strip() or None
+        # Handle declared size consistency check
+        declared_size_header = request.headers.get("X-Declared-Size")
+        metadata_path = session_dir / "session.json"
+        
+        if declared_size_header is not None:
+            try:
+                declared_size = int(declared_size_header)
+                if declared_size < 0:
+                    return jsonify({"error": "X-Declared-Size must be non-negative"}), 400
+            except ValueError:
+                return jsonify({"error": "X-Declared-Size must be an integer"}), 400
+            
+            if metadata_path.exists():
+                # Session metadata exists, validate declared size matches
+                try:
+                    with metadata_path.open("r") as f:
+                        session_meta = json.load(f)
+                    stored_declared = session_meta.get("declared_size")
+                    if stored_declared is not None and stored_declared != declared_size:
+                        return jsonify({
+                            "error": "declared size mismatch",
+                            "expected": stored_declared,
+                            "received": declared_size
+                        }), 400
+                except (json.JSONDecodeError, OSError):
+                    # If metadata is corrupted, treat as no declared size
+                    pass
+            else:
+                # First chunk with declared size - store it
+                session_meta = {"declared_size": declared_size, "total_uploaded": 0}
+                try:
+                    with metadata_path.open("w") as f:
+                        json.dump(session_meta, f)
+                except OSError:
+                    pass  # Non-critical, continue without tracking
+
+        # Persist each session chunk with bounded-chunk hashing for integrity.
+        g.upload_config = config
+        streaming_chunk = create_streaming_file_storage(chunk)
+        chunk_path = session_dir / f"chunk-{chunk_index}"
         try:
             progress, total_bytes = upload_session_store.write_chunk(
                 session_id,
@@ -1139,10 +1177,25 @@ def create_app() -> Flask:
             )
         except RequestEntityTooLarge:
             return jsonify({"error": "chunk exceeds size limit"}), 413
-        except SessionNotFoundError:
-            return jsonify({"error": "session not found"}), 404
-        except UploadSessionError as exc:
-            return error_response(code=exc.code, message=str(exc), status=exc.status_code)
+
+        # Update total uploaded bytes if tracking
+        if metadata_path.exists():
+            try:
+                with metadata_path.open("r") as f:
+                    session_meta = json.load(f)
+                session_meta["total_uploaded"] = session_meta.get("total_uploaded", 0) + streaming_chunk.bytes_written
+                # Check if total exceeds declared size
+                declared = session_meta.get("declared_size")
+                if declared is not None and session_meta["total_uploaded"] > declared:
+                    return jsonify({
+                        "error": "total uploaded bytes exceeds declared size",
+                        "declared": declared,
+                        "uploaded": session_meta["total_uploaded"]
+                    }), 400
+                with metadata_path.open("w") as f:
+                    json.dump(session_meta, f)
+            except (json.JSONDecodeError, OSError):
+                pass  # Non-critical
 
         return jsonify({
             "ok": True,
@@ -1174,6 +1227,23 @@ def create_app() -> Flask:
             return jsonify({"error": "session not found"}), 404
         except UploadSessionError as exc:
             return error_response(code=exc.code, message=str(exc), status=exc.status_code)
+
+        # Validate declared size consistency at commit time
+        metadata_path = session_dir / "session.json"
+        if metadata_path.exists():
+            try:
+                with metadata_path.open("r") as f:
+                    session_meta = json.load(f)
+                declared = session_meta.get("declared_size")
+                total_uploaded = session_meta.get("total_uploaded", 0)
+                if declared is not None and total_uploaded != declared:
+                    return jsonify({
+                        "error": "total uploaded bytes does not match declared size",
+                        "declared": declared,
+                        "uploaded": total_uploaded
+                    }), 400
+            except (json.JSONDecodeError, OSError):
+                pass  # Non-critical
 
         metadata_raw = request.form.get("metadata")
         if metadata_raw is None:
