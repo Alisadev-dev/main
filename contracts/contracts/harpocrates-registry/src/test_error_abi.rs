@@ -149,14 +149,8 @@ fn canonical_name(err: RegistryError) -> &'static str {
         RegistryError::CircuitVersionMismatch => "CircuitVersionMismatch",
         RegistryError::ReporterDisputesSaturated => "ReporterDisputesSaturated",
         RegistryError::InsufficientApprovals => "InsufficientApprovals",
-        RegistryError::InvalidCursor => "InvalidCursor",
-        RegistryError::ListLimitExceeded => "ListLimitExceeded",
-        RegistryError::ExpiredCredentialRoot => "ExpiredCredentialRoot",
         RegistryError::RoleConflict => "RoleConflict",
-        RegistryError::InvalidInclusionProof => "InvalidInclusionProof",
-        RegistryError::IssuerQuotaExhausted => "IssuerQuotaExhausted",
-        RegistryError::LineageDepthMismatch => "LineageDepthMismatch",
-        RegistryError::LineageFanOutSaturated => "LineageFanOutSaturated",
+        RegistryError::ListLimitExceeded => "ListLimitExceeded",
     }
 }
 
@@ -253,14 +247,8 @@ const ALL_VARIANTS: &[RegistryError] = &[
     RegistryError::CircuitVersionMismatch,
     RegistryError::ReporterDisputesSaturated,
     RegistryError::InsufficientApprovals,
-    RegistryError::InvalidCursor,
-    RegistryError::ListLimitExceeded,
-    RegistryError::ExpiredCredentialRoot,
     RegistryError::RoleConflict,
-    RegistryError::InvalidInclusionProof,
-    RegistryError::IssuerQuotaExhausted,
-    RegistryError::LineageDepthMismatch,
-    RegistryError::LineageFanOutSaturated,
+    RegistryError::ListLimitExceeded,
 ];
 
 #[cfg(test)]
