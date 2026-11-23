@@ -75,16 +75,13 @@ All application-owned browser persistence must go through the wrappers in
 
 - `currentView`: the active navigation view
 - `selectedTier`: the active identity-tier selection
+- `vaultRecoveryRehearsed`: flag indicating whether the one-time vault recovery rehearsal has completed
 
 Credential or nullifier seeds, proof witnesses, generated proofs, raw private
 inputs, and every other field are prohibited from both `localStorage` and
 `sessionStorage`. Keep secret proof-generation data in memory only.
 
-The sole encrypted exception is `CredentialVault` (`src/credentialVault.ts`),
-which persists encrypted credential envelopes under `harpocrates:credential-vault`
-(current format `v: 2`, AES-GCM-256 with PBKDF2-SHA256 and version-bound AAD).
-Legacy `v: 1` envelopes are upgraded via staged migration (`vault.migrate(password)`
-or automatically during `vault.unlock(password)`):
-- Decrypts and validates the previous envelope into isolated memory before touching storage.
-- Encrypts and round-trip verifies the new `v: 2` envelope in isolated memory.
-- Preserves the previous encrypted envelope (including in `harpocrates:credential-vault:backup` during swap) until the new envelope verifies and primary storage readback succeeds.
+Credential seeds may be stored locally only in the encrypted VaultEnvelope
+managed by `CredentialVault`. To verify recovery preparedness without exposing
+live credentials, use `rehearseVaultRecovery()` which executes export and
+import roundtrips exclusively through isolated in-memory state containers.

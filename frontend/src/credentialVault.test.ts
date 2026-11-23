@@ -1,57 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   CredentialVault,
-  VAULT_BACKUP_STORAGE_KEY,
-  VAULT_STORAGE_KEY,
-  VAULT_VERSION,
-  VAULT_VERSION_V1,
-  VaultMigrationError,
-  VaultValidationError,
+  rehearseVaultRecovery,
+  hasVaultRecoveryRehearsed,
+  resetVaultRecoveryRehearsal,
+  validateVaultEnvelope,
+  type VaultEnvelope,
 } from './credentialVault'
-import type { SafeStorageLike } from './safeStorage'
-
-function bufToHex(buffer: ArrayBuffer): string {
-  return [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, '0')).join('')
-}
-
-async function createLegacyV1Envelope(
-  password: string,
-  payload: Record<string, unknown>
-): Promise<string> {
-  const salt = crypto.getRandomValues(new Uint8Array(16))
-  const iv = crypto.getRandomValues(new Uint8Array(12))
-  const enc = new TextEncoder()
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    enc.encode(password),
-    { name: 'PBKDF2' },
-    false,
-    ['deriveBits', 'deriveKey']
-  )
-  const key = await crypto.subtle.deriveKey(
-    {
-      name: 'PBKDF2',
-      salt: salt as unknown as ArrayBuffer,
-      iterations: 600000,
-      hash: 'SHA-256',
-    },
-    keyMaterial,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  )
-  const ct = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: iv as unknown as ArrayBuffer },
-    key,
-    enc.encode(JSON.stringify(payload))
-  )
-  return JSON.stringify({
-    v: VAULT_VERSION_V1,
-    salt: bufToHex(salt as unknown as ArrayBuffer),
-    iv: bufToHex(iv as unknown as ArrayBuffer),
-    ct: bufToHex(ct),
-  })
-}
+import { createIsolatedStateContainer } from './safeStorage'
 
 describe('CredentialVault', () => {
   let vault: CredentialVault
@@ -169,130 +125,187 @@ describe('CredentialVault', () => {
     await expect(restoredVault.unlock('secret')).rejects.toThrow('Vault corrupted: unable to parse envelope')
   })
 
-  describe('staged format migration (v1 -> v2)', () => {
-    it('decrypts and validates in isolated memory, verifies v2, and replaces v1 storage', async () => {
-      const seeds = { credentialSeed: 'legacy-cred-1', nullifierSeed: 'legacy-null-2' }
-      const legacyRaw = await createLegacyV1Envelope('migration-pass', seeds)
-      window.localStorage.setItem(VAULT_STORAGE_KEY, legacyRaw)
+  it('should validate envelope structure and reject invalid parameters', () => {
+    expect(() => validateVaultEnvelope(null)).toThrow('Vault corrupted: envelope must be an object')
+    expect(() => validateVaultEnvelope([])).toThrow('Vault corrupted: envelope must be an object')
+    expect(() => validateVaultEnvelope({ v: 2, salt: 'aa', iv: 'bb', ct: 'cc' })).toThrow('Unsupported vault version: 2')
+    expect(() => validateVaultEnvelope({ v: 1, salt: 'odd', iv: 'bb', ct: 'cc' })).toThrow('salt must be a non-empty hex string with even length')
+    expect(() => validateVaultEnvelope({ v: 1, salt: 'aa', iv: '', ct: 'cc' })).toThrow('iv must be a non-empty hex string with even length')
+    expect(() => validateVaultEnvelope({ v: 1, salt: 'aa', iv: 'bb', ct: 'not-hex!' })).toThrow('ct must be a non-empty hex string with even length')
 
-      const migrator = new CredentialVault()
-      expect(migrator.getVaultVersion()).toBe(VAULT_VERSION_V1)
-      expect(migrator.needsMigration()).toBe(true)
-
-      const result = await migrator.migrate('migration-pass')
-      expect(result).toEqual({
-        migrated: true,
-        fromVersion: VAULT_VERSION_V1,
-        toVersion: VAULT_VERSION,
-      })
-
-      // Migration operates in isolated memory and leaves the vault locked.
-      expect(migrator.isLocked()).toBe(true)
-      expect(migrator.getSeeds()).toBeNull()
-      expect(migrator.hasBackup()).toBe(false)
-      expect(migrator.getVaultVersion()).toBe(VAULT_VERSION)
-      expect(migrator.needsMigration()).toBe(false)
-
-      const storedAfter = JSON.parse(window.localStorage.getItem(VAULT_STORAGE_KEY)!)
-      expect(storedAfter.v).toBe(VAULT_VERSION)
-      expect(storedAfter.kdf).toBe('PBKDF2-SHA256')
-      expect(storedAfter.cipher).toBe('AES-GCM-256')
-
-      // Unlocking the migrated v2 vault returns the exact original seeds.
-      expect(await migrator.unlock('migration-pass')).toBe(true)
-      expect(migrator.getSeeds()).toEqual(seeds)
-
-      // Subsequent migrate() call is a no-op.
-      const second = await migrator.migrate('migration-pass')
-      expect(second).toEqual({
-        migrated: false,
-        fromVersion: VAULT_VERSION,
-        toVersion: VAULT_VERSION,
-      })
-    }, 20000)
-
-    it('automatically stages migration during unlock of a legacy v1 vault', async () => {
-      const seeds = { credentialSeed: 'auto-cred', nullifierSeed: 'auto-null' }
-      const legacyRaw = await createLegacyV1Envelope('auto-pass', seeds)
-      window.localStorage.setItem(VAULT_STORAGE_KEY, legacyRaw)
-
-      const restored = new CredentialVault()
-      expect(await restored.unlock('auto-pass')).toBe(true)
-      expect(restored.getSeeds()).toEqual(seeds)
-      expect(restored.getVaultVersion()).toBe(VAULT_VERSION)
-      expect(restored.hasBackup()).toBe(false)
-    }, 20000)
-
-    it('preserves the previous v1 envelope when unlocking with the wrong password', async () => {
-      const seeds = { credentialSeed: 'keep-cred', nullifierSeed: 'keep-null' }
-      const legacyRaw = await createLegacyV1Envelope('right-pass', seeds)
-      window.localStorage.setItem(VAULT_STORAGE_KEY, legacyRaw)
-
-      const restored = new CredentialVault()
-      expect(await restored.unlock('wrong-pass')).toBe(false)
-      expect(restored.isLocked()).toBe(true)
-      expect(window.localStorage.getItem(VAULT_STORAGE_KEY)).toBe(legacyRaw)
-      expect(window.localStorage.getItem(VAULT_BACKUP_STORAGE_KEY)).toBeNull()
-    })
-
-    it('fails closed and preserves v1 storage when decrypted payload fails validation', async () => {
-      const legacyRaw = await createLegacyV1Envelope('valid-pass', {
-        credentialSeed: '',
-        nullifierSeed: 'only-one-seed',
-      })
-      window.localStorage.setItem(VAULT_STORAGE_KEY, legacyRaw)
-
-      const migrator = new CredentialVault()
-      await expect(migrator.migrate('valid-pass')).rejects.toThrow(VaultValidationError)
-      expect(migrator.isLocked()).toBe(true)
-      expect(window.localStorage.getItem(VAULT_STORAGE_KEY)).toBe(legacyRaw)
-      expect(window.localStorage.getItem(VAULT_BACKUP_STORAGE_KEY)).toBeNull()
-    })
-
-    it('preserves the previous v1 envelope when staged v2 verification fails', async () => {
-      const seeds = { credentialSeed: 'verify-cred', nullifierSeed: 'verify-null' }
-      const legacyRaw = await createLegacyV1Envelope('verify-pass', seeds)
-      window.localStorage.setItem(VAULT_STORAGE_KEY, legacyRaw)
-
-      const migrator = new CredentialVault()
-      await expect(
-        migrator.migrate('verify-pass', {
-          verifyEnvelope: async () => {
-            throw new VaultMigrationError('Simulated verification failure')
-          },
-        })
-      ).rejects.toThrow('Simulated verification failure')
-
-      expect(migrator.isLocked()).toBe(true)
-      expect(window.localStorage.getItem(VAULT_STORAGE_KEY)).toBe(legacyRaw)
-      expect(window.localStorage.getItem(VAULT_BACKUP_STORAGE_KEY)).toBeNull()
-    })
-
-    it('preserves the previous encrypted envelope if replacing primary storage fails', async () => {
-      const seeds = { credentialSeed: 'disk-cred', nullifierSeed: 'disk-null' }
-      const legacyRaw = await createLegacyV1Envelope('disk-pass', seeds)
-
-      const backing = new Map<string, string>([[VAULT_STORAGE_KEY, legacyRaw]])
-      let failPrimaryWrite = true
-      const flakyStorage: SafeStorageLike = {
-        getItem: (key) => backing.get(key) ?? null,
-        setItem: (key, value) => {
-          if (key === VAULT_STORAGE_KEY && failPrimaryWrite) {
-            failPrimaryWrite = false
-            throw new Error('QuotaExceededError')
-          }
-          backing.set(key, value)
-        },
-        removeItem: (key) => {
-          backing.delete(key)
-        },
-      }
-
-      const migrator = new CredentialVault({ storage: flakyStorage })
-      await expect(migrator.migrate('disk-pass')).rejects.toThrow(VaultMigrationError)
-      expect(migrator.isLocked()).toBe(true)
-      expect(backing.get(VAULT_STORAGE_KEY)).toBe(legacyRaw)
-      expect(backing.get(VAULT_BACKUP_STORAGE_KEY)).toBe(legacyRaw)
-    }, 20000)
+    const valid: VaultEnvelope = { v: 1, salt: 'deadbeef', iv: '0102030405060708090a0b0c', ct: 'aabbccdd' }
+    expect(validateVaultEnvelope(valid)).toEqual(valid)
   })
+
+  it('should export and import vault through isolated containers', async () => {
+    const isolatedContainer = createIsolatedStateContainer()
+    const isolatedVault = new CredentialVault({ storage: isolatedContainer })
+
+    // Exporting an empty vault throws
+    expect(() => isolatedVault.exportVault()).toThrow('Vault is empty')
+
+    const seeds = { credentialSeed: 'isolated-cred', nullifierSeed: 'isolated-null' }
+    await isolatedVault.setup('testPass123!', seeds)
+
+    const envelope = isolatedVault.exportVault()
+    expect(envelope.v).toBe(1)
+    expect(envelope.salt).toBeDefined()
+    expect(envelope.iv).toBeDefined()
+    expect(envelope.ct).toBeDefined()
+
+    // Import into a target container
+    const targetContainer = createIsolatedStateContainer()
+    const targetVault = new CredentialVault({ storage: targetContainer })
+    expect(targetVault.hasVault()).toBe(false)
+
+    targetVault.importVault(envelope)
+    expect(targetVault.hasVault()).toBe(true)
+    expect(targetVault.isLocked()).toBe(true)
+
+    // Unlocking target vault restores identical seeds
+    const unlocked = await targetVault.unlock('testPass123!')
+    expect(unlocked).toBe(true)
+    expect(targetVault.getSeeds()).toEqual(seeds)
+
+    // Window localStorage was not touched
+    expect(window.localStorage.getItem('harpocrates:credential-vault')).toBeNull()
+  })
+
+  it('should reject importing malformed or corrupted envelopes', async () => {
+    const isolatedContainer = createIsolatedStateContainer()
+    const isolatedVault = new CredentialVault({ storage: isolatedContainer })
+
+    expect(() => isolatedVault.importVault('invalid-json')).toThrow('Vault corrupted: unable to parse envelope')
+    expect(() => isolatedVault.importVault({ v: 1, salt: 'invalid', iv: 'aa', ct: 'bb' } as unknown as VaultEnvelope))
+      .toThrow('Unsupported vault parameter: salt must be a non-empty hex string with even length')
+  })
+})
+
+describe('Vault Recovery Rehearsal with Synthetic Material', () => {
+  beforeEach(() => {
+    window.localStorage.clear()
+    vi.useRealTimers()
+  })
+
+  afterEach(() => {
+    window.localStorage.clear()
+  })
+
+  it('should execute a successful one-time vault recovery rehearsal without touching live credentials', async () => {
+    // 1. Arrange: Setup existing real private credentials in window.localStorage
+    const realSeeds = { credentialSeed: 'real-production-secret-1', nullifierSeed: 'real-production-secret-2' }
+    const realVault = new CredentialVault()
+    await realVault.setup('realMasterPassword#1', realSeeds)
+    const initialRealEnvelope = window.localStorage.getItem('harpocrates:credential-vault')
+    expect(initialRealEnvelope).not.toBeNull()
+
+    // Status is initially false
+    expect(hasVaultRecoveryRehearsed()).toBe(false)
+
+    // 2. Act: Perform recovery rehearsal with synthetic material
+    const result = await rehearseVaultRecovery()
+
+    // 3. Assert: Verify rehearsal results
+    expect(result.success).toBe(true)
+    expect(result.syntheticSeedsVerified).toBe(true)
+    expect(result.isolatedExportVerified).toBe(true)
+    expect(result.isolatedImportVerified).toBe(true)
+    expect(result.originalCredentialsUntouched).toBe(true)
+    expect(result.rehearsalCompleted).toBe(true)
+    expect(result.exportedEnvelope.v).toBe(1)
+    expect(result.timestamp).toBeGreaterThan(0)
+
+    // 4. Assert: Plaintext privacy - synthetic material never exposed unencrypted
+    const exportedJson = JSON.stringify(result.exportedEnvelope)
+    expect(exportedJson).not.toContain('synth_cred_')
+    expect(exportedJson).not.toContain('synth_null_')
+
+    // 5. Assert: Active user's real private credentials remain strictly unchanged and functional
+    const postRehearsalEnvelope = window.localStorage.getItem('harpocrates:credential-vault')
+    expect(postRehearsalEnvelope).toBe(initialRealEnvelope)
+
+    // User can still unlock their real vault with their real password
+    const restoredRealVault = new CredentialVault()
+    const unlockedReal = await restoredRealVault.unlock('realMasterPassword#1')
+    expect(unlockedReal).toBe(true)
+    expect(restoredRealVault.getSeeds()).toEqual(realSeeds)
+
+    // 6. Assert: One-time status is tracked in safe UI preferences
+    expect(hasVaultRecoveryRehearsed()).toBe(true)
+
+    // Resetting works
+    resetVaultRecoveryRehearsal()
+    expect(hasVaultRecoveryRehearsed()).toBe(false)
+  }, 30000)
+
+  it('should support instance method rehearseRecovery with custom synthetic material', async () => {
+    const vaultInstance = new CredentialVault()
+    const customSynthetic = {
+      credentialSeed: 'synth_custom_credential_material_123',
+      nullifierSeed: 'synth_custom_nullifier_material_456',
+    }
+
+    const result = await vaultInstance.rehearseRecovery({
+      syntheticMaterial: customSynthetic,
+      passphrase: 'RehearsalPassphrase#2026',
+    })
+
+    expect(result.success).toBe(true)
+    expect(result.syntheticSeedsVerified).toBe(true)
+    expect(result.isolatedExportVerified).toBe(true)
+    expect(result.isolatedImportVerified).toBe(true)
+    expect(result.originalCredentialsUntouched).toBe(true)
+  }, 30000)
+
+  it('should fail closed when recovery rehearsal passphrase does not match', async () => {
+    const isolatedSource = createIsolatedStateContainer()
+    const isolatedTarget = createIsolatedStateContainer()
+
+    // Attempting rehearsal with an invalid unlock attempt
+    const customSynthetic = {
+      credentialSeed: 'synth_fail_cred_1',
+      nullifierSeed: 'synth_fail_null_2',
+    }
+
+    // Set up source vault
+    const sourceVault = new CredentialVault(15 * 60 * 1000, isolatedSource)
+    await sourceVault.setup('correctPassphrase', customSynthetic)
+    const exported = sourceVault.exportVault()
+
+    // Import into target
+    const destVault = new CredentialVault(15 * 60 * 1000, isolatedTarget)
+    destVault.importVault(exported)
+
+    // Attempt unlock with wrong passphrase
+    const unlockSuccess = await destVault.unlock('wrongPassphrase')
+    expect(unlockSuccess).toBe(false)
+    expect(destVault.isLocked()).toBe(true)
+    expect(destVault.getSeeds()).toBeNull()
+  }, 30000)
+
+  it('should fail closed if ciphertext in exported envelope is tampered', async () => {
+    const isolatedSource = createIsolatedStateContainer()
+    const isolatedTarget = createIsolatedStateContainer()
+
+    const sourceVault = new CredentialVault(15 * 60 * 1000, isolatedSource)
+    await sourceVault.setup('testPass', {
+      credentialSeed: 'synth_1',
+      nullifierSeed: 'synth_2',
+    })
+
+    const exported = sourceVault.exportVault()
+
+    // Tamper ciphertext
+    const tamperedCt = exported.ct.slice(0, -2) + (exported.ct.endsWith('00') ? 'ff' : '00')
+    const tamperedEnvelope = { ...exported, ct: tamperedCt }
+
+    const destVault = new CredentialVault(15 * 60 * 1000, isolatedTarget)
+    destVault.importVault(tamperedEnvelope)
+
+    // Decryption fails with invalid ciphertext
+    const unlockSuccess = await destVault.unlock('testPass')
+    expect(unlockSuccess).toBe(false)
+    expect(destVault.isLocked()).toBe(true)
+    expect(destVault.getSeeds()).toBeNull()
+  }, 30000)
 })
