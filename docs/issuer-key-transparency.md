@@ -77,14 +77,21 @@ Use `explain_historical_key_validity(directory, key_id, signature_timestamp, max
 
 The registry expresses the same window on chain: `rotate_issuer` retires the predecessor key immediately (it can no longer sign new seals, directly or through a delegation) and records a bounded `grace_expires_at` during which `is_issuer_verifiable(predecessor)` keeps pre-rotation evidence verifiable. The window lapses on its own against ledger time and `finalize_issuer_rotation` settles the record. Because the on-chain window is capped by `MAX_ISSUER_ROTATION_GRACE_SECS`, a retired key’s manifest `validUntil` should not be set beyond that bound; `revoke_issuer` and `add_issuer` clear the on-chain record, so a compromised or re-onboarded key is never covered by a stale grace window.
 
-## Trust-policy simulation report
+## Trust changes across verification runs
 
-Operators can preview trust-policy changes against synthetic or captured evidence attestations (`CaptureAttestation`) before activating a new policy version using `simulate_trust_policy` in `backend/issuer_key_transparency.py`:
+Use `assess_issuer_trust(directory, key_id, ...)` to evaluate an issuer key for a single verification run and `compare_issuer_trust(previous, current, ...)` to explain why trust changed between runs without collapsing distinct causes into a generic invalid-issuer error.
 
-- **Inputs**: an iterable of `CapturedEvidenceSample` records (bounded by `MAX_SIMULATION_ITEMS`), an immutable baseline `TrustPolicy` (the active policy), an immutable candidate `TrustPolicy`, and optional `IssuerDirectory` / `DirectoryCache` / `now` context.
-- **Non-mutating**: both `TrustPolicy` objects, the directory, and the checkpoint cache are read-only; the report explicitly records `activePolicyMutated: false`.
-- **Fail-closed evaluation**: `evaluate_captured_evidence` checks trust levels, privacy scopes, app signing digest requirements, secure-time source and drift bounds, camera pipeline integrity claims, historical issuer key validity / rotation / compromise rules, and checkpoint freshness (standard and high-assurance). Missing directory or signature timestamp context for keyed samples fails closed.
-- **Canonical privacy-preserving output**: `PolicySimulationReport` includes summary counts (`totalEvaluated`, `unchangedCount`, `changedCount`, `newlyRejectedCount`, `newlyAcceptedCount`, `reasonChangedCount`) and only the changed outcomes (`changes`) identified by `evidenceId` and `attestationHash` (never `captureNonce`, `deviceCommitment`, or raw PII). Use `canonicalize_simulation_report` and `simulation_report_hash` for deterministic digests.
+- **States (`TrustState`)**: `trusted`, `historically_valid`, `untrusted`, `stale`.
+- **Reasons (`TrustChangeReason`)**:
+  - `unchanged` — trust state and reason did not change between runs.
+  - `activated` — key is active and within its validity window.
+  - `key_rotated` — key was rotated to a successor (`successorKeyId` populated); pre-rotation historical signatures remain `historically_valid`.
+  - `key_expired` — key or manifest `validUntil` window elapsed.
+  - `key_retired` — key was explicitly retired (optional opaque `reasonHash`).
+  - `key_compromised` — key was marked compromised (optional opaque `reasonHash`); pre-compromise signatures remain `historically_valid` while surfacing compromise status.
+  - `stale_directory` — cached checkpoint exceeded its standard or high-assurance freshness window (fail-closed `stale` state).
+  - `directory_inconsistent` — checkpoint consistency check or cross-run rollback/equivocation check failed.
+  - `unknown_key` / `not_yet_valid` — key missing from directory or signature predates `validFrom`.
 
 ## Operational procedures
 

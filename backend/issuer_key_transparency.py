@@ -75,6 +75,26 @@ class KeyStatus(str, Enum):
     RETIRED = "retired"
 
 
+class TrustState(str, Enum):
+    TRUSTED = "trusted"
+    HISTORICALLY_VALID = "historically_valid"
+    UNTRUSTED = "untrusted"
+    STALE = "stale"
+
+
+class TrustChangeReason(str, Enum):
+    UNCHANGED = "unchanged"
+    ACTIVATED = "activated"
+    KEY_ROTATED = "key_rotated"
+    KEY_EXPIRED = "key_expired"
+    KEY_RETIRED = "key_retired"
+    KEY_COMPROMISED = "key_compromised"
+    STALE_DIRECTORY = "stale_directory"
+    DIRECTORY_INCONSISTENT = "directory_inconsistent"
+    UNKNOWN_KEY = "unknown_key"
+    NOT_YET_VALID = "not_yet_valid"
+
+
 class EventType(str, Enum):
     ACTIVATION = "activation"
     ROTATION = "rotation"
@@ -940,747 +960,346 @@ def create_rotation_event(
 
 
 @dataclass(frozen=True)
-class KeyLifecycleChange:
-    """Proposed key lifecycle transition reported by a directory import preview."""
+class IssuerTrustAssessment:
+    """Structured issuer trust evaluation for a single verification run."""
 
     key_id: str
-    public_key_hash: str
-    previous_status: KeyStatus | None
-    proposed_status: KeyStatus
-    event_types: tuple[EventType, ...]
-    valid_from: int
-    valid_until: int | None = None
-    related_key_id: str | None = None
+    organization_identity_hash: str
+    state: TrustState
+    reason: TrustChangeReason
+    verified_at: int
+    signature_timestamp: int
+    key_status: KeyStatus | None = None
+    successor_key_id: str | None = None
+    reason_hash: str | None = None
+    checkpoint_event_count: int | None = None
+    checkpoint_age_seconds: int | None = None
+    high_assurance: bool = False
+    consistency_errors: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
-            "eventTypes": [et.value for et in self.event_types],
+            "highAssurance": self.high_assurance,
             "keyId": self.key_id,
-            "previousStatus": self.previous_status.value if self.previous_status else None,
-            "proposedStatus": self.proposed_status.value,
-            "publicKeyHash": self.public_key_hash,
-            "validFrom": self.valid_from,
+            "organizationIdentityHash": self.organization_identity_hash,
+            "reason": self.reason.value,
+            "signatureTimestamp": self.signature_timestamp,
+            "state": self.state.value,
+            "verifiedAt": self.verified_at,
         }
-        if self.valid_until is not None:
-            d["validUntil"] = self.valid_until
-        if self.related_key_id is not None:
-            d["relatedKeyId"] = self.related_key_id
+        if self.key_status is not None:
+            d["keyStatus"] = self.key_status.value
+        if self.successor_key_id is not None:
+            d["successorKeyId"] = self.successor_key_id
+        if self.reason_hash is not None:
+            d["reasonHash"] = self.reason_hash
+        if self.checkpoint_event_count is not None:
+            d["checkpointEventCount"] = self.checkpoint_event_count
+        if self.checkpoint_age_seconds is not None:
+            d["checkpointAgeSeconds"] = self.checkpoint_age_seconds
+        if self.consistency_errors:
+            d["consistencyErrors"] = list(self.consistency_errors)
         return d
 
 
 @dataclass(frozen=True)
-class CheckpointLineage:
-    """Before/after checkpoint and manifest lineage for a directory import preview."""
+class IssuerTrustChange:
+    """Explains why an issuer key's trust state changed across verification runs."""
 
+    key_id: str
     organization_identity_hash: str
-    current_event_count: int
-    proposed_event_count: int
-    added_event_count: int
-    current_tree_head_hash: str
-    proposed_tree_head_hash: str
-    current_manifest_hash: str | None
-    proposed_manifest_hash: str | None
-    manifest_chain_hashes: tuple[str, ...]
-    previously_seen_checkpoint_hash: str | None = None
-    incoming_checkpoint_hash: str | None = None
-    incoming_checkpoint_event_count: int | None = None
-    incoming_checkpoint_tree_head_hash: str | None = None
-    extends_current_head: bool = True
+    changed: bool
+    previous_state: TrustState
+    current_state: TrustState
+    reason: TrustChangeReason
+    previous_verified_at: int
+    current_verified_at: int
+    successor_key_id: str | None = None
+    reason_hash: str | None = None
+    rollback_errors: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
-            "addedEventCount": self.added_event_count,
-            "currentEventCount": self.current_event_count,
-            "currentManifestHash": self.current_manifest_hash,
-            "currentTreeHeadHash": self.current_tree_head_hash,
-            "extendsCurrentHead": self.extends_current_head,
-            "manifestChainHashes": list(self.manifest_chain_hashes),
+            "changed": self.changed,
+            "currentState": self.current_state.value,
+            "currentVerifiedAt": self.current_verified_at,
+            "keyId": self.key_id,
             "organizationIdentityHash": self.organization_identity_hash,
-            "proposedEventCount": self.proposed_event_count,
-            "proposedManifestHash": self.proposed_manifest_hash,
-            "proposedTreeHeadHash": self.proposed_tree_head_hash,
+            "previousState": self.previous_state.value,
+            "previousVerifiedAt": self.previous_verified_at,
+            "reason": self.reason.value,
         }
-        if self.previously_seen_checkpoint_hash is not None:
-            d["previouslySeenCheckpointHash"] = self.previously_seen_checkpoint_hash
-        if self.incoming_checkpoint_hash is not None:
-            d["incomingCheckpointHash"] = self.incoming_checkpoint_hash
-        if self.incoming_checkpoint_event_count is not None:
-            d["incomingCheckpointEventCount"] = self.incoming_checkpoint_event_count
-        if self.incoming_checkpoint_tree_head_hash is not None:
-            d["incomingCheckpointTreeHeadHash"] = self.incoming_checkpoint_tree_head_hash
+        if self.successor_key_id is not None:
+            d["successorKeyId"] = self.successor_key_id
+        if self.reason_hash is not None:
+            d["reasonHash"] = self.reason_hash
+        if self.rollback_errors:
+            d["rollbackErrors"] = list(self.rollback_errors)
         return d
 
 
-@dataclass(frozen=True)
-class DirectoryImportPreview:
-    """Non-mutating preview of a proposed issuer directory import."""
-
-    organization_identity_hash: str
-    acceptable: bool
-    errors: tuple[str, ...]
-    key_changes: tuple[KeyLifecycleChange, ...]
-    checkpoint_lineage: CheckpointLineage
-    proposed_events: tuple[DirectoryEvent, ...]
-    proposed_manifests: tuple[IssuerManifest, ...]
-    incoming_checkpoint: DirectoryCheckpoint | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "acceptable": self.acceptable,
-            "checkpointLineage": self.checkpoint_lineage.to_dict(),
-            "errors": list(self.errors),
-            "keyChanges": [c.to_dict() for c in self.key_changes],
-            "organizationIdentityHash": self.organization_identity_hash,
-        }
-
-
-def _clone_directory(directory: IssuerDirectory) -> IssuerDirectory:
-    clone = IssuerDirectory(
-        organization_identity_hash=directory.organization_identity_hash,
-        events=list(directory.events),
-        keys=dict(directory.keys),
-        current_manifest=directory.current_manifest,
-        manifests_by_hash=dict(directory.manifests_by_hash),
-    )
-    return clone
-
-
-def preview_directory_import(
-    current_directory: IssuerDirectory,
-    incoming_events: list[DirectoryEvent],
-    *,
-    incoming_manifests: list[IssuerManifest] | None = None,
-    incoming_checkpoint: DirectoryCheckpoint | None = None,
-    previously_seen_checkpoint: DirectoryCheckpoint | None = None,
-) -> DirectoryImportPreview:
-    """Preview proposed key lifecycle changes and checkpoint lineage without mutating trust state.
-
-    Accepts either a full event log starting at sequence 0 (whose prefix must match
-    `current_directory.events`) or delta events starting at `len(current_directory.events)`.
-    No mutation is performed on `current_directory`; call `apply_directory_import` only
-    after reviewing and accepting a valid preview.
-    """
-    errors: list[str] = []
-    extends_current_head = True
-    current_count = len(current_directory.events)
-    current_head = current_directory.tree_head()
-    current_mh = (
-        manifest_hash(current_directory.current_manifest)
-        if current_directory.current_manifest is not None
-        else None
-    )
-
-    # Determine delta events while checking prefix consistency / rollback.
-    delta_events: list[DirectoryEvent] = []
-    if incoming_events:
-        first_seq = incoming_events[0].sequence
-        if current_count > 0 and first_seq == 0:
-            if len(incoming_events) < current_count:
-                errors.append("incoming event log shorter than current directory (rollback)")
-                extends_current_head = False
-            else:
-                for idx in range(current_count):
-                    if event_hash(incoming_events[idx]) != event_hash(current_directory.events[idx]):
-                        errors.append(
-                            f"incoming event log diverges from current directory at sequence {idx} (split view)"
-                        )
-                        extends_current_head = False
-                        break
-                if extends_current_head:
-                    delta_events = list(incoming_events[current_count:])
-        else:
-            delta_events = list(incoming_events)
-
-    # Filter out already-published manifests if a full manifest history was supplied.
-    delta_manifests: list[IssuerManifest] = []
-    for manifest in incoming_manifests or []:
-        try:
-            mh = manifest_hash(manifest)
-        except TransparencyError as exc:
-            errors.append(str(exc))
-            continue
-        if mh not in current_directory.manifests_by_hash:
-            delta_manifests.append(manifest)
-
-    candidate = _clone_directory(current_directory)
-    applied_events: list[DirectoryEvent] = []
-    applied_manifests: list[IssuerManifest] = []
-    manifest_chain_hashes: list[str] = []
-
-    if extends_current_head:
-        for ev in delta_events:
-            try:
-                candidate.append_event(ev)
-                applied_events.append(ev)
-            except TransparencyError as exc:
-                errors.append(str(exc))
-                extends_current_head = False
-                break
-
-        for manifest in delta_manifests:
-            try:
-                mh = candidate.publish_manifest(manifest)
-                applied_manifests.append(manifest)
-                manifest_chain_hashes.append(mh)
-            except TransparencyError as exc:
-                errors.append(str(exc))
-                break
-
-    # Checkpoint lineage and rollback/equivocation checks.
-    if incoming_checkpoint is not None:
-        errors.extend(verify_checkpoint_consistency(candidate, incoming_checkpoint))
-        if previously_seen_checkpoint is not None:
-            errors.extend(detect_rollback(previously_seen_checkpoint, incoming_checkpoint))
-    elif previously_seen_checkpoint is not None:
-        if len(candidate.events) < previously_seen_checkpoint.event_count:
-            errors.append("candidate directory shorter than previously seen checkpoint (rollback)")
-            extends_current_head = False
-        else:
-            prefix_head = compute_tree_head(
-                candidate.events[: previously_seen_checkpoint.event_count]
-            )
-            if prefix_head != previously_seen_checkpoint.tree_head_hash:
-                errors.append(
-                    "candidate directory diverges from previously seen checkpoint (split view)"
-                )
-                extends_current_head = False
-
-    # Compute proposed key lifecycle changes by comparing current vs candidate state.
-    events_by_key: dict[str, list[EventType]] = {}
-    related_by_key: dict[str, str] = {}
-    for ev in applied_events:
-        if ev.event_type == EventType.CHECKPOINT:
-            continue
-        events_by_key.setdefault(ev.key_id, []).append(ev.event_type)
-        if ev.related_key_id:
-            related_by_key[ev.key_id] = ev.related_key_id
-            events_by_key.setdefault(ev.related_key_id, []).append(ev.event_type)
-
-    key_changes: list[KeyLifecycleChange] = []
-    for key_id in sorted(set(current_directory.keys) | set(candidate.keys)):
-        before = current_directory.keys.get(key_id)
-        after = candidate.keys.get(key_id)
-        if after is None:
-            continue
-        if before != after:
-            key_changes.append(
-                KeyLifecycleChange(
-                    key_id=key_id,
-                    public_key_hash=after.public_key_hash,
-                    previous_status=before.status if before is not None else None,
-                    proposed_status=after.status,
-                    event_types=tuple(events_by_key.get(key_id, ())),
-                    valid_from=after.valid_from,
-                    valid_until=after.valid_until,
-                    related_key_id=related_by_key.get(key_id),
-                )
-            )
-
-    proposed_mh = (
-        manifest_hash(candidate.current_manifest)
-        if candidate.current_manifest is not None
-        else None
-    )
-    lineage = CheckpointLineage(
-        organization_identity_hash=current_directory.organization_identity_hash,
-        current_event_count=current_count,
-        proposed_event_count=len(candidate.events),
-        added_event_count=len(applied_events),
-        current_tree_head_hash=current_head,
-        proposed_tree_head_hash=candidate.tree_head(),
-        current_manifest_hash=current_mh,
-        proposed_manifest_hash=proposed_mh,
-        manifest_chain_hashes=tuple(manifest_chain_hashes),
-        previously_seen_checkpoint_hash=(
-            checkpoint_hash(previously_seen_checkpoint)
-            if previously_seen_checkpoint is not None
-            else None
-        ),
-        incoming_checkpoint_hash=(
-            checkpoint_hash(incoming_checkpoint) if incoming_checkpoint is not None else None
-        ),
-        incoming_checkpoint_event_count=(
-            incoming_checkpoint.event_count if incoming_checkpoint is not None else None
-        ),
-        incoming_checkpoint_tree_head_hash=(
-            incoming_checkpoint.tree_head_hash if incoming_checkpoint is not None else None
-        ),
-        extends_current_head=extends_current_head and not errors,
-    )
-
-    return DirectoryImportPreview(
-        organization_identity_hash=current_directory.organization_identity_hash,
-        acceptable=len(errors) == 0,
-        errors=tuple(errors),
-        key_changes=tuple(key_changes),
-        checkpoint_lineage=lineage,
-        proposed_events=tuple(applied_events),
-        proposed_manifests=tuple(applied_manifests),
-        incoming_checkpoint=incoming_checkpoint,
-    )
-
-
-def apply_directory_import(
+def _find_key_lifecycle_metadata(
     directory: IssuerDirectory,
-    preview: DirectoryImportPreview,
-) -> IssuerDirectory:
-    """Apply an accepted directory import preview to `directory` (fail-closed)."""
-    if not preview.acceptable:
-        raise TransparencyError(
-            "cannot apply rejected directory import preview: " + "; ".join(preview.errors)
-        )
-    lineage = preview.checkpoint_lineage
-    if directory.organization_identity_hash != preview.organization_identity_hash:
-        raise TransparencyError("directory organizationIdentityHash mismatch")
-    if (
-        len(directory.events) != lineage.current_event_count
-        or directory.tree_head() != lineage.current_tree_head_hash
-    ):
-        raise TransparencyError("directory state changed since preview was generated")
-    current_mh = (
-        manifest_hash(directory.current_manifest)
-        if directory.current_manifest is not None
-        else None
-    )
-    if current_mh != lineage.current_manifest_hash:
-        raise TransparencyError("directory manifest changed since preview was generated")
-
-    for ev in preview.proposed_events:
-        directory.append_event(ev)
-    for manifest in preview.proposed_manifests:
-        directory.publish_manifest(manifest)
-    return directory
+    key_id: str,
+) -> tuple[str | None, str | None]:
+    """Return (successor_key_id, reason_hash) for a key from directory events."""
+    successor_key_id: str | None = None
+    reason_hash: str | None = None
+    for ev in directory.events:
+        if ev.event_type == EventType.ROTATION and ev.related_key_id == key_id:
+            successor_key_id = ev.key_id
+        if ev.key_id == key_id and ev.event_type in (EventType.COMPROMISE, EventType.RETIREMENT):
+            if ev.reason_hash is not None:
+                reason_hash = ev.reason_hash
+    return successor_key_id, reason_hash
 
 
-# ── Offline issuer trust snapshot exports ──────────────────────────────────
-
-_SNAPSHOT_ALLOWED_KEYS: frozenset[str] = frozenset(
-    {
-        "protocol",
-        "version",
-        "exportedAt",
-        "manifests",
-        "checkpointReferences",
-        "policyVersions",
-    }
-)
-_MANIFEST_ALLOWED_KEYS: frozenset[str] = frozenset(
-    {
-        "protocol",
-        "version",
-        "organizationIdentityHash",
-        "issuerAddress",
-        "activeKeys",
-        "policyHash",
-        "validFrom",
-        "validUntil",
-        "predecessorManifestHash",
-        "successorManifestHash",
-        "signatureHash",
-    }
-)
-_KEY_ALLOWED_KEYS: frozenset[str] = frozenset(
-    {
-        "keyId",
-        "publicKeyHash",
-        "algorithm",
-        "validFrom",
-        "validUntil",
-        "status",
-    }
-)
-_CHECKPOINT_REF_ALLOWED_KEYS: frozenset[str] = frozenset(
-    {
-        "checkpointHash",
-        "treeHeadHash",
-        "eventCount",
-        "timestamp",
-        "organizationIdentityHash",
-        "manifestHash",
-        "signatureHash",
-    }
-)
-_POLICY_VERSION_ALLOWED_KEYS: frozenset[str] = frozenset(
-    {
-        "policyVersion",
-        "policyHash",
-        "effectiveFrom",
-    }
-)
+def _effective_key_valid_until(directory: IssuerDirectory, key: IssuerKey) -> int | None:
+    """Return the tightest valid_until bound from key state or current manifest."""
+    bounds: list[int] = []
+    if key.valid_until is not None:
+        bounds.append(key.valid_until)
+    if directory.current_manifest is not None:
+        for mk in directory.current_manifest.active_keys:
+            if mk.key_id == key.key_id and mk.valid_until is not None:
+                bounds.append(mk.valid_until)
+        if directory.current_manifest.valid_until is not None:
+            bounds.append(directory.current_manifest.valid_until)
+    return min(bounds) if bounds else None
 
 
-def _reject_forbidden_and_unknown_keys(
-    obj: Any,
-    allowed: frozenset[str],
-    context: str,
-) -> None:
-    if not isinstance(obj, dict):
-        raise TransparencyError(f"{context} must be a JSON object")
-    for key in obj:
-        normalized = str(key).lower().replace("_", "")
-        if normalized in FORBIDDEN_SNAPSHOT_FIELDS:
-            raise TransparencyError(f"{context} contains forbidden private field: {key}")
-        if key not in allowed:
-            raise TransparencyError(f"{context} contains unsupported field: {key}")
-
-
-@dataclass(frozen=True)
-class PolicyVersion:
-    """Public policy version identifier and canonical policy digest."""
-
-    policy_version: str
-    policy_hash: str
-    effective_from: int | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.policy_version, str) or not self.policy_version.strip():
-            raise TransparencyError("policyVersion must be a non-empty string")
-        _require_hex("policyHash", self.policy_hash)
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
-            "policyHash": self.policy_hash.lower(),
-            "policyVersion": self.policy_version,
-        }
-        if self.effective_from is not None:
-            d["effectiveFrom"] = self.effective_from
-        return d
-
-    @staticmethod
-    def from_dict(obj: dict[str, Any]) -> "PolicyVersion":
-        _reject_forbidden_and_unknown_keys(obj, _POLICY_VERSION_ALLOWED_KEYS, "policyVersion")
-        if "policyVersion" not in obj or "policyHash" not in obj:
-            raise TransparencyError("policyVersion and policyHash are required")
-        return PolicyVersion(
-            policy_version=str(obj["policyVersion"]),
-            policy_hash=_require_hex("policyHash", str(obj["policyHash"])),
-            effective_from=(
-                int(obj["effectiveFrom"]) if obj.get("effectiveFrom") is not None else None
-            ),
-        )
-
-
-@dataclass(frozen=True)
-class CheckpointReference:
-    """Public reference to a signed directory checkpoint for offline verification."""
-
-    checkpoint_hash: str
-    tree_head_hash: str
-    event_count: int
-    timestamp: int
-    organization_identity_hash: str
-    manifest_hash: str
-    signature_hash: str | None = None
-
-    def __post_init__(self) -> None:
-        _require_hex("checkpointHash", self.checkpoint_hash)
-        _require_hex("treeHeadHash", self.tree_head_hash)
-        _require_hex("organizationIdentityHash", self.organization_identity_hash)
-        _require_hex("manifestHash", self.manifest_hash)
-        if self.signature_hash is not None:
-            _require_hex("signatureHash", self.signature_hash)
-        if self.event_count < 0:
-            raise TransparencyError("checkpointReference eventCount must be non-negative")
-
-    @staticmethod
-    def from_checkpoint(checkpoint: DirectoryCheckpoint) -> "CheckpointReference":
-        return CheckpointReference(
-            checkpoint_hash=checkpoint_hash(checkpoint),
-            tree_head_hash=checkpoint.tree_head_hash,
-            event_count=checkpoint.event_count,
-            timestamp=checkpoint.timestamp,
-            organization_identity_hash=checkpoint.organization_identity_hash,
-            manifest_hash=checkpoint.manifest_hash,
-            signature_hash=checkpoint.signature_hash,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
-            "checkpointHash": self.checkpoint_hash.lower(),
-            "eventCount": self.event_count,
-            "manifestHash": self.manifest_hash.lower(),
-            "organizationIdentityHash": self.organization_identity_hash.lower(),
-            "timestamp": self.timestamp,
-            "treeHeadHash": self.tree_head_hash.lower(),
-        }
-        if self.signature_hash:
-            d["signatureHash"] = self.signature_hash.lower()
-        return d
-
-    @staticmethod
-    def from_dict(obj: dict[str, Any]) -> "CheckpointReference":
-        _reject_forbidden_and_unknown_keys(
-            obj, _CHECKPOINT_REF_ALLOWED_KEYS, "checkpointReference"
-        )
-        required = (
-            "checkpointHash",
-            "treeHeadHash",
-            "eventCount",
-            "timestamp",
-            "organizationIdentityHash",
-            "manifestHash",
-        )
-        for req in required:
-            if req not in obj:
-                raise TransparencyError(f"checkpointReference missing required field: {req}")
-        return CheckpointReference(
-            checkpoint_hash=_require_hex("checkpointHash", str(obj["checkpointHash"])),
-            tree_head_hash=_require_hex("treeHeadHash", str(obj["treeHeadHash"])),
-            event_count=int(obj["eventCount"]),
-            timestamp=int(obj["timestamp"]),
-            organization_identity_hash=_require_hex(
-                "organizationIdentityHash", str(obj["organizationIdentityHash"])
-            ),
-            manifest_hash=_require_hex("manifestHash", str(obj["manifestHash"])),
-            signature_hash=(
-                _require_hex("signatureHash", str(obj["signatureHash"]))
-                if obj.get("signatureHash")
-                else None
-            ),
-        )
-
-
-@dataclass
-class IssuerTrustSnapshot:
-    """Offline-exportable public issuer trust snapshot.
-
-    Contains only public manifests, checkpoint references, and policy versions.
-    Evidence-specific private identifiers are never included.
-    """
-
-    exported_at: int
-    manifests: list[IssuerManifest]
-    checkpoint_references: list[CheckpointReference]
-    policy_versions: list[PolicyVersion]
-    version: int = VERSION
-    protocol: str = SNAPSHOT_PROTOCOL
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "checkpointReferences": [c.to_dict() for c in self.checkpoint_references],
-            "exportedAt": self.exported_at,
-            "manifests": [m.to_dict() for m in self.manifests],
-            "policyVersions": [p.to_dict() for p in self.policy_versions],
-            "protocol": self.protocol,
-            "version": self.version,
-        }
-
-    @staticmethod
-    def from_dict(obj: dict[str, Any]) -> "IssuerTrustSnapshot":
-        _reject_forbidden_and_unknown_keys(obj, _SNAPSHOT_ALLOWED_KEYS, "trust snapshot")
-        if obj.get("protocol") != SNAPSHOT_PROTOCOL:
-            raise TransparencyError("unsupported issuer trust snapshot protocol")
-        if int(obj.get("version", 0)) not in SUPPORTED_VERSIONS:
-            raise TransparencyError("unsupported issuer trust snapshot version")
-        if "exportedAt" not in obj:
-            raise TransparencyError("trust snapshot missing required field: exportedAt")
-
-        raw_manifests = obj.get("manifests")
-        raw_checkpoints = obj.get("checkpointReferences")
-        raw_policies = obj.get("policyVersions")
-        if not isinstance(raw_manifests, list):
-            raise TransparencyError("trust snapshot manifests must be a list")
-        if not isinstance(raw_checkpoints, list):
-            raise TransparencyError("trust snapshot checkpointReferences must be a list")
-        if not isinstance(raw_policies, list):
-            raise TransparencyError("trust snapshot policyVersions must be a list")
-
-        manifests: list[IssuerManifest] = []
-        for m_obj in raw_manifests:
-            _reject_forbidden_and_unknown_keys(m_obj, _MANIFEST_ALLOWED_KEYS, "manifest")
-            for k_obj in m_obj.get("activeKeys", []):
-                _reject_forbidden_and_unknown_keys(k_obj, _KEY_ALLOWED_KEYS, "activeKey")
-            manifests.append(IssuerManifest.from_dict(m_obj))
-
-        checkpoints = [CheckpointReference.from_dict(c) for c in raw_checkpoints]
-        policies = [PolicyVersion.from_dict(p) for p in raw_policies]
-
-        return IssuerTrustSnapshot(
-            exported_at=int(obj["exportedAt"]),
-            manifests=manifests,
-            checkpoint_references=checkpoints,
-            policy_versions=policies,
-            version=int(obj["version"]),
-            protocol=str(obj["protocol"]),
-        )
-
-
-def canonicalize_trust_snapshot(snapshot: IssuerTrustSnapshot) -> str:
-    """Deterministic JSON encoding for an offline issuer trust snapshot."""
-    if snapshot.protocol != SNAPSHOT_PROTOCOL:
-        raise TransparencyError("unsupported issuer trust snapshot protocol")
-    if snapshot.version not in SUPPORTED_VERSIONS:
-        raise TransparencyError("unsupported issuer trust snapshot version")
-    if len(snapshot.manifests) > MAX_SNAPSHOT_MANIFESTS:
-        raise TransparencyError("trust snapshot manifest count exceeds bound")
-    if len(snapshot.checkpoint_references) > MAX_SNAPSHOT_CHECKPOINTS:
-        raise TransparencyError("trust snapshot checkpoint count exceeds bound")
-    if len(snapshot.policy_versions) > MAX_SNAPSHOT_POLICY_VERSIONS:
-        raise TransparencyError("trust snapshot policy version count exceeds bound")
-    for manifest in snapshot.manifests:
-        canonicalize_manifest(manifest)
-    encoded = _canonical_json(snapshot.to_dict())
-    if len(encoded) > MAX_SNAPSHOT_BYTES:
-        raise TransparencyError("trust snapshot exceeds size bound")
-    return encoded.decode("utf-8")
-
-
-def trust_snapshot_hash(snapshot: IssuerTrustSnapshot) -> str:
-    """Compute the canonical SHA-256 digest of an offline issuer trust snapshot."""
-    return _sha256_hex(canonicalize_trust_snapshot(snapshot).encode("utf-8"))
-
-
-def export_offline_trust_snapshot(
-    directories: Iterable[IssuerDirectory],
-    checkpoints: Iterable[DirectoryCheckpoint],
-    policy_versions: Iterable[PolicyVersion],
+def assess_issuer_trust(
+    directory: IssuerDirectory,
+    key_id: str,
     *,
-    exported_at: int | None = None,
-    include_historical_manifests: bool = True,
-) -> IssuerTrustSnapshot:
-    """Export a canonical offline issuer trust snapshot.
+    signature_timestamp: int | None = None,
+    cache: DirectoryCache | None = None,
+    high_assurance: bool = False,
+    now: int | None = None,
+) -> IssuerTrustAssessment:
+    """Evaluate issuer key trust for a verification run with an explicit reason.
 
-    Includes only public manifests, checkpoint references, and policy versions.
-    Fails closed if any checkpoint is inconsistent with its directory or if
-    conflicting policy versions are supplied.
+    Distinguishes rotation, expiry, retirement, compromise, stale directory state,
+    and directory consistency failures instead of collapsing them into a generic
+    invalid-issuer outcome. Preserves fail-closed freshness for cached checkpoints.
     """
-    dirs_by_org: dict[str, IssuerDirectory] = {}
-    manifests_by_digest: dict[str, IssuerManifest] = {}
+    verified_at = int(time.time()) if now is None else now
+    sig_ts = verified_at if signature_timestamp is None else signature_timestamp
+    cp_event_count: int | None = None
+    cp_age: int | None = None
 
-    for directory in directories:
-        if directory.organization_identity_hash in dirs_by_org:
-            raise TransparencyError("duplicate directory for organizationIdentityHash")
-        if directory.current_manifest is None:
-            raise TransparencyError(
-                "cannot export trust snapshot for directory without a published manifest"
-            )
-        dirs_by_org[directory.organization_identity_hash] = directory
-        if include_historical_manifests and directory.manifests_by_hash:
-            for mh, manifest in directory.manifests_by_hash.items():
-                manifests_by_digest[mh] = manifest
-        else:
-            mh = manifest_hash(directory.current_manifest)
-            manifests_by_digest[mh] = directory.current_manifest
-
-    checkpoint_refs_by_hash: dict[str, CheckpointReference] = {}
-    for cp in checkpoints:
-        directory = dirs_by_org.get(cp.organization_identity_hash)
-        if directory is None:
-            raise TransparencyError(
-                "checkpoint references unknown organizationIdentityHash not in export"
-            )
-        consistency_errors = verify_checkpoint_consistency(directory, cp)
+    if cache is not None:
+        cp_event_count = cache.checkpoint.event_count
+        cp_age = cache.age_seconds(verified_at)
+        consistency_errors = verify_checkpoint_consistency(directory, cache.checkpoint)
         if consistency_errors:
-            raise TransparencyError(
-                "inconsistent checkpoint in trust snapshot export: "
-                + "; ".join(consistency_errors)
+            return IssuerTrustAssessment(
+                key_id=key_id,
+                organization_identity_hash=directory.organization_identity_hash,
+                state=TrustState.UNTRUSTED,
+                reason=TrustChangeReason.DIRECTORY_INCONSISTENT,
+                verified_at=verified_at,
+                signature_timestamp=sig_ts,
+                checkpoint_event_count=cp_event_count,
+                checkpoint_age_seconds=cp_age,
+                high_assurance=high_assurance,
+                consistency_errors=tuple(consistency_errors),
             )
-        if cp.manifest_hash not in manifests_by_digest:
-            raise TransparencyError(
-                "checkpoint manifestHash is not present in exported manifests"
-            )
-        ref = CheckpointReference.from_checkpoint(cp)
-        checkpoint_refs_by_hash[ref.checkpoint_hash] = ref
-
-    policies_by_version: dict[str, PolicyVersion] = {}
-    for pv in policy_versions:
-        existing = policies_by_version.get(pv.policy_version)
-        if existing is not None and existing.policy_hash.lower() != pv.policy_hash.lower():
-            raise TransparencyError(
-                f"conflicting policyHash for policyVersion {pv.policy_version}"
-            )
-        policies_by_version[pv.policy_version] = pv
-
-    sorted_manifests = sorted(
-        manifests_by_digest.values(),
-        key=lambda m: (m.organization_identity_hash, m.valid_from, manifest_hash(m)),
-    )
-    sorted_checkpoints = sorted(
-        checkpoint_refs_by_hash.values(),
-        key=lambda c: (c.organization_identity_hash, c.event_count, c.checkpoint_hash),
-    )
-    sorted_policies = sorted(
-        policies_by_version.values(),
-        key=lambda p: (p.policy_version, p.policy_hash.lower()),
-    )
-
-    ts = int(time.time()) if exported_at is None else exported_at
-    snapshot = IssuerTrustSnapshot(
-        exported_at=ts,
-        manifests=sorted_manifests,
-        checkpoint_references=sorted_checkpoints,
-        policy_versions=sorted_policies,
-    )
-    canonicalize_trust_snapshot(snapshot)
-    return snapshot
-
-
-def import_offline_trust_snapshot(
-    raw: str | bytes | dict[str, Any],
-) -> IssuerTrustSnapshot:
-    """Decode and validate an offline issuer trust snapshot (fail-closed)."""
-    if isinstance(raw, (str, bytes)):
         try:
-            obj = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise TransparencyError(f"invalid trust snapshot JSON: {exc}") from exc
-    elif isinstance(raw, dict):
-        obj = raw
-    else:
-        raise TransparencyError("trust snapshot input must be JSON string, bytes, or dict")
-
-    snapshot = IssuerTrustSnapshot.from_dict(obj)
-    canonicalize_trust_snapshot(snapshot)
-    return snapshot
-
-
-def verify_offline_trust_snapshot(snapshot: IssuerTrustSnapshot) -> list[str]:
-    """Return consistency errors for an offline trust snapshot (empty = valid)."""
-    errors: list[str] = []
-    try:
-        canonicalize_trust_snapshot(snapshot)
-    except TransparencyError as exc:
-        errors.append(str(exc))
-
-    manifests_by_digest: dict[str, IssuerManifest] = {}
-    for manifest in snapshot.manifests:
-        try:
-            mh = manifest_hash(manifest)
-            manifests_by_digest[mh] = manifest
-            if manifest.successor_manifest_hash is not None:
-                unlinked = IssuerManifest(
-                    organization_identity_hash=manifest.organization_identity_hash,
-                    issuer_address=manifest.issuer_address,
-                    active_keys=list(manifest.active_keys),
-                    policy_hash=manifest.policy_hash,
-                    valid_from=manifest.valid_from,
-                    valid_until=manifest.valid_until,
-                    predecessor_manifest_hash=manifest.predecessor_manifest_hash,
-                    successor_manifest_hash=None,
-                    signature_hash=manifest.signature_hash,
-                    version=manifest.version,
-                    protocol=manifest.protocol,
-                )
-                manifests_by_digest[manifest_hash(unlinked)] = manifest
-        except TransparencyError as exc:
-            errors.append(f"invalid manifest: {exc}")
-
-    for ref in snapshot.checkpoint_references:
-        manifest = manifests_by_digest.get(ref.manifest_hash)
-        if manifest is None:
-            errors.append(
-                f"checkpoint {ref.checkpoint_hash} references missing manifest {ref.manifest_hash}"
-            )
-        elif manifest.organization_identity_hash != ref.organization_identity_hash:
-            errors.append(
-                f"checkpoint {ref.checkpoint_hash} organizationIdentityHash mismatch with manifest"
+            require_fresh_checkpoint(cache, high_assurance=high_assurance, now=verified_at)
+        except FreshnessError:
+            return IssuerTrustAssessment(
+                key_id=key_id,
+                organization_identity_hash=directory.organization_identity_hash,
+                state=TrustState.STALE,
+                reason=TrustChangeReason.STALE_DIRECTORY,
+                verified_at=verified_at,
+                signature_timestamp=sig_ts,
+                checkpoint_event_count=cp_event_count,
+                checkpoint_age_seconds=cp_age,
+                high_assurance=high_assurance,
             )
 
-    seen_policy_versions: dict[str, str] = {}
-    for pv in snapshot.policy_versions:
-        prev_hash = seen_policy_versions.get(pv.policy_version)
-        if prev_hash is not None and prev_hash != pv.policy_hash.lower():
-            errors.append(f"conflicting policyHash for policyVersion {pv.policy_version}")
-        seen_policy_versions[pv.policy_version] = pv.policy_hash.lower()
+    key = directory.keys.get(key_id)
+    if key is None:
+        return IssuerTrustAssessment(
+            key_id=key_id,
+            organization_identity_hash=directory.organization_identity_hash,
+            state=TrustState.UNTRUSTED,
+            reason=TrustChangeReason.UNKNOWN_KEY,
+            verified_at=verified_at,
+            signature_timestamp=sig_ts,
+            checkpoint_event_count=cp_event_count,
+            checkpoint_age_seconds=cp_age,
+            high_assurance=high_assurance,
+        )
 
-    return errors
+    successor_key_id, reason_hash = _find_key_lifecycle_metadata(directory, key_id)
+
+    if sig_ts < key.valid_from:
+        return IssuerTrustAssessment(
+            key_id=key_id,
+            organization_identity_hash=directory.organization_identity_hash,
+            state=TrustState.UNTRUSTED,
+            reason=TrustChangeReason.NOT_YET_VALID,
+            verified_at=verified_at,
+            signature_timestamp=sig_ts,
+            key_status=key.status,
+            successor_key_id=successor_key_id,
+            reason_hash=reason_hash,
+            checkpoint_event_count=cp_event_count,
+            checkpoint_age_seconds=cp_age,
+            high_assurance=high_assurance,
+        )
+
+    if key.status == KeyStatus.COMPROMISED:
+        state = (
+            TrustState.UNTRUSTED
+            if key_was_compromised_at(directory, key_id, sig_ts)
+            else TrustState.HISTORICALLY_VALID
+        )
+        return IssuerTrustAssessment(
+            key_id=key_id,
+            organization_identity_hash=directory.organization_identity_hash,
+            state=state,
+            reason=TrustChangeReason.KEY_COMPROMISED,
+            verified_at=verified_at,
+            signature_timestamp=sig_ts,
+            key_status=key.status,
+            successor_key_id=successor_key_id,
+            reason_hash=reason_hash,
+            checkpoint_event_count=cp_event_count,
+            checkpoint_age_seconds=cp_age,
+            high_assurance=high_assurance,
+        )
+
+    if key.status == KeyStatus.ROTATED:
+        state = (
+            TrustState.HISTORICALLY_VALID
+            if key_valid_for_historical_signature(directory, key_id, sig_ts)
+            else TrustState.UNTRUSTED
+        )
+        return IssuerTrustAssessment(
+            key_id=key_id,
+            organization_identity_hash=directory.organization_identity_hash,
+            state=state,
+            reason=TrustChangeReason.KEY_ROTATED,
+            verified_at=verified_at,
+            signature_timestamp=sig_ts,
+            key_status=key.status,
+            successor_key_id=successor_key_id,
+            reason_hash=reason_hash,
+            checkpoint_event_count=cp_event_count,
+            checkpoint_age_seconds=cp_age,
+            high_assurance=high_assurance,
+        )
+
+    if key.status == KeyStatus.RETIRED:
+        state = (
+            TrustState.HISTORICALLY_VALID
+            if key_valid_for_historical_signature(directory, key_id, sig_ts)
+            else TrustState.UNTRUSTED
+        )
+        return IssuerTrustAssessment(
+            key_id=key_id,
+            organization_identity_hash=directory.organization_identity_hash,
+            state=state,
+            reason=TrustChangeReason.KEY_RETIRED,
+            verified_at=verified_at,
+            signature_timestamp=sig_ts,
+            key_status=key.status,
+            successor_key_id=successor_key_id,
+            reason_hash=reason_hash,
+            checkpoint_event_count=cp_event_count,
+            checkpoint_age_seconds=cp_age,
+            high_assurance=high_assurance,
+        )
+
+    # KeyStatus.ACTIVE — check manifest valid_from and key/manifest expiry
+    if directory.current_manifest is not None and sig_ts < directory.current_manifest.valid_from:
+        return IssuerTrustAssessment(
+            key_id=key_id,
+            organization_identity_hash=directory.organization_identity_hash,
+            state=TrustState.UNTRUSTED,
+            reason=TrustChangeReason.NOT_YET_VALID,
+            verified_at=verified_at,
+            signature_timestamp=sig_ts,
+            key_status=key.status,
+            checkpoint_event_count=cp_event_count,
+            checkpoint_age_seconds=cp_age,
+            high_assurance=high_assurance,
+        )
+
+    effective_until = _effective_key_valid_until(directory, key)
+    if effective_until is not None and sig_ts >= effective_until:
+        return IssuerTrustAssessment(
+            key_id=key_id,
+            organization_identity_hash=directory.organization_identity_hash,
+            state=TrustState.UNTRUSTED,
+            reason=TrustChangeReason.KEY_EXPIRED,
+            verified_at=verified_at,
+            signature_timestamp=sig_ts,
+            key_status=key.status,
+            checkpoint_event_count=cp_event_count,
+            checkpoint_age_seconds=cp_age,
+            high_assurance=high_assurance,
+        )
+
+    return IssuerTrustAssessment(
+        key_id=key_id,
+        organization_identity_hash=directory.organization_identity_hash,
+        state=TrustState.TRUSTED,
+        reason=TrustChangeReason.ACTIVATED,
+        verified_at=verified_at,
+        signature_timestamp=sig_ts,
+        key_status=key.status,
+        checkpoint_event_count=cp_event_count,
+        checkpoint_age_seconds=cp_age,
+        high_assurance=high_assurance,
+    )
+
+
+def compare_issuer_trust(
+    previous: IssuerTrustAssessment,
+    current: IssuerTrustAssessment,
+    *,
+    previous_checkpoint: DirectoryCheckpoint | None = None,
+    current_checkpoint: DirectoryCheckpoint | None = None,
+) -> IssuerTrustChange:
+    """Compare two verification runs and expose the reason for any trust change."""
+    if previous.organization_identity_hash != current.organization_identity_hash:
+        raise TransparencyError("cannot compare trust across different organizations")
+    if previous.key_id != current.key_id:
+        raise TransparencyError("cannot compare trust across different keys")
+
+    if previous_checkpoint is not None and current_checkpoint is not None:
+        rollback_errors = detect_rollback(previous_checkpoint, current_checkpoint)
+        if rollback_errors:
+            return IssuerTrustChange(
+                key_id=current.key_id,
+                organization_identity_hash=current.organization_identity_hash,
+                changed=True,
+                previous_state=previous.state,
+                current_state=TrustState.UNTRUSTED,
+                reason=TrustChangeReason.DIRECTORY_INCONSISTENT,
+                previous_verified_at=previous.verified_at,
+                current_verified_at=current.verified_at,
+                successor_key_id=current.successor_key_id,
+                reason_hash=current.reason_hash,
+                rollback_errors=tuple(rollback_errors),
+            )
+
+    changed = previous.state != current.state or previous.reason != current.reason
+    reason = current.reason if changed else TrustChangeReason.UNCHANGED
+    return IssuerTrustChange(
+        key_id=current.key_id,
+        organization_identity_hash=current.organization_identity_hash,
+        changed=changed,
+        previous_state=previous.state,
+        current_state=current.state,
+        reason=reason,
+        previous_verified_at=previous.verified_at,
+        current_verified_at=current.verified_at,
+        successor_key_id=current.successor_key_id,
+        reason_hash=current.reason_hash,
+    )

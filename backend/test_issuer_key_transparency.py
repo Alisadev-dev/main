@@ -26,12 +26,15 @@ from issuer_key_transparency import (
     IssuerDirectory,
     IssuerKey,
     IssuerManifest,
-    IssuerTrustSnapshot,
+    IssuerTrustAssessment,
+    IssuerTrustChange,
     KeyStatus,
     PolicyVersion,
     TransparencyError,
-    canonicalize_trust_snapshot,
-    checkpoint_hash,
+    TrustChangeReason,
+    TrustState,
+    assess_issuer_trust,
+    compare_issuer_trust,
     compute_tree_head,
     create_activation_event,
     create_rotation_event,
@@ -393,165 +396,177 @@ class PrivacyTests(unittest.TestCase):
         self.assertIn("organizationIdentityHash", encoded)
 
 
-class OfflineTrustSnapshotTests(unittest.TestCase):
-    def _build_directory_and_checkpoints(
+class IssuerTrustChangeTests(unittest.TestCase):
+    def _active_directory(
         self,
-    ) -> tuple[IssuerDirectory, list[DirectoryCheckpoint]]:
+        *,
+        key_valid_until: int | None = None,
+        manifest_valid_until: int | None = None,
+    ) -> tuple[IssuerDirectory, DirectoryCheckpoint]:
         e0 = create_activation_event(ORG, "k1", KEY_A, 0, 1000)
         d = rebuild_directory(ORG, [e0])
-        m1 = _manifest([IssuerKey("k1", KEY_A, "ed25519", 1000)], valid_from=1000)
-        h1 = d.publish_manifest(m1)
-        cp1 = d.make_checkpoint(timestamp=1500, signature_hash=SIG)
+        m = IssuerManifest(
+            organization_identity_hash=ORG,
+            issuer_address="GTESTISSUERADDRESSXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            active_keys=[IssuerKey("k1", KEY_A, "ed25519", 1000, valid_until=key_valid_until)],
+            policy_hash=POLICY,
+            valid_from=1000,
+            valid_until=manifest_valid_until,
+            signature_hash=SIG,
+        )
+        d.publish_manifest(m)
+        cp = d.make_checkpoint(timestamp=1100, signature_hash=SIG)
+        return d, cp
 
-        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(e0))
+    def test_unchanged_trust_across_runs(self) -> None:
+        d, cp = self._active_directory()
+        cache = DirectoryCache(checkpoint=cp, fetched_at=1200)
+        run1 = assess_issuer_trust(d, "k1", signature_timestamp=1200, cache=cache, now=1200)
+        run2 = assess_issuer_trust(d, "k1", signature_timestamp=1200, cache=cache, now=1300)
+        change = compare_issuer_trust(run1, run2)
+        self.assertFalse(change.changed)
+        self.assertEqual(change.previous_state, TrustState.TRUSTED)
+        self.assertEqual(change.current_state, TrustState.TRUSTED)
+        self.assertEqual(change.reason, TrustChangeReason.UNCHANGED)
+
+    def test_rotation_distinguished_for_historical_and_new_signatures(self) -> None:
+        d, _ = self._active_directory()
+        run1 = assess_issuer_trust(d, "k1", signature_timestamp=1500, now=1500)
+        self.assertEqual(run1.state, TrustState.TRUSTED)
+
+        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(d.events[0]))
+        d.append_event(e1)
+
+        # Historical signature made before rotation stays historically valid with rotation reason
+        run2_hist = assess_issuer_trust(d, "k1", signature_timestamp=1500, now=2100)
+        change_hist = compare_issuer_trust(run1, run2_hist)
+        self.assertTrue(change_hist.changed)
+        self.assertEqual(change_hist.previous_state, TrustState.TRUSTED)
+        self.assertEqual(change_hist.current_state, TrustState.HISTORICALLY_VALID)
+        self.assertEqual(change_hist.reason, TrustChangeReason.KEY_ROTATED)
+        self.assertEqual(change_hist.successor_key_id, "k2")
+
+        # New signature at/after rotation boundary is untrusted due to rotation
+        run2_new = assess_issuer_trust(d, "k1", signature_timestamp=2000, now=2100)
+        change_new = compare_issuer_trust(run1, run2_new)
+        self.assertTrue(change_new.changed)
+        self.assertEqual(change_new.current_state, TrustState.UNTRUSTED)
+        self.assertEqual(change_new.reason, TrustChangeReason.KEY_ROTATED)
+        self.assertEqual(change_new.successor_key_id, "k2")
+
+    def test_expiry_distinguished_from_rotation_and_compromise(self) -> None:
+        d, _ = self._active_directory(key_valid_until=2000)
+        run1 = assess_issuer_trust(d, "k1", signature_timestamp=1999, now=1999)
+        self.assertEqual(run1.state, TrustState.TRUSTED)
+
+        run2 = assess_issuer_trust(d, "k1", signature_timestamp=2000, now=2000)
+        change = compare_issuer_trust(run1, run2)
+        self.assertTrue(change.changed)
+        self.assertEqual(change.previous_state, TrustState.TRUSTED)
+        self.assertEqual(change.current_state, TrustState.UNTRUSTED)
+        self.assertEqual(change.reason, TrustChangeReason.KEY_EXPIRED)
+        self.assertIsNone(change.successor_key_id)
+
+    def test_compromise_distinguished_and_surfaces_reason_hash(self) -> None:
+        d, _ = self._active_directory()
+        run1 = assess_issuer_trust(d, "k1", signature_timestamp=1500, now=1500)
+        self.assertEqual(run1.state, TrustState.TRUSTED)
+
+        reason_digest = "7" * 64
+        d.append_event(
+            DirectoryEvent(
+                event_type=EventType.COMPROMISE,
+                sequence=1,
+                timestamp=1800,
+                organization_identity_hash=ORG,
+                key_id="k1",
+                public_key_hash=KEY_A,
+                previous_event_hash=event_hash(d.events[0]),
+                reason_hash=reason_digest,
+            )
+        )
+
+        # Pre-compromise historical signature surfaces compromise status
+        run2_pre = assess_issuer_trust(d, "k1", signature_timestamp=1500, now=1900)
+        change_pre = compare_issuer_trust(run1, run2_pre)
+        self.assertTrue(change_pre.changed)
+        self.assertEqual(change_pre.current_state, TrustState.HISTORICALLY_VALID)
+        self.assertEqual(change_pre.reason, TrustChangeReason.KEY_COMPROMISED)
+        self.assertEqual(change_pre.reason_hash, reason_digest)
+
+        # Post-compromise signature is untrusted due to compromise
+        run2_post = assess_issuer_trust(d, "k1", signature_timestamp=1800, now=1900)
+        change_post = compare_issuer_trust(run1, run2_post)
+        self.assertTrue(change_post.changed)
+        self.assertEqual(change_post.current_state, TrustState.UNTRUSTED)
+        self.assertEqual(change_post.reason, TrustChangeReason.KEY_COMPROMISED)
+        self.assertEqual(change_post.reason_hash, reason_digest)
+
+    def test_stale_directory_state_fail_closed_across_runs(self) -> None:
+        d, cp = self._active_directory()
+        cache = DirectoryCache(checkpoint=cp, fetched_at=1500)
+        run1 = assess_issuer_trust(
+            d, "k1", signature_timestamp=1500, cache=cache, high_assurance=True, now=1500
+        )
+        self.assertEqual(run1.state, TrustState.TRUSTED)
+
+        stale_now = 1500 + HIGH_ASSURANCE_FRESHNESS_SECONDS + 1
+        run2 = assess_issuer_trust(
+            d, "k1", signature_timestamp=1500, cache=cache, high_assurance=True, now=stale_now
+        )
+        change = compare_issuer_trust(run1, run2)
+        self.assertTrue(change.changed)
+        self.assertEqual(change.previous_state, TrustState.TRUSTED)
+        self.assertEqual(change.current_state, TrustState.STALE)
+        self.assertEqual(change.reason, TrustChangeReason.STALE_DIRECTORY)
+        self.assertEqual(run2.checkpoint_age_seconds, HIGH_ASSURANCE_FRESHNESS_SECONDS + 1)
+
+    def test_checkpoint_rollback_across_runs_flagged_inconsistent(self) -> None:
+        d, cp1 = self._active_directory()
+        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(d.events[0]))
         d.append_event(e1)
         m2 = _manifest(
             [IssuerKey("k2", KEY_B, "ed25519", 2000)],
-            predecessor=h1,
+            predecessor=manifest_hash(d.current_manifest),  # type: ignore[arg-type]
             valid_from=2000,
         )
         d.publish_manifest(m2)
-        cp2 = d.make_checkpoint(timestamp=2500, signature_hash=SIG)
-        return d, [cp1, cp2]
+        cp2 = d.make_checkpoint(timestamp=2100, signature_hash=SIG)
 
-    def test_export_roundtrip_and_deterministic_hash(self) -> None:
-        d, checkpoints = self._build_directory_and_checkpoints()
-        policies = [
-            PolicyVersion(policy_version="2026.1", policy_hash=POLICY, effective_from=1000),
-            PolicyVersion(policy_version="2026.2", policy_hash="1" * 64, effective_from=2000),
-        ]
-
-        snap_a = export_offline_trust_snapshot(
-            [d], checkpoints, policies, exported_at=3000
+        run1 = assess_issuer_trust(d, "k2", signature_timestamp=2100, now=2100)
+        run2 = assess_issuer_trust(d, "k2", signature_timestamp=2100, now=2200)
+        change = compare_issuer_trust(
+            run1, run2, previous_checkpoint=cp2, current_checkpoint=cp1
         )
-        # Reversed input order must yield identical canonical encoding and hash
-        snap_b = export_offline_trust_snapshot(
-            [d], list(reversed(checkpoints)), list(reversed(policies)), exported_at=3000
-        )
+        self.assertTrue(change.changed)
+        self.assertEqual(change.current_state, TrustState.UNTRUSTED)
+        self.assertEqual(change.reason, TrustChangeReason.DIRECTORY_INCONSISTENT)
+        self.assertTrue(any("rollback" in e.lower() for e in change.rollback_errors))
 
-        self.assertEqual(snap_a.protocol, SNAPSHOT_PROTOCOL)
-        self.assertEqual(len(snap_a.manifests), 2)
-        self.assertEqual(len(snap_a.checkpoint_references), 2)
-        self.assertEqual(len(snap_a.policy_versions), 2)
-        self.assertEqual(canonicalize_trust_snapshot(snap_a), canonicalize_trust_snapshot(snap_b))
-        self.assertEqual(trust_snapshot_hash(snap_a), trust_snapshot_hash(snap_b))
-        self.assertEqual(snap_a.checkpoint_references[0].checkpoint_hash, checkpoint_hash(checkpoints[0]))
+    def test_boundary_unknown_key_not_yet_valid_and_mismatch_errors(self) -> None:
+        d, _ = self._active_directory()
+        unknown = assess_issuer_trust(d, "missing", signature_timestamp=1500, now=1500)
+        self.assertEqual(unknown.state, TrustState.UNTRUSTED)
+        self.assertEqual(unknown.reason, TrustChangeReason.UNKNOWN_KEY)
 
-        # Round-trip import and verify
-        raw = canonicalize_trust_snapshot(snap_a)
-        reloaded = import_offline_trust_snapshot(raw)
-        self.assertEqual(trust_snapshot_hash(reloaded), trust_snapshot_hash(snap_a))
-        self.assertEqual(verify_offline_trust_snapshot(reloaded), [])
+        early = assess_issuer_trust(d, "k1", signature_timestamp=999, now=1500)
+        self.assertEqual(early.state, TrustState.UNTRUSTED)
+        self.assertEqual(early.reason, TrustChangeReason.NOT_YET_VALID)
 
-    def test_snapshot_excludes_evidence_private_identifiers(self) -> None:
-        d, checkpoints = self._build_directory_and_checkpoints()
-        policies = [PolicyVersion(policy_version="2026.1", policy_hash=POLICY)]
-        snap = export_offline_trust_snapshot([d], checkpoints, policies, exported_at=3000)
-
-        raw = canonicalize_trust_snapshot(snap).lower()
-        for forbidden in (
-            "evidencedigestbinding",
-            "capturenonce",
-            "devicecommitment",
-            "evidenceid",
-            "sealid",
-            "proofid",
-            "nullifier",
-            "email",
-            "legalname",
-        ):
-            self.assertNotIn(forbidden, raw)
-
-        # Injecting evidence-specific private identifiers must fail closed on import
-        tampered_top = snap.to_dict()
-        tampered_top["evidenceDigestBinding"] = "a" * 64
-        with self.assertRaises(TransparencyError) as ctx:
-            import_offline_trust_snapshot(tampered_top)
-        self.assertIn("forbidden private field", str(ctx.exception).lower())
-
-        tampered_cp = snap.to_dict()
-        tampered_cp["checkpointReferences"][0]["captureNonce"] = "b" * 64
-        with self.assertRaises(TransparencyError) as ctx:
-            import_offline_trust_snapshot(tampered_cp)
-        self.assertIn("forbidden private field", str(ctx.exception).lower())
-
-        tampered_manifest = snap.to_dict()
-        tampered_manifest["manifests"][0]["deviceCommitment"] = "c" * 64
-        with self.assertRaises(TransparencyError) as ctx:
-            import_offline_trust_snapshot(tampered_manifest)
-        self.assertIn("forbidden private field", str(ctx.exception).lower())
-
-        tampered_policy = snap.to_dict()
-        tampered_policy["policyVersions"][0]["evidenceId"] = "ev-123"
-        with self.assertRaises(TransparencyError) as ctx:
-            import_offline_trust_snapshot(tampered_policy)
-        self.assertIn("forbidden private field", str(ctx.exception).lower())
-
-    def test_export_rejects_inconsistent_checkpoint(self) -> None:
-        d, checkpoints = self._build_directory_and_checkpoints()
-        forged_cp = DirectoryCheckpoint(
-            tree_head_hash="9" * 64,
-            event_count=checkpoints[-1].event_count,
-            timestamp=2500,
-            organization_identity_hash=ORG,
-            manifest_hash=checkpoints[-1].manifest_hash,
-            signature_hash=SIG,
-        )
-        with self.assertRaises(TransparencyError) as ctx:
-            export_offline_trust_snapshot(
-                [d],
-                [forged_cp],
-                [PolicyVersion(policy_version="2026.1", policy_hash=POLICY)],
-                exported_at=3000,
-            )
-        self.assertIn("inconsistent checkpoint", str(ctx.exception).lower())
-
-    def test_export_rejects_conflicting_policy_versions(self) -> None:
-        d, checkpoints = self._build_directory_and_checkpoints()
-        with self.assertRaises(TransparencyError) as ctx:
-            export_offline_trust_snapshot(
-                [d],
-                checkpoints,
-                [
-                    PolicyVersion(policy_version="2026.1", policy_hash=POLICY),
-                    PolicyVersion(policy_version="2026.1", policy_hash="2" * 64),
-                ],
-                exported_at=3000,
-            )
-        self.assertIn("conflicting policyhash", str(ctx.exception).lower())
-
-    def test_export_rejects_directory_without_manifest(self) -> None:
-        empty_dir = IssuerDirectory(ORG)
-        with self.assertRaises(TransparencyError) as ctx:
-            export_offline_trust_snapshot([empty_dir], [], [], exported_at=3000)
-        self.assertIn("without a published manifest", str(ctx.exception).lower())
-
-    def test_verify_flags_checkpoint_referencing_missing_manifest(self) -> None:
-        d, checkpoints = self._build_directory_and_checkpoints()
-        snap = IssuerTrustSnapshot(
-            exported_at=3000,
-            manifests=[d.current_manifest],  # type: ignore[list-item]
-            checkpoint_references=[CheckpointReference.from_checkpoint(checkpoints[0])],
-            policy_versions=[PolicyVersion(policy_version="2026.1", policy_hash=POLICY)],
-        )
-        errors = verify_offline_trust_snapshot(snap)
-        self.assertTrue(any("missing manifest" in e.lower() for e in errors))
-
-    def test_import_rejects_unsupported_protocol_and_unknown_fields(self) -> None:
-        d, checkpoints = self._build_directory_and_checkpoints()
-        snap = export_offline_trust_snapshot(
-            [d], checkpoints, [PolicyVersion("2026.1", POLICY)], exported_at=3000
-        )
-        bad_proto = snap.to_dict()
-        bad_proto["protocol"] = "unknown-protocol"
         with self.assertRaises(TransparencyError):
-            import_offline_trust_snapshot(bad_proto)
+            compare_issuer_trust(unknown, early)
 
-        extra_field = snap.to_dict()
-        extra_field["unexpectedKey"] = "value"
-        with self.assertRaises(TransparencyError) as ctx:
-            import_offline_trust_snapshot(extra_field)
-        self.assertIn("unsupported field", str(ctx.exception).lower())
+    def test_trust_change_serialization_excludes_private_fields(self) -> None:
+        d, _ = self._active_directory(key_valid_until=2000)
+        run1 = assess_issuer_trust(d, "k1", signature_timestamp=1500, now=1500)
+        run2 = assess_issuer_trust(d, "k1", signature_timestamp=2000, now=2000)
+        change = compare_issuer_trust(run1, run2)
+        self.assertIsInstance(run2, IssuerTrustAssessment)
+        self.assertIsInstance(change, IssuerTrustChange)
+        blob = str({"assessment": run2.to_dict(), "change": change.to_dict()}).lower()
+        for forbidden in ("email", "legalname", "phone", "street", "employee"):
+            self.assertNotIn(forbidden, blob)
+        self.assertEqual(change.to_dict()["reason"], "key_expired")
 
 
 if __name__ == "__main__":
