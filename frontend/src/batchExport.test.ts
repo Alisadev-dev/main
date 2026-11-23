@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import type { BatchItemResult, BatchPreflightReport } from './batchVerifier'
 import {
   EXPORT_PRIVACY_PROFILES,
   OWNER_ONLY_EXPORT_FIELDS,
@@ -7,6 +8,8 @@ import {
   exportBatchCSV,
   exportBatchCheckpoint,
   exportBatchJSON,
+  exportPreflightReportCSV,
+  exportPreflightReportJSON,
   exportReceiptCollection,
   parseBatchCheckpoint,
   sanitizeBatchResults,
