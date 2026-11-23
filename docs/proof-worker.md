@@ -17,7 +17,8 @@ Implementation:
 - `src/workers/proofWorker.ts` — runs inside the worker, wraps `noirClient.ts`
 - `src/workers/proofWorker.types.ts` — shared message/state/runtime types
 - `src/workers/proofWorkerClient.ts` — main-thread client (`ProofWorkerClient`)
-- `src/proofWorkerMemory.ts` — worker memory and artifact-size budget checks
+- `src/workers/proof-worker-manager.ts` — CSP-configured worker manager & pre-flight resource admission (`getResourceAdmissionDecision()`)
+- `src/proofWorkerMemory.ts` — worker memory, artifact-size budget checks, and resource admission evaluator (`evaluateProofWorkerResourceAdmission()`)
 - `src/hooks/useEvidence.ts` — Evidence Studio integration + Cancel button
 - `src/workers/multiBrowserWorkerSupport.ts` — multi-browser capability floor for module-worker proving
 
@@ -233,15 +234,16 @@ Focused coverage lives in:
 
 ```bash
 cd frontend
-npx vitest run src/workers/multiBrowserWorkerSupport.test.ts src/proofWorkerMemory.test.ts src/workers/proofWorkerClient.test.ts src/workers/crashRecoveryFixtureProtocol.test.ts
+npx vitest run src/workers/multiBrowserWorkerSupport.test.ts src/proofWorkerMemory.test.ts src/workers/proofWorkerClient.test.ts src/workers/proof-worker-manager.test.ts
 ```
 
+## Resource admission decisions
 
+Before proving starts, callers can inspect memory, thread, and concurrency restrictions via `evaluateProofWorkerResourceAdmission()` (`src/proofWorkerMemory.ts`) or `ProofWorkerManager.getResourceAdmissionDecision()` (`src/workers/proof-worker-manager.ts`).
 
-## Worker / Main-Thread Protocol Versioning
+The returned `ProofWorkerResourceAdmissionDecision` is privacy-safe (byte counts, thread counts, concurrency slots, and reason codes only — never witness or secret material) and reports:
 
-`ProofWorkerManager` (`frontend/src/workers/proof-worker-manager.ts`) and `proof.worker.ts` enforce a strict integer protocol version (`PROOF_WORKER_PROTOCOL_VERSION = 1` in `frontend/src/workers/proof.worker.types.ts`) on worker/main-thread messages:
+- **Memory**: estimated bytes vs. canonical `PROOF_WORKER_MEMORY_LIMITS` runtime ceiling and optional CSP `maxMemoryMB` cap, plus whether `deviceMemoryGB` (`<= 2 GB`) marks the browser as memory-constrained.
+- **Threads**: multithreaded WASM (`1–8` threads) when `crossOriginIsolated` is true and the device is not memory-constrained; otherwise preserves a safe `single-threaded-fallback` (`1` thread) with explicit reason codes (`fallback_single_thread_not_isolated`, `fallback_single_thread_memory_constrained`, or `fallback_single_thread_low_concurrency`).
+- **Concurrency**: active tasks vs. `maxConcurrentTasks` (default `1`), failing closed with `concurrency_limit_reached` when no slot is available.
 
-- **Fail-closed before buffer transfer**: `validateWorkerProtocolVersion()` and `ProofWorkerManager.handleWorkerMessage()` check `protocolVersion` before invoking buffer-acceptance callbacks or parsing payload fields.
-- **No unsafe fallback parsing**: Missing, non-integer, stringified (e.g. `"1"`), zero, negative, `NaN`, or mismatched versions are rejected immediately without coercion.
-- **Clear reload-required result**: Mismatches return a privacy-safe `ProofWorkerResponse` with `type: 'error'`, `error.code = 'PROTOCOL_VERSION_MISMATCH'`, `error.reloadRequired = true`, and `error.privacySafe = true`, settling any matching pending request immediately.

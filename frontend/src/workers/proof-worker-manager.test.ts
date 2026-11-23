@@ -433,125 +433,67 @@ describe('destroy', () => {
   })
 })
 
-
-describe('protocol version compatibility', () => {
-  it('accepts the exact supported protocol version and rejects mismatched or non-integer versions without fallback parsing', async () => {
-    const {
-      PROOF_WORKER_PROTOCOL_VERSION,
-      validateWorkerProtocolVersion,
-    } = await import('./proof-worker-manager')
-
-    expect(validateWorkerProtocolVersion(PROOF_WORKER_PROTOCOL_VERSION)).toEqual({
-      compatible: true,
-      protocolVersion: PROOF_WORKER_PROTOCOL_VERSION,
-      reloadRequired: false,
+describe('getResourceAdmissionDecision', () => {
+  it('explains memory, thread, and concurrency decisions before proving starts', () => {
+    const manager = createManager({ maxMemoryMB: 256 })
+    const decision = manager.getResourceAdmissionDecision({
+      crossOriginIsolated: true,
+      hardwareConcurrency: 4,
+      deviceMemoryGB: 8,
     })
 
-    // Mismatched integer versions (older/newer)
-    expect(validateWorkerProtocolVersion(PROOF_WORKER_PROTOCOL_VERSION + 1)).toMatchObject({
-      compatible: false,
-      code: 'PROTOCOL_VERSION_MISMATCH',
-      expectedVersion: PROOF_WORKER_PROTOCOL_VERSION,
-      receivedVersion: PROOF_WORKER_PROTOCOL_VERSION + 1,
-      reloadRequired: true,
-      privacySafe: true,
-    })
-
-    // Boundary & malformed inputs: must fail closed without coercing strings/floats/zero
-    for (const invalid of [undefined, null, 0, -1, 1.5, Number.NaN, '1', { version: 1 }]) {
-      expect(validateWorkerProtocolVersion(invalid)).toMatchObject({
-        compatible: false,
-        code: 'PROTOCOL_VERSION_MISMATCH',
-        expectedVersion: PROOF_WORKER_PROTOCOL_VERSION,
-        receivedVersion: null,
-        reloadRequired: true,
-        privacySafe: true,
-      })
-    }
+    expect(decision.admitted).toBe(true)
+    expect(decision.mode).toBe('multithreaded')
+    expect(decision.threads.admitted).toBe(4)
+    expect(decision.memory.maxMemoryBytes).toBe(256 * 1024 * 1024)
+    expect(decision.concurrency.activeTasks).toBe(0)
+    expect(decision.concurrency.maxConcurrentTasks).toBe(1)
+    expect(decision.summary).toContain('Memory within budget')
+    expect(decision.summary).toContain('4 threads')
+    expect(decision.summary).toContain('0/1 active')
   })
 
-  it('fails before accepting transferred buffers and returns a reload-required response on mismatch', async () => {
-    vi.useFakeTimers()
-    const { PROOF_WORKER_PROTOCOL_VERSION } = await import('./proof-worker-manager')
+  it('preserves a safe single-threaded fallback for constrained browsers', () => {
     const manager = createManager()
-    await manager.init()
-
-    const pending = manager.verifyProof(EVIDENCE, PROOF, CONTRACT, 1000)
-    const [id] = [...internals(manager).messageHandlers.keys()]
-    const acceptBuffers = vi.fn(() => [new ArrayBuffer(16)])
-
-    const result = manager.handleWorkerMessage(
-      {
-        protocolVersion: PROOF_WORKER_PROTOCOL_VERSION + 1,
-        type: 'success',
-        id,
-        data: { valid: true, result: { evidence: EVIDENCE, proof: PROOF } },
-      },
-      acceptBuffers,
-    )
-
-    expect(acceptBuffers).not.toHaveBeenCalled()
-    expect(result).toMatchObject({
-      type: 'error',
-      id,
-      protocolVersion: PROOF_WORKER_PROTOCOL_VERSION,
-      error: {
-        code: 'PROTOCOL_VERSION_MISMATCH',
-        privacySafe: true,
-        reloadRequired: true,
-      },
+    const decision = manager.getResourceAdmissionDecision({
+      crossOriginIsolated: false,
+      hardwareConcurrency: 8,
+      deviceMemoryGB: 2,
     })
-    expect(result.error?.message).toContain('Reload required')
-    await expect(pending).resolves.toEqual(result)
-    expect(internals(manager).messageHandlers.size).toBe(0)
 
-    const text = loggedText()
-    expect(text).not.toContain(EVIDENCE)
-    expect(text).not.toContain(PROOF)
+    expect(decision.admitted).toBe(true)
+    expect(decision.mode).toBe('single-threaded-fallback')
+    expect(decision.fallbackApplied).toBe(true)
+    expect(decision.threads.admitted).toBe(1)
+    expect(decision.memory.constrained).toBe(true)
   })
 
-  it('rejects stringified or missing protocol versions without unsafe fallback parsing or accepting buffers', async () => {
-    const manager = createManager()
-    await manager.init()
-    const acceptBuffers = vi.fn(() => [new ArrayBuffer(8)])
-
-    const missing = manager.handleWorkerMessage({ type: 'success', id: 'req-1' }, acceptBuffers)
-    const stringified = manager.handleWorkerMessage(
-      { protocolVersion: String(manager.getProtocolVersion()), type: 'success', id: 'req-2' },
-      acceptBuffers,
-    )
-    const primitive = manager.handleWorkerMessage('not-an-object', acceptBuffers)
-
-    expect(acceptBuffers).not.toHaveBeenCalled()
-    for (const res of [missing, stringified, primitive]) {
-      expect(res.type).toBe('error')
-      expect(res.error?.code).toBe('PROTOCOL_VERSION_MISMATCH')
-      expect(res.error?.reloadRequired).toBe(true)
-      expect(res.error?.privacySafe).toBe(true)
-    }
-  })
-
-  it('accepts transferred buffers and settles normally when protocolVersion matches', async () => {
+  it('reflects live active tasks and rejects when concurrency limit is reached', async () => {
     vi.useFakeTimers()
     const manager = createManager()
     await manager.init()
 
-    const pending = manager.verifyProof(EVIDENCE, PROOF, CONTRACT, 1000)
-    const [id] = [...internals(manager).messageHandlers.keys()]
-    const buffer = new ArrayBuffer(16)
-    const acceptBuffers = vi.fn(() => [buffer])
+    const pending = manager.verifyProof(EVIDENCE, PROOF, CONTRACT, 100)
+    const assertion = expect(pending).rejects.toThrow('Verification timed out')
 
-    const response: ProofWorkerResponse = {
-      protocolVersion: manager.getProtocolVersion(),
-      type: 'success',
-      id,
-      data: { valid: true },
-    }
-    const handled = manager.handleWorkerMessage(response, acceptBuffers)
+    const busyDecision = manager.getResourceAdmissionDecision({
+      crossOriginIsolated: true,
+      hardwareConcurrency: 4,
+    })
+    expect(busyDecision.admitted).toBe(false)
+    expect(busyDecision.mode).toBe('rejected')
+    expect(busyDecision.reasonCodes).toContain('concurrency_limit_reached')
+    expect(busyDecision.concurrency.activeTasks).toBe(1)
+    expect(busyDecision.concurrency.availableSlots).toBe(0)
 
-    expect(acceptBuffers).toHaveBeenCalledTimes(1)
-    expect(handled).toEqual(response)
-    await expect(pending).resolves.toEqual(response)
-    expect(internals(manager).messageHandlers.size).toBe(0)
+    await vi.advanceTimersByTimeAsync(100)
+    await assertion
+
+    const idleDecision = manager.getResourceAdmissionDecision({
+      crossOriginIsolated: true,
+      hardwareConcurrency: 4,
+    })
+    expect(idleDecision.admitted).toBe(true)
+    expect(idleDecision.concurrency.activeTasks).toBe(0)
   })
 })

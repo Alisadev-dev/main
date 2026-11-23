@@ -1,98 +1,13 @@
 import type {
-  CSPPolicyConfig,
   ProofWorkerMessage,
+  ProofWorkerResourceAdmissionDecision,
+  ProofWorkerResourceAdmissionInput,
   ProofWorkerResponse,
   WorkerStatus,
 } from './proof.worker.types';
 import { ProofWorkerLogger } from './proof-worker-logger';
 import { validateCSPPolicy, isOriginAllowed, createCSPHeaders } from './csp-policy';
-import {
-  assessWorkerSupport,
-  detectWorkerCapabilities,
-  type WorkerCapabilityId,
-  type WorkerCapabilitySnapshot,
-  type WorkerSupportTier,
-} from './multiBrowserWorkerSupport';
-import {
-  inspectProofWorkerArtifactMetadata,
-  type BrowserArtifactManifestLike,
-  type ProofWorkerArtifactMetadataReport,
-} from '../proofWorkerMemory';
-
-export interface OfflineWorkerCapabilityReport {
-  readonly offline: true;
-  readonly ready: boolean;
-  readonly browser: {
-    readonly ok: boolean;
-    readonly tier: WorkerSupportTier;
-    readonly capabilities: WorkerCapabilitySnapshot;
-    readonly missing: readonly WorkerCapabilityId[];
-    readonly reason: string;
-  };
-  readonly artifacts: ProofWorkerArtifactMetadataReport;
-  readonly csp: {
-    readonly sandbox: boolean;
-    readonly maxMemoryMB: number;
-    readonly maxExecutionTimeMs: number;
-    readonly allowedOriginsCount: number;
-  };
-  readonly issues: readonly string[];
-}
-
-export interface OfflineWorkerCapabilityReportOptions {
-  globalObj?: typeof globalThis;
-  cspConfig?: Partial<CSPPolicyConfig>;
-  manifest?: BrowserArtifactManifestLike;
-}
-
-/**
- * Build an offline capability report for browser proof workers.
- * Inspects required browser features and configured artifact metadata
- * without spawning a worker, loading proving artifacts, or contacting network endpoints.
- */
-export function buildOfflineWorkerCapabilityReport(
-  options: OfflineWorkerCapabilityReportOptions = {}
-): OfflineWorkerCapabilityReport {
-  const cspConfig = validateCSPPolicy(options.cspConfig || {});
-  const capabilities = detectWorkerCapabilities(options.globalObj);
-  const assessment = assessWorkerSupport(options.globalObj);
-  const artifacts = inspectProofWorkerArtifactMetadata(options.manifest);
-
-  const issues: string[] = [];
-  if (!assessment.ok) {
-    issues.push(assessment.reason);
-  }
-  if (artifacts.publishedArtifactCount === 0) {
-    issues.push('No published proving artifacts configured in manifest.');
-  }
-  if (!artifacts.allArtifactsWithinLimit) {
-    issues.push('One or more configured proving artifacts exceed the worker artifact byte limit.');
-  }
-  const cspMemoryBudgetBytes = cspConfig.maxMemoryMB * 1024 * 1024;
-  if (artifacts.totalPublishedArtifactBytes > cspMemoryBudgetBytes) {
-    issues.push('Configured proving artifact metadata exceeds CSP maxMemoryMB budget.');
-  }
-
-  return Object.freeze({
-    offline: true,
-    ready: issues.length === 0,
-    browser: Object.freeze({
-      ok: assessment.ok,
-      tier: assessment.tier,
-      capabilities,
-      missing: assessment.missing,
-      reason: assessment.reason,
-    }),
-    artifacts,
-    csp: Object.freeze({
-      sandbox: cspConfig.sandbox,
-      maxMemoryMB: cspConfig.maxMemoryMB,
-      maxExecutionTimeMs: cspConfig.maxExecutionTimeMs,
-      allowedOriginsCount: cspConfig.allowedOrigins.length,
-    }),
-    issues: Object.freeze(issues),
-  });
-}
+import { evaluateProofWorkerResourceAdmission } from '../proofWorkerMemory';
 
 const logger = new ProofWorkerLogger({ enabled: true });
 const textEncoder = new TextEncoder();
@@ -564,12 +479,37 @@ export class ProofWorkerManager {
     };
   }
 
-  getOfflineCapabilityReport(
-    options: Omit<OfflineWorkerCapabilityReportOptions, 'cspConfig'> = {}
-  ): OfflineWorkerCapabilityReport {
-    return buildOfflineWorkerCapabilityReport({
-      ...options,
-      cspConfig: this.cspConfig,
+  getResourceAdmissionDecision(
+    options: Partial<ProofWorkerResourceAdmissionInput> = {}
+  ): ProofWorkerResourceAdmissionDecision {
+    const nav =
+      typeof navigator !== 'undefined'
+        ? (navigator as Navigator & { deviceMemory?: number })
+        : undefined;
+    const crossOriginIsolated =
+      options.crossOriginIsolated ??
+      (typeof globalThis.crossOriginIsolated === 'boolean'
+        ? globalThis.crossOriginIsolated
+        : false);
+    const hardwareConcurrency =
+      options.hardwareConcurrency !== undefined
+        ? options.hardwareConcurrency
+        : nav?.hardwareConcurrency ?? 1;
+    const deviceMemoryGB =
+      options.deviceMemoryGB !== undefined
+        ? options.deviceMemoryGB
+        : typeof nav?.deviceMemory === 'number'
+          ? nav.deviceMemory
+          : null;
+
+    return evaluateProofWorkerResourceAdmission({
+      usage: options.usage,
+      maxMemoryMB: options.maxMemoryMB ?? this.cspConfig.maxMemoryMB,
+      deviceMemoryGB,
+      crossOriginIsolated,
+      hardwareConcurrency,
+      activeTasks: options.activeTasks ?? this.messageHandlers.size,
+      maxConcurrentTasks: options.maxConcurrentTasks ?? 1,
     });
   }
 
