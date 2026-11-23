@@ -541,13 +541,6 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
           offline={offline}
         />
 
-        <VerificationResultTabs
-          identity={statementIdentity}
-          status={status}
-          offline={offline}
-          chainProof={chainProof}
-        />
-
         {/* Action row — reachable on mobile, adequate touch targets */}
         <div className="verify-actions" role="group" aria-label="Verification actions">
           {isVerifying ? (

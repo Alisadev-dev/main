@@ -7,6 +7,23 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+
+vi.mock('../stellar', () => ({
+  CONTRACT_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+  getVerifierState: vi.fn().mockResolvedValue(null),
+  expireProof: vi.fn(),
+  correctProof: vi.fn(),
+}))
+
+vi.mock('../harpocratesRegistry', () => ({
+  CONTRACT_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+  getVerifierState: vi.fn().mockResolvedValue(null),
+  getOpenDisputeCount: vi.fn().mockResolvedValue(0),
+  getProofHistory: vi.fn().mockResolvedValue({ entries: [], total: 0 }),
+  expireProof: vi.fn(),
+  correctProof: vi.fn(),
+}))
+
 import { StudioView } from './StudioView'
 import { buildProofPreparationPreview } from '../proofPreparationPreview'
 import type { UseEvidenceReturn } from '../hooks/useEvidence'
@@ -66,10 +83,10 @@ function makeEvidence(overrides: Partial<UseEvidenceReturn>): UseEvidenceReturn 
     networkMismatch: null,
     networkMismatchRecovery: null,
     isCancellable: false,
-    admissionState: null,
-    uploadErrorKind: 'none',
-    isRejectedUpload: false,
-    isInvalidEvidence: false,
+    review: null,
+    reviewInvalidatedReason: null,
+    openReview: vi.fn(),
+    closeReview: vi.fn(),
     handleEvidence: vi.fn(),
     retryEvidence: vi.fn(),
     registerProof: vi.fn(),
@@ -194,87 +211,72 @@ describe('StudioView – cancel button', () => {
   })
 })
 
-describe('StudioView – upload admission and queue state', () => {
-  it('renders admission queue banner when upload is rejected by queue limits', () => {
-    renderStudio(
-      makeEvidence({
-        stage: 'error',
-        isRejectedUpload: true,
-        admissionState: {
-          status: 'rejected',
-          reason: 'queue_full',
-          message: 'Upload queue is full. Try again in 5s.',
-          retryAfter: 5,
-          retryable: true,
-          actionHint: 'retry',
-        },
-      }),
-    )
-
-    expect(screen.getByTestId('admission-queue-banner')).toBeInTheDocument()
-    expect(screen.getByTestId('admission-queue-title')).toHaveTextContent(/Rejected \(queue full\)/i)
-    expect(screen.getByTestId('admission-queue-message')).toHaveTextContent('Upload queue is full. Try again in 5s.')
-    expect(screen.getByTestId('admission-queue-retry-hint')).toHaveTextContent('5s')
-    expect(screen.getByRole('button', { name: 'Retry upload' })).toBeInTheDocument()
-    expect(screen.getByTestId('admission-state-value')).toHaveTextContent('REJECTED (queue_full)')
-  })
-
-  it('triggers retryUpload when Retry Upload button is clicked', async () => {
+describe('StudioView – evidence processing review', () => {
+  it('shows Review before registering button and opens review on click', async () => {
     const user = userEvent.setup()
-    const retryUpload = vi.fn()
-    renderStudio(
-      makeEvidence({
-        stage: 'error',
-        isRejectedUpload: true,
-        retryUpload,
-        admissionState: {
-          status: 'rejected',
-          reason: 'identity_limit',
-          message: 'Concurrent upload limit reached for tier.',
-          retryAfter: 10,
-          retryable: true,
-          actionHint: 'retry',
-        },
-      }),
-    )
+    const openReview = vi.fn()
+    renderStudio(makeEvidence({ stage: 'ready', proof, openReview }))
 
-    await user.click(screen.getByRole('button', { name: 'Retry upload' }))
-    expect(retryUpload).toHaveBeenCalledTimes(1)
+    const reviewBtn = screen.getByRole('button', { name: /review before registering/i })
+    expect(reviewBtn).toBeEnabled()
+    await user.click(reviewBtn)
+    expect(openReview).toHaveBeenCalledTimes(1)
   })
 
-  it('renders invalid evidence banner distinct from admission rejection', () => {
-    renderStudio(
-      makeEvidence({
-        stage: 'error',
-        isInvalidEvidence: true,
-        isRejectedUpload: false,
-        admissionState: null,
-        message: 'Unsupported video container format.',
-      }),
-    )
+  it('renders identity tier, statement digest, and network in the review screen', async () => {
+    const user = userEvent.setup()
+    const registerProof = vi.fn()
+    const closeReview = vi.fn()
+    const digest = 'f'.repeat(64)
 
-    expect(screen.getByTestId('invalid-evidence-banner')).toBeInTheDocument()
-    expect(screen.getByTestId('invalid-evidence-message')).toHaveTextContent('Unsupported video container format.')
-    expect(screen.queryByTestId('admission-queue-banner')).not.toBeInTheDocument()
-    expect(screen.getByTestId('admission-state-value')).toHaveTextContent('IDLE')
-  })
-
-  it('renders ADMITTED in data list when evidence proof is ready', () => {
     renderStudio(
       makeEvidence({
         stage: 'ready',
         proof,
-        admissionState: {
-          status: 'admitted',
-          reason: null,
-          message: 'Upload admitted and processed successfully.',
-          retryAfter: null,
-          retryable: false,
-          actionHint: 'none',
+        registerProof,
+        closeReview,
+        review: {
+          tier: 'silent',
+          tierTitle: 'Silent Witness',
+          tierLabel: 'Anonymous Credential',
+          statementDigest: digest,
+          networkName: 'Testnet',
+          networkPassphrase: 'Test SDF Network ; September 2015',
+          proofId: proof.proofId,
+          videoHash: proof.videoHash,
+          metadataHash: proof.metadataHash,
+          sourceHash: proof.sourceHash,
         },
       }),
     )
 
-    expect(screen.getByTestId('admission-state-value')).toHaveTextContent('ADMITTED')
+    const region = screen.getByRole('region', { name: 'Evidence processing review' })
+    expect(region).toBeInTheDocument()
+    expect(region).toHaveTextContent('Silent Witness (Anonymous Credential)')
+    expect(screen.getByTestId('review-statement-digest')).toHaveTextContent(digest)
+    expect(region).toHaveTextContent('Testnet')
+    expect(region).toHaveTextContent('Test SDF Network ; September 2015')
+
+    await user.click(screen.getByRole('button', { name: /confirm & register proof/i }))
+    expect(registerProof).toHaveBeenCalledWith('GSOURCEGAUTH')
+
+    await user.click(screen.getByRole('button', { name: 'Back' }))
+    expect(closeReview).toHaveBeenCalledTimes(1)
+  })
+
+  it('displays an invalidation alert when reviewInvalidatedReason is set', () => {
+    renderStudio(
+      makeEvidence({
+        stage: 'ready',
+        proof,
+        review: null,
+        reviewInvalidatedReason:
+          'Review invalidated because the identity tier changed. Review again before registering.',
+      }),
+    )
+
+    expect(screen.getByRole('alert')).toHaveTextContent(/identity tier changed/i)
+    expect(screen.queryByRole('region', { name: 'Evidence processing review' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /review before registering/i })).toBeInTheDocument()
   })
 })

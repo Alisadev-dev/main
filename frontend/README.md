@@ -88,6 +88,23 @@ All application-owned browser persistence must go through the wrappers in
 Credential or nullifier seeds, proof witnesses, generated proofs, raw private
 inputs, and every other field are prohibited from both `localStorage` and
 `sessionStorage`. Keep secret proof-generation data in memory only.
+
+## Evidence Processing Review
+
+Before submitting a proof to Stellar, Evidence Studio requires an explicit
+pre-registration review step (`openReview` / `EvidenceReviewSnapshot` in
+`src/hooks/useEvidence.ts`, rendered by `src/views/StudioView.tsx`):
+
+- Displays the selected **Identity Tier**, the canonical **Statement Digest**
+  (SHA-256 over the public registration statement, excluding private seeds and
+  raw media), and the target **Stellar Network** name and passphrase.
+- Automatically invalidates an active review whenever the source file, identity
+  tier, or Silent Witness proof parameters (`credentialSeed`, `nullifierSeed`)
+  change, requiring a fresh review before registration can proceed.
+- Enforces fail-closed registration in `registerProof`: submission is blocked
+  unless a valid review snapshot matching the current file and proof parameters
+  is active.
+
 ## Verification Timeline Observations
 
 The verification portal (`src/views/VerifyView.tsx`, `src/components/VerificationTimeline.tsx`,
@@ -103,20 +120,3 @@ with observation provenance without replacing the stage model:
   older than `DEFAULT_OBSERVATION_STALE_MS`) from **Source disagreement**
   (contradictory identity tiers, mismatched video hashes, revoked on-chain
   records vs. active backend events, or metadata envelope mismatches).
-
-## Resumable Batch Verification Checkpoints
-
-Batch verification (`src/batchVerifier.ts`, `src/batchExport.ts`) supports
-fail-closed resumable checkpoints (`harpocrates-batch-checkpoint` v1):
-
-- **Privacy-safe persistence**: Checkpoints (`BatchVerificationCheckpoint`,
-  `exportBatchCheckpoint`, `parseBatchCheckpoint`) persist only nonsecret file
-  fingerprints (index, name, byte size, `lastModified`, MIME type, and bounded
-  head/tail SHA-256 `sampleHash`), policy limits, network context, and completed
-  sanitized results. Raw `File` handles, media bytes, and wallet addresses are
-  never persisted.
-- **Fail-closed resume validation**: `BatchVerifier.resumeBatch` (and
-  `runBatch(..., { checkpoint })`) validates input file identities, policy
-  limits (`maxFileSizeBytes`, `maxTotalSizeBytes`), and network context
-  (`apiBase`, `contractId`, `network`) via `validateBatchCheckpoint` and rejects
-  resumption with `BatchCheckpointError` on any mismatch or malformed payload.

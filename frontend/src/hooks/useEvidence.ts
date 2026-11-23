@@ -75,25 +75,47 @@ const CANCELLED_MESSAGES: Record<Stage, string> = {
   cancelled: 'Request cancelled.',
 }
 
-export type NetworkMismatchRecoveryState = {
-  /** Human-readable name of the network required by the deployed contract (e.g. "Testnet"). */
-  requiredNetwork: string
-  /** Human-readable name of the wallet's currently reported network (e.g. "Mainnet"), or "Unavailable". */
-  currentWalletNetwork: string
-  /** Non-identifying explanation of the mismatch. */
-  reason: string
-  /** Actionable remediation guidance for switching networks. */
-  remediation: string
-  /** True while a fresh network and evidence-intent validation is in progress. */
-  isValidating: boolean
-  /** Snapshot of the evidence intent active when the mismatch was detected. */
-  intent: {
-    proofId: string
-    tier: IdentityTier
-    videoHash: string
-  } | null
-  /** Optional privacy-safe error message from the most recent re-validation attempt. */
-  validationError: string | null
+export type EvidenceReviewSnapshot = {
+  /** Selected identity tier being registered. */
+  tier: IdentityTier
+  /** Human-readable tier title (e.g. "Silent Witness"). */
+  tierTitle: string
+  /** Human-readable tier label (e.g. "Anonymous Credential"). */
+  tierLabel: string
+  /** Canonical SHA-256 hex digest of the public registration statement. */
+  statementDigest: string
+  /** Human-readable Stellar network name (e.g. "Testnet"). */
+  networkName: string
+  /** Canonical Stellar network passphrase. */
+  networkPassphrase: string
+  /** Proof identifiers bound to this review snapshot. */
+  proofId: string
+  videoHash: string
+  metadataHash: string
+  sourceHash: string
+}
+
+/**
+ * Compute a canonical, privacy-safe SHA-256 digest of the public registration
+ * statement. Private seeds, witness proofs, and raw media are never included.
+ */
+export async function computeStatementDigest(input: {
+  tier: IdentityTier
+  videoHash: string
+  metadataHash: string
+  proofId: string
+  networkPassphrase: string
+}): Promise<string> {
+  const { sha256 } = await import('../utils')
+  const canonical = JSON.stringify({
+    schema: 'harpocrates.evidence-review.v1',
+    tier: input.tier,
+    videoHash: input.videoHash,
+    metadataHash: input.metadataHash,
+    proofId: input.proofId,
+    network: input.networkPassphrase,
+  })
+  return sha256(canonical)
 }
 
 export type UseEvidenceReturn = {
@@ -126,10 +148,12 @@ export type UseEvidenceReturn = {
   /** Guided recovery state when the wallet network does not match the required contract network. */
   networkMismatchRecovery: NetworkMismatchRecoveryState | null
   isCancellable: boolean
-  admissionState: UploadAdmissionState | null
-  uploadErrorKind: UploadErrorKind
-  isRejectedUpload: boolean
-  isInvalidEvidence: boolean
+  /** Active pre-registration review snapshot, or null when closed/invalidated. */
+  review: EvidenceReviewSnapshot | null
+  /** Privacy-safe reason explaining why a previously opened review was invalidated. */
+  reviewInvalidatedReason: string | null
+  openReview: () => Promise<void>
+  closeReview: () => void
   handleEvidence: (nextFile: File | null) => Promise<void>
   /** Retry evidence processing tied to the reviewed file identity. */
   retryEvidence: () => Promise<void>
@@ -148,15 +172,23 @@ type PendingRegistration = {
   wallet: string
 }
 
+type ReviewFingerprint = {
+  file: File | null
+  proofId: string
+  tier: IdentityTier
+  credentialSeed: string
+  nullifierSeed: string
+}
+
 export function useEvidence(): UseEvidenceReturn {
-  const [selectedTier, setSelectedTier] = useState<IdentityTier>('silent')
+  const [selectedTier, setSelectedTierState] = useState<IdentityTier>('silent')
   const [stage, setStage] = useState<Stage>('idle')
   const [hashProgress, setHashProgress] = useState<HashProgress | null>(null)
   const [file, setFile] = useState<File | null>(null)
   const [proof, setProof] = useState<ProofPackage | null>(null)
   const [processedVideoUrl, setProcessedVideoUrl] = useState<string>('')
-  const [credentialSeed, setCredentialSeed] = useState<string>('')
-  const [nullifierSeed, setNullifierSeed] = useState<string>('')
+  const [credentialSeed, setCredentialSeedState] = useState<string>('')
+  const [nullifierSeed, setNullifierSeedState] = useState<string>('')
   const [message, setMessage] = useState<string>('Upload evidence to begin.')
   const [evidenceNotes, setEvidenceNotesState] = useState<string>('')
   const evidenceNotesRef = useRef<string>('')
@@ -169,14 +201,19 @@ export function useEvidence(): UseEvidenceReturn {
   } | null>(null)
   const [registration, setRegistration] = useState<RegisterProofResult | null>(null)
   const [networkMismatch, setNetworkMismatch] = useState<string | null>(null)
-  const [admissionState, setAdmissionState] = useState<UploadAdmissionState | null>(null)
-  const [uploadErrorKind, setUploadErrorKind] = useState<UploadErrorKind>('none')
+  const [review, setReview] = useState<EvidenceReviewSnapshot | null>(null)
+  const [reviewInvalidatedReason, setReviewInvalidatedReason] = useState<string | null>(null)
   // Keep retries safe: a completed proof/wallet pair must never be submitted twice.
   const registrationInFlightedRef = useRef<boolean>(false)
   const completedRegistrationRef = useRef<string | null>(null)
   const pendingPersistenceRef = useRef<PendingRegistration | null>(null)
   const processedVideoUrlRef = useRef<string>('')
   const hasSelectedEvidenceRef = useRef<boolean>(false)
+
+  // Review state refs for synchronous invalidation and fail-closed registration checks.
+  const reviewRef = useRef<EvidenceReviewSnapshot | null>(null)
+  const reviewFingerprintRef = useRef<ReviewFingerprint | null>(null)
+  const reviewSeqRef = useRef<number>(0)
 
   // Sequence guard + abort plumbing so stale uploads/proofs cannot clobber a
   // newer flow or a reset caused by cancellation.
@@ -242,19 +279,95 @@ export function useEvidence(): UseEvidenceReturn {
 
   const isCancellable = stage === 'hashing' || stage === 'embedding' || stage === 'proving'
 
-  function clearProcessedVideoUrl() {
-    if (processedVideoUrlRef.current) {
-      URL.revokeObjectURL(processedVideoUrlRef.current)
-      processedVideoUrlRef.current = ''
-    }
-    setProcessedVideoUrl('')
+  function clearReviewState() {
+    reviewSeqRef.current += 1
+    reviewRef.current = null
+    reviewFingerprintRef.current = null
+    setReview(null)
+    setReviewInvalidatedReason(null)
   }
 
-  function clearEvidenceChangeNotice() {
-    setEvidenceChangeNotice(null)
+  function invalidateReview(reason: string) {
+    reviewSeqRef.current += 1
+    const hadActiveReview = reviewRef.current !== null
+    reviewRef.current = null
+    reviewFingerprintRef.current = null
+    setReview(null)
+    if (hadActiveReview) {
+      setReviewInvalidatedReason(reason)
+      setMessage(reason)
+    }
+  }
+
+  function setSelectedTier(nextTier: IdentityTier) {
+    if (nextTier === selectedTier) return
+    setSelectedTierState(nextTier)
+    invalidateReview(
+      'Review invalidated because the identity tier changed. Review again before registering.',
+    )
+  }
+
+  function setCredentialSeed(value: string) {
+    if (value === credentialSeed) return
+    setCredentialSeedState(value)
+    invalidateReview(
+      'Review invalidated because proof parameters changed. Review again before registering.',
+    )
+  }
+
+  function setNullifierSeed(value: string) {
+    if (value === nullifierSeed) return
+    setNullifierSeedState(value)
+    invalidateReview(
+      'Review invalidated because proof parameters changed. Review again before registering.',
+    )
+  }
+
+  async function openReview() {
+    if (!proof || isCancellable) return
+    const reviewSeq = ++reviewSeqRef.current
+    const fingerprint: ReviewFingerprint = {
+      file,
+      proofId: proof.proofId,
+      tier: selectedTier,
+      credentialSeed,
+      nullifierSeed,
+    }
+    const { CONTRACT_NETWORK_PASSPHRASE } = await import('../stellar')
+    const { networkName } = await import('../networkGuard')
+    const statementDigest = await computeStatementDigest({
+      tier: selectedTier,
+      videoHash: proof.videoHash,
+      metadataHash: proof.metadataHash,
+      proofId: proof.proofId,
+      networkPassphrase: CONTRACT_NETWORK_PASSPHRASE,
+    })
+    if (reviewSeqRef.current !== reviewSeq) return
+    const snapshot: EvidenceReviewSnapshot = {
+      tier: selectedTier,
+      tierTitle: selectedTierMeta.title,
+      tierLabel: selectedTierMeta.label,
+      statementDigest,
+      networkName: networkName(CONTRACT_NETWORK_PASSPHRASE),
+      networkPassphrase: CONTRACT_NETWORK_PASSPHRASE,
+      proofId: proof.proofId,
+      videoHash: proof.videoHash,
+      metadataHash: proof.metadataHash,
+      sourceHash: proof.sourceHash,
+    }
+    reviewRef.current = snapshot
+    reviewFingerprintRef.current = fingerprint
+    setReview(snapshot)
+    setReviewInvalidatedReason(null)
+    setMessage('Review the evidence details below before registering on Stellar.')
+  }
+
+  function closeReview() {
+    clearReviewState()
   }
 
   function resetFlow() {
+    clearReviewState()
     abortRef.current?.abort()
     abortRef.current = null
     seqRef.current += 1
@@ -299,39 +412,13 @@ export function useEvidence(): UseEvidenceReturn {
   async function handleEvidence(nextFile: File | null) {
     if (!nextFile) return
 
-    const prevReviewed = reviewedFileRef.current
-    const isSameReviewedFile =
-      prevReviewed !== null &&
-      (prevReviewed.file === nextFile ||
-        (prevReviewed.name === nextFile.name &&
-          prevReviewed.size === nextFile.size &&
-          prevReviewed.lastModified === nextFile.lastModified))
-
-    if (!prevReviewed) {
-      reviewedFileRef.current = {
-        file: nextFile,
-        name: nextFile.name,
-        size: nextFile.size,
-        lastModified: nextFile.lastModified,
-      }
-    } else if (!isSameReviewedFile) {
-      // Selecting a different file resets the reviewed file identity and clears previous notes
-      reviewedFileRef.current = {
-        file: nextFile,
-        name: nextFile.name,
-        size: nextFile.size,
-        lastModified: nextFile.lastModified,
-      }
-      notesEditSeqRef.current += 1
-      evidenceNotesRef.current = ''
-      setEvidenceNotesState('')
+    if (reviewRef.current !== null) {
+      invalidateReview(
+        'Review invalidated because the source file changed. Review again before registering.',
+      )
     } else {
-      // Retrying or re-submitting the same reviewed file identity:
-      // keep the updated File instance and preserve user-entered evidence notes
-      reviewedFileRef.current.file = nextFile
+      clearReviewState()
     }
-
-    const editSeqAtStart = notesEditSeqRef.current
 
     evidenceFlowAbortRef.current?.abort()
     const controller = new AbortController()
@@ -502,6 +589,30 @@ export function useEvidence(): UseEvidenceReturn {
   async function registerProof(wallet: string) {
     if (!proof) return
 
+    const activeReview = reviewRef.current
+    const fingerprint = reviewFingerprintRef.current
+    const reviewMatchesCurrentState =
+      activeReview !== null &&
+      fingerprint !== null &&
+      fingerprint.file === file &&
+      fingerprint.proofId === proof.proofId &&
+      fingerprint.tier === selectedTier &&
+      fingerprint.credentialSeed === credentialSeed &&
+      fingerprint.nullifierSeed === nullifierSeed
+
+    if (!reviewMatchesCurrentState) {
+      if (activeReview !== null) {
+        invalidateReview(
+          'Review invalidated because the source file or proof parameters changed. Review again before registering.',
+        )
+      } else {
+        setMessage(
+          reviewInvalidatedReason ?? 'Review the evidence package before registering.',
+        )
+      }
+      return
+    }
+
     if (!CONTRACT_ID) {
       setMessage('Set VITE_HARPOCRATES_REGISTRY_ID after deploying the Soroban contract.')
       return
@@ -629,6 +740,7 @@ export function useEvidence(): UseEvidenceReturn {
       await persistRegistration(proofForRegistration, result, wallet)
       pendingPersistenceRef.current = null
       completedRegistrationRef.current = registrationKey
+      clearReviewState()
       setRegistration(result)
       setEvidenceChangeNotice(null)
       setStage('registered')
@@ -854,10 +966,10 @@ export function useEvidence(): UseEvidenceReturn {
     networkMismatch,
     networkMismatchRecovery,
     isCancellable,
-    admissionState,
-    uploadErrorKind,
-    isRejectedUpload,
-    isInvalidEvidence,
+    review,
+    reviewInvalidatedReason,
+    openReview,
+    closeReview,
     handleEvidence,
     retryEvidence,
     registerProof,
