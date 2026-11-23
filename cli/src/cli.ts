@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import { createReadStream } from 'node:fs'
-import { writeFile } from 'node:fs/promises'
+import { realpath, stat, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { resolve } from 'node:path'
+import { basename, dirname, resolve } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 import { StrKey } from '@stellar/stellar-sdk'
@@ -38,13 +38,7 @@ import { createRequire } from 'node:module'
 import { parseCliArgs, CliUsageError, type ParsedArgs } from './args.js'
 import { handleRegister } from './register.js'
 import { DEFAULT_NETWORK_PASSPHRASE, resolveNetwork } from './network.js'
-import {
-  assertDistinctInputOutputPaths,
-  pathsResolveToSameFile,
-  SameInputOutputPathError,
-} from './path-guard.js'
-
-export { pathsResolveToSameFile }
+import { runCheckCompat } from './compat.js'
 
 function getCliVersion(): string {
   const require = createRequire(import.meta.url)
@@ -77,6 +71,54 @@ export async function readText(
     chunks.push(Buffer.from(chunk))
   }
   return Buffer.concat(chunks).toString('utf-8')
+}
+
+function normalizeForCompare(targetPath: string): string {
+  return process.platform === 'win32' ? targetPath.toLowerCase() : targetPath
+}
+
+async function resolveCanonicalPath(filePath: string): Promise<string> {
+  const absolute = resolve(filePath)
+  try {
+    return await realpath(absolute)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'ENOENT') {
+      try {
+        const parentReal = await realpath(dirname(absolute))
+        return resolve(parentReal, basename(absolute))
+      } catch {
+        return absolute
+      }
+    }
+    return absolute
+  }
+}
+
+export async function pathsResolveToSameFile(inputPath: string, outputPath: string): Promise<boolean> {
+  if (!inputPath || !outputPath || inputPath === '-' || outputPath === '-') {
+    return false
+  }
+
+  const [canonicalInput, canonicalOutput] = await Promise.all([
+    resolveCanonicalPath(inputPath),
+    resolveCanonicalPath(outputPath),
+  ])
+
+  if (normalizeForCompare(canonicalInput) === normalizeForCompare(canonicalOutput)) {
+    return true
+  }
+
+  try {
+    const [inStat, outStat] = await Promise.all([stat(inputPath), stat(outputPath)])
+    if (inStat.dev === outStat.dev && inStat.ino === outStat.ino && inStat.ino !== 0) {
+      return true
+    }
+  } catch {
+    // One or both paths do not exist yet; canonical path comparison above is authoritative.
+  }
+
+  return false
 }
 
 function printJson(data: unknown): void {
@@ -186,6 +228,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
       return await handleVerify(flags, debugLog)
     case 'status':
       return await handleStatus(flags, debugLog)
+    case 'check-compat':
+      return await handleCheckCompat(flags, debugLog)
     case 'manifest':
       return await handleManifest(flags, debugLog)
     case 'hash':
@@ -298,11 +342,8 @@ async function handleManifest(flags: Record<string, string>, debugLog: (event: R
     exit(2, '--input is required for manifest creation')
   }
 
-  try {
-    await assertDistinctInputOutputPaths([{ flag: '--input', path: inputPath }], outputPath)
-  } catch (err) {
-    if (err instanceof SameInputOutputPathError) exit(2, err.message)
-    throw err
+  if (outputPath && (await pathsResolveToSameFile(inputPath, outputPath))) {
+    exit(2, '--output must not resolve to the same file as --input')
   }
 
   let metadata: HarpocratesMetadata
@@ -472,17 +513,11 @@ async function handleC2pa(flags: Record<string, string>, debugLog: (event: Recor
     exit(2, '--manifest is required for c2pa export')
   }
 
-  try {
-    await assertDistinctInputOutputPaths(
-      [
-        { flag: '--manifest', path: inputPath },
-        { flag: '--receipt', path: receiptPath },
-      ],
-      outputPath,
-    )
-  } catch (err) {
-    if (err instanceof SameInputOutputPathError) exit(2, err.message)
-    throw err
+  if (outputPath && (await pathsResolveToSameFile(inputPath, outputPath))) {
+    exit(2, '--output must not resolve to the same file as --manifest')
+  }
+  if (outputPath && receiptPath && (await pathsResolveToSameFile(receiptPath, outputPath))) {
+    exit(2, '--output must not resolve to the same file as --receipt')
   }
 
   let manifest: ReturnType<typeof parseManifest>
@@ -707,6 +742,19 @@ export async function handleStatus(
   exit(STATUS_EXIT_CODES[status] ?? 8)
 }
 
+export async function handleCheckCompat(
+  flags: Record<string, string>,
+  debugLog: (event: Record<string, unknown>) => void = () => {},
+): Promise<void> {
+  const code = await runCheckCompat(flags, {
+    readText,
+    writeStdout: (text) => process.stdout.write(text),
+    writeStderr: (text) => process.stderr.write(text),
+    debugLog,
+  })
+  exit(code)
+}
+
 export function helpText(): string {
   const help = `
 Harpocrates CLI – headless verification and proof utilities
@@ -718,6 +766,7 @@ Usage:
 Commands:
   verify         Verify a proof against the Stellar network.
   status         Report the on-chain lifecycle status of a proof by proof ID.
+  check-compat   Compare bundle metadata against selected network and contract config.
   verify-lineage Verify a derivative's full lineage back to registered originals.
   register       Register a source or seal proof using a local signing key.
   manifest       Create a proof manifest from metadata.
@@ -751,6 +800,13 @@ Status options:
   --source-address  Source address for simulation.
   --network         Network: testnet, mainnet/public, futurenet, or a full passphrase (default: testnet).
   --output, -o      Output format: "text" (default) or "json".
+
+Check-compat options:
+  --manifest, -m    Path to a proof manifest JSON file (use "-" for stdin; required).
+  --contract-id     Selected contract ID on Stellar to compare against (required).
+  --network         Selected network: testnet, mainnet/public, futurenet, or a full passphrase (default: testnet).
+  --output, -o      Output format: "text" (default) or "json".
+  Performs local metadata inspection only: no signing, no chain writes, and no RPC calls.
 
 Lineage verification options:
   --output-digest  32-byte hex digest of the derivative (required).
