@@ -13,8 +13,7 @@ from capture_attestation import (
 from issuer_key_transparency import (
     DEFAULT_FRESHNESS_SECONDS,
     HIGH_ASSURANCE_FRESHNESS_SECONDS,
-    SNAPSHOT_PROTOCOL,
-    CheckpointReference,
+    ConsistencyProofBundle,
     DirectoryCache,
     DirectoryCheckpoint,
     DirectoryEvent,
@@ -31,11 +30,11 @@ from issuer_key_transparency import (
     KeyStatus,
     PolicyVersion,
     TransparencyError,
-    TrustChangeReason,
-    TrustState,
-    assess_issuer_trust,
-    compare_issuer_trust,
+    advance_tree_head,
+    build_consistency_proof_bundle,
+    canonicalize_consistency_proof_bundle,
     compute_tree_head,
+    consistency_proof_bundle_hash,
     create_activation_event,
     create_rotation_event,
     detect_rollback,
@@ -49,9 +48,9 @@ from issuer_key_transparency import (
     preview_directory_import,
     rebuild_directory,
     require_fresh_checkpoint,
-    trust_snapshot_hash,
+    require_valid_consistency_proof_bundle,
     verify_checkpoint_consistency,
-    verify_offline_trust_snapshot,
+    verify_consistency_proof_bundle,
 )
 
 ORG = "a" * 64
@@ -396,177 +395,190 @@ class PrivacyTests(unittest.TestCase):
         self.assertIn("organizationIdentityHash", encoded)
 
 
-class IssuerTrustChangeTests(unittest.TestCase):
-    def _active_directory(
+class ConsistencyProofBundleTests(unittest.TestCase):
+    def _build_two_checkpoint_history(
         self,
-        *,
-        key_valid_until: int | None = None,
-        manifest_valid_until: int | None = None,
-    ) -> tuple[IssuerDirectory, DirectoryCheckpoint]:
+    ) -> tuple[IssuerDirectory, DirectoryCheckpoint, DirectoryCheckpoint]:
         e0 = create_activation_event(ORG, "k1", KEY_A, 0, 1000)
         d = rebuild_directory(ORG, [e0])
-        m = IssuerManifest(
+        m1 = _manifest([IssuerKey("k1", KEY_A, "ed25519", 1000)], valid_from=1000)
+        d.publish_manifest(m1)
+        cp1 = d.make_checkpoint(timestamp=1500, signature_hash=SIG)
+
+        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(e0))
+        d.append_event(e1)
+        e2 = DirectoryEvent(
+            event_type=EventType.RETIREMENT,
+            sequence=2,
+            timestamp=2500,
             organization_identity_hash=ORG,
-            issuer_address="GTESTISSUERADDRESSXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
-            active_keys=[IssuerKey("k1", KEY_A, "ed25519", 1000, valid_until=key_valid_until)],
-            policy_hash=POLICY,
-            valid_from=1000,
-            valid_until=manifest_valid_until,
-            signature_hash=SIG,
+            key_id="k1",
+            public_key_hash=KEY_A,
+            previous_event_hash=event_hash(e1),
+            reason_hash="1" * 64,
         )
-        d.publish_manifest(m)
-        cp = d.make_checkpoint(timestamp=1100, signature_hash=SIG)
-        return d, cp
-
-    def test_unchanged_trust_across_runs(self) -> None:
-        d, cp = self._active_directory()
-        cache = DirectoryCache(checkpoint=cp, fetched_at=1200)
-        run1 = assess_issuer_trust(d, "k1", signature_timestamp=1200, cache=cache, now=1200)
-        run2 = assess_issuer_trust(d, "k1", signature_timestamp=1200, cache=cache, now=1300)
-        change = compare_issuer_trust(run1, run2)
-        self.assertFalse(change.changed)
-        self.assertEqual(change.previous_state, TrustState.TRUSTED)
-        self.assertEqual(change.current_state, TrustState.TRUSTED)
-        self.assertEqual(change.reason, TrustChangeReason.UNCHANGED)
-
-    def test_rotation_distinguished_for_historical_and_new_signatures(self) -> None:
-        d, _ = self._active_directory()
-        run1 = assess_issuer_trust(d, "k1", signature_timestamp=1500, now=1500)
-        self.assertEqual(run1.state, TrustState.TRUSTED)
-
-        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(d.events[0]))
-        d.append_event(e1)
-
-        # Historical signature made before rotation stays historically valid with rotation reason
-        run2_hist = assess_issuer_trust(d, "k1", signature_timestamp=1500, now=2100)
-        change_hist = compare_issuer_trust(run1, run2_hist)
-        self.assertTrue(change_hist.changed)
-        self.assertEqual(change_hist.previous_state, TrustState.TRUSTED)
-        self.assertEqual(change_hist.current_state, TrustState.HISTORICALLY_VALID)
-        self.assertEqual(change_hist.reason, TrustChangeReason.KEY_ROTATED)
-        self.assertEqual(change_hist.successor_key_id, "k2")
-
-        # New signature at/after rotation boundary is untrusted due to rotation
-        run2_new = assess_issuer_trust(d, "k1", signature_timestamp=2000, now=2100)
-        change_new = compare_issuer_trust(run1, run2_new)
-        self.assertTrue(change_new.changed)
-        self.assertEqual(change_new.current_state, TrustState.UNTRUSTED)
-        self.assertEqual(change_new.reason, TrustChangeReason.KEY_ROTATED)
-        self.assertEqual(change_new.successor_key_id, "k2")
-
-    def test_expiry_distinguished_from_rotation_and_compromise(self) -> None:
-        d, _ = self._active_directory(key_valid_until=2000)
-        run1 = assess_issuer_trust(d, "k1", signature_timestamp=1999, now=1999)
-        self.assertEqual(run1.state, TrustState.TRUSTED)
-
-        run2 = assess_issuer_trust(d, "k1", signature_timestamp=2000, now=2000)
-        change = compare_issuer_trust(run1, run2)
-        self.assertTrue(change.changed)
-        self.assertEqual(change.previous_state, TrustState.TRUSTED)
-        self.assertEqual(change.current_state, TrustState.UNTRUSTED)
-        self.assertEqual(change.reason, TrustChangeReason.KEY_EXPIRED)
-        self.assertIsNone(change.successor_key_id)
-
-    def test_compromise_distinguished_and_surfaces_reason_hash(self) -> None:
-        d, _ = self._active_directory()
-        run1 = assess_issuer_trust(d, "k1", signature_timestamp=1500, now=1500)
-        self.assertEqual(run1.state, TrustState.TRUSTED)
-
-        reason_digest = "7" * 64
-        d.append_event(
-            DirectoryEvent(
-                event_type=EventType.COMPROMISE,
-                sequence=1,
-                timestamp=1800,
-                organization_identity_hash=ORG,
-                key_id="k1",
-                public_key_hash=KEY_A,
-                previous_event_hash=event_hash(d.events[0]),
-                reason_hash=reason_digest,
-            )
-        )
-
-        # Pre-compromise historical signature surfaces compromise status
-        run2_pre = assess_issuer_trust(d, "k1", signature_timestamp=1500, now=1900)
-        change_pre = compare_issuer_trust(run1, run2_pre)
-        self.assertTrue(change_pre.changed)
-        self.assertEqual(change_pre.current_state, TrustState.HISTORICALLY_VALID)
-        self.assertEqual(change_pre.reason, TrustChangeReason.KEY_COMPROMISED)
-        self.assertEqual(change_pre.reason_hash, reason_digest)
-
-        # Post-compromise signature is untrusted due to compromise
-        run2_post = assess_issuer_trust(d, "k1", signature_timestamp=1800, now=1900)
-        change_post = compare_issuer_trust(run1, run2_post)
-        self.assertTrue(change_post.changed)
-        self.assertEqual(change_post.current_state, TrustState.UNTRUSTED)
-        self.assertEqual(change_post.reason, TrustChangeReason.KEY_COMPROMISED)
-        self.assertEqual(change_post.reason_hash, reason_digest)
-
-    def test_stale_directory_state_fail_closed_across_runs(self) -> None:
-        d, cp = self._active_directory()
-        cache = DirectoryCache(checkpoint=cp, fetched_at=1500)
-        run1 = assess_issuer_trust(
-            d, "k1", signature_timestamp=1500, cache=cache, high_assurance=True, now=1500
-        )
-        self.assertEqual(run1.state, TrustState.TRUSTED)
-
-        stale_now = 1500 + HIGH_ASSURANCE_FRESHNESS_SECONDS + 1
-        run2 = assess_issuer_trust(
-            d, "k1", signature_timestamp=1500, cache=cache, high_assurance=True, now=stale_now
-        )
-        change = compare_issuer_trust(run1, run2)
-        self.assertTrue(change.changed)
-        self.assertEqual(change.previous_state, TrustState.TRUSTED)
-        self.assertEqual(change.current_state, TrustState.STALE)
-        self.assertEqual(change.reason, TrustChangeReason.STALE_DIRECTORY)
-        self.assertEqual(run2.checkpoint_age_seconds, HIGH_ASSURANCE_FRESHNESS_SECONDS + 1)
-
-    def test_checkpoint_rollback_across_runs_flagged_inconsistent(self) -> None:
-        d, cp1 = self._active_directory()
-        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(d.events[0]))
-        d.append_event(e1)
+        d.append_event(e2)
         m2 = _manifest(
             [IssuerKey("k2", KEY_B, "ed25519", 2000)],
-            predecessor=manifest_hash(d.current_manifest),  # type: ignore[arg-type]
+            predecessor=manifest_hash(m1),
             valid_from=2000,
         )
         d.publish_manifest(m2)
-        cp2 = d.make_checkpoint(timestamp=2100, signature_hash=SIG)
+        cp2 = d.make_checkpoint(timestamp=3000, signature_hash=SIG)
+        return d, cp1, cp2
 
-        run1 = assess_issuer_trust(d, "k2", signature_timestamp=2100, now=2100)
-        run2 = assess_issuer_trust(d, "k2", signature_timestamp=2100, now=2200)
-        change = compare_issuer_trust(
-            run1, run2, previous_checkpoint=cp2, current_checkpoint=cp1
+    def test_portable_bundle_roundtrip_and_offline_verification(self) -> None:
+        d, cp1, cp2 = self._build_two_checkpoint_history()
+        bundle = d.make_consistency_proof_bundle(cp1, cp2)
+        self.assertEqual(len(bundle.intervening_events), 2)
+        self.assertEqual(
+            advance_tree_head(cp1.tree_head_hash, bundle.intervening_events),
+            cp2.tree_head_hash,
         )
-        self.assertTrue(change.changed)
-        self.assertEqual(change.current_state, TrustState.UNTRUSTED)
-        self.assertEqual(change.reason, TrustChangeReason.DIRECTORY_INCONSISTENT)
-        self.assertTrue(any("rollback" in e.lower() for e in change.rollback_errors))
 
-    def test_boundary_unknown_key_not_yet_valid_and_mismatch_errors(self) -> None:
-        d, _ = self._active_directory()
-        unknown = assess_issuer_trust(d, "missing", signature_timestamp=1500, now=1500)
-        self.assertEqual(unknown.state, TrustState.UNTRUSTED)
-        self.assertEqual(unknown.reason, TrustChangeReason.UNKNOWN_KEY)
+        # Serialize to canonical JSON and verify completely offline (no directory).
+        raw_json = bundle.to_json()
+        restored = ConsistencyProofBundle.from_json(raw_json)
+        self.assertEqual(
+            consistency_proof_bundle_hash(bundle),
+            consistency_proof_bundle_hash(restored),
+        )
+        self.assertEqual(canonicalize_consistency_proof_bundle(restored), raw_json)
+        self.assertEqual(
+            verify_consistency_proof_bundle(
+                restored,
+                expected_organization_identity_hash=ORG,
+                expected_earlier_checkpoint=cp1,
+            ),
+            [],
+        )
+        self.assertIs(
+            require_valid_consistency_proof_bundle(
+                restored,
+                expected_organization_identity_hash=ORG,
+                expected_earlier_checkpoint=cp1,
+            ),
+            restored,
+        )
 
-        early = assess_issuer_trust(d, "k1", signature_timestamp=999, now=1500)
-        self.assertEqual(early.state, TrustState.UNTRUSTED)
-        self.assertEqual(early.reason, TrustChangeReason.NOT_YET_VALID)
+    def test_zero_event_identity_bundle_and_genesis_bundle(self) -> None:
+        d, cp1, _ = self._build_two_checkpoint_history()
+        # Same checkpoint -> 0 intervening events
+        identity_bundle = build_consistency_proof_bundle(d, cp1, cp1)
+        self.assertEqual(identity_bundle.intervening_events, ())
+        self.assertEqual(verify_consistency_proof_bundle(identity_bundle), [])
 
+        # Genesis (0 events) -> cp1 (1 event)
+        d_gen = IssuerDirectory(ORG)
+        m0 = _manifest([], valid_from=500)
+        d_gen.publish_manifest(m0)
+        cp0 = d_gen.make_checkpoint(timestamp=500, signature_hash=SIG)
+        e0 = create_activation_event(ORG, "k1", KEY_A, 0, 1000)
+        d_gen.append_event(e0)
+        m1 = _manifest(
+            [IssuerKey("k1", KEY_A, "ed25519", 1000)],
+            predecessor=manifest_hash(m0),
+            valid_from=1000,
+        )
+        d_gen.publish_manifest(m1)
+        cp_after = d_gen.make_checkpoint(timestamp=1200, signature_hash=SIG)
+        genesis_bundle = d_gen.make_consistency_proof_bundle(cp0, cp_after)
+        self.assertEqual(len(genesis_bundle.intervening_events), 1)
+        self.assertEqual(verify_consistency_proof_bundle(genesis_bundle), [])
+
+    def test_rejects_tampered_intervening_event(self) -> None:
+        d, cp1, cp2 = self._build_two_checkpoint_history()
+        bundle = d.make_consistency_proof_bundle(cp1, cp2)
+        ev0 = bundle.intervening_events[0]
+        tampered_ev0 = DirectoryEvent(
+            event_type=ev0.event_type,
+            sequence=ev0.sequence,
+            timestamp=ev0.timestamp + 1,
+            organization_identity_hash=ev0.organization_identity_hash,
+            key_id=ev0.key_id,
+            public_key_hash=ev0.public_key_hash,
+            previous_event_hash=ev0.previous_event_hash,
+            related_key_id=ev0.related_key_id,
+        )
+        tampered = ConsistencyProofBundle(
+            earlier_checkpoint=cp1,
+            later_checkpoint=cp2,
+            intervening_events=(tampered_ev0, bundle.intervening_events[1]),
+        )
+        errors = verify_consistency_proof_bundle(tampered)
+        self.assertTrue(any("broken continuity" in e.lower() for e in errors))
         with self.assertRaises(TransparencyError):
-            compare_issuer_trust(unknown, early)
+            require_valid_consistency_proof_bundle(tampered)
 
-    def test_trust_change_serialization_excludes_private_fields(self) -> None:
-        d, _ = self._active_directory(key_valid_until=2000)
-        run1 = assess_issuer_trust(d, "k1", signature_timestamp=1500, now=1500)
-        run2 = assess_issuer_trust(d, "k1", signature_timestamp=2000, now=2000)
-        change = compare_issuer_trust(run1, run2)
-        self.assertIsInstance(run2, IssuerTrustAssessment)
-        self.assertIsInstance(change, IssuerTrustChange)
-        blob = str({"assessment": run2.to_dict(), "change": change.to_dict()}).lower()
+    def test_rejects_missing_intervening_event(self) -> None:
+        d, cp1, cp2 = self._build_two_checkpoint_history()
+        bundle = d.make_consistency_proof_bundle(cp1, cp2)
+        truncated = ConsistencyProofBundle(
+            earlier_checkpoint=cp1,
+            later_checkpoint=cp2,
+            intervening_events=(bundle.intervening_events[0],),
+        )
+        errors = verify_consistency_proof_bundle(truncated)
+        self.assertTrue(any("count mismatch" in e.lower() for e in errors))
+
+    def test_rejects_rollback_and_equivocation(self) -> None:
+        d, cp1, cp2 = self._build_two_checkpoint_history()
+        # Rollback: later < earlier
+        with self.assertRaises(TransparencyError) as ctx:
+            d.make_consistency_proof_bundle(cp2, cp1)
+        self.assertIn("rollback", str(ctx.exception).lower())
+
+        rollback_bundle = ConsistencyProofBundle(
+            earlier_checkpoint=cp2,
+            later_checkpoint=cp1,
+            intervening_events=(),
+        )
+        errors = verify_consistency_proof_bundle(rollback_bundle)
+        self.assertTrue(any("rollback" in e.lower() for e in errors))
+
+        # Equivocation: same eventCount, diverging tree head
+        forged_same_count = DirectoryCheckpoint(
+            tree_head_hash="9" * 64,
+            event_count=cp1.event_count,
+            timestamp=cp1.timestamp + 10,
+            organization_identity_hash=ORG,
+            manifest_hash=cp1.manifest_hash,
+            signature_hash=SIG,
+        )
+        equiv_bundle = ConsistencyProofBundle(
+            earlier_checkpoint=cp1,
+            later_checkpoint=forged_same_count,
+            intervening_events=(),
+        )
+        errors = verify_consistency_proof_bundle(equiv_bundle)
+        self.assertTrue(any("equivocat" in e.lower() for e in errors))
+
+    def test_rejects_anchor_and_org_mismatch(self) -> None:
+        d, cp1, cp2 = self._build_two_checkpoint_history()
+        bundle = d.make_consistency_proof_bundle(cp1, cp2)
+        errors = verify_consistency_proof_bundle(
+            bundle,
+            expected_organization_identity_hash="9" * 64,
+            expected_earlier_checkpoint=cp2,
+        )
+        self.assertTrue(any("organizationidentityhash mismatch" in e.lower() for e in errors))
+        self.assertTrue(any("expected anchor" in e.lower() for e in errors))
+
+    def test_rejects_malformed_or_unsupported_bundle_json(self) -> None:
+        with self.assertRaises(TransparencyError):
+            ConsistencyProofBundle.from_json("{not-json")
+        with self.assertRaises(TransparencyError):
+            ConsistencyProofBundle.from_dict({"protocol": "wrong", "version": 1})
+        with self.assertRaises(TransparencyError):
+            ConsistencyProofBundle.from_dict(
+                {"protocol": "harpocrates-issuer-key-transparency", "version": 99}
+            )
+
+    def test_bundle_preserves_privacy(self) -> None:
+        d, cp1, cp2 = self._build_two_checkpoint_history()
+        raw = d.make_consistency_proof_bundle(cp1, cp2).to_json().lower()
         for forbidden in ("email", "legalname", "phone", "street", "employee"):
-            self.assertNotIn(forbidden, blob)
-        self.assertEqual(change.to_dict()["reason"], "key_expired")
+            self.assertNotIn(forbidden, raw)
 
 
 if __name__ == "__main__":

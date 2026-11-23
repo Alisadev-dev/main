@@ -49,16 +49,14 @@ A checkpoint binds:
 
 Clients detect **split views** (diverging heads at the same count), **rollback** (shrinking `eventCount` after a higher head was observed), **stale checkpoints**, **broken rotation links**, **conflicting manifests**, and **compromised keys**.
 
-## Offline issuer trust snapshots
+## Portable consistency proof bundles
 
-For air-gapped or offline verification, `export_offline_trust_snapshot` produces a deterministic canonical JSON snapshot (`protocol: harpocrates-issuer-trust-snapshot`, `version: 1`) containing **only**:
+A `ConsistencyProofBundle` (`protocol: harpocrates-issuer-key-transparency`, `version: 1`) binds an `earlierCheckpoint` and `laterCheckpoint` to the ordered `interveningEvents` slice between them.
 
-- `manifests` — public issuer manifests (current and, optionally, historical rotation manifests)
-- `checkpointReferences` — public `CheckpointReference` entries (`checkpointHash`, `treeHeadHash`, `eventCount`, `timestamp`, `organizationIdentityHash`, `manifestHash`, optional `signatureHash`)
-- `policyVersions` — public `PolicyVersion` entries (`policyVersion`, `policyHash`, optional `effectiveFrom`)
-- `exportedAt` — snapshot export timestamp
-
-Evidence-specific private identifiers (such as `evidenceDigestBinding`, `captureNonce`, `deviceCommitment`, `evidenceId`, `sealId`, `proofId`, `nullifier`) and private organization fields are excluded on export and rejected fail-closed by `import_offline_trust_snapshot`. Use `verify_offline_trust_snapshot` to validate manifest references, bounds, and policy-version consistency before trusting an imported snapshot.
+- Build from an authoritative directory with `build_consistency_proof_bundle(directory, earlier, later)` (or `directory.make_consistency_proof_bundle(earlier, later)`).
+- Serialize/deserialize canonically with `bundle.to_json()` / `ConsistencyProofBundle.from_json(raw)` and hash with `consistency_proof_bundle_hash(bundle)`.
+- Verify continuity offline without trusting a live directory response via `verify_consistency_proof_bundle(bundle, expected_organization_identity_hash=..., expected_earlier_checkpoint=...)` or fail-closed `require_valid_consistency_proof_bundle(...)`.
+- Verification confirms non-regression (`detect_rollback` and checkpoint timestamps), contiguous monotonic sequences, `previousEventHash` chaining, and `advance_tree_head(earlier.tree_head_hash, intervening_events) == later.tree_head_hash`.
 
 ## Caching & freshness (fail-closed)
 
