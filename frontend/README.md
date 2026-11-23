@@ -80,11 +80,11 @@ Credential or nullifier seeds, proof witnesses, generated proofs, raw private
 inputs, and every other field are prohibited from both `localStorage` and
 `sessionStorage`. Keep secret proof-generation data in memory only.
 
-## Batch verification exports & comparison
-
-`src/batchExport.ts` exports privacy-safe batch results (`harpocrates-batch-report` v1)
-and supports deterministic comparison of two versioned batch result manifests via:
-
-- `parseBatchResultManifest(input)` — validates `harpocrates-batch-report` v1 JSON or objects and fails closed on malformed JSON, unsupported versions, count mismatches, or invalid item fields.
-- `compareBatchManifests(baseline, candidate)` — matches items by canonical statement identity (`video:<hash>` for hashed items, `duplicate:<hash>:<fileName>` for duplicates, `file:<fileName>:<size>` for unhashed items) and separates `trustContextChanges` (`status`, `tier`, `chainStatus`, `metadataHash`, `sourceHash`) from `added`, `removed`, and `unchanged` entries.
-- `exportBatchComparisonJSON(baseline, candidate)` — serializes a canonical, byte-for-byte deterministic `harpocrates-batch-comparison` v1 JSON report with code-unit-sorted collections and no wall-clock timestamps.
+The sole encrypted exception is `CredentialVault` (`src/credentialVault.ts`),
+which persists encrypted credential envelopes under `harpocrates:credential-vault`
+(current format `v: 2`, AES-GCM-256 with PBKDF2-SHA256 and version-bound AAD).
+Legacy `v: 1` envelopes are upgraded via staged migration (`vault.migrate(password)`
+or automatically during `vault.unlock(password)`):
+- Decrypts and validates the previous envelope into isolated memory before touching storage.
+- Encrypts and round-trip verifies the new `v: 2` envelope in isolated memory.
+- Preserves the previous encrypted envelope (including in `harpocrates:credential-vault:backup` during swap) until the new envelope verifies and primary storage readback succeeds.

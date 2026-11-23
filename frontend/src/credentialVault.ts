@@ -1,95 +1,21 @@
 import type { SeedPair } from './seedVault'
-import { VaultStorageError, classifyErrorCode } from './safeStorage'
+import { safeLocalStorage, type SafeStorageLike } from './safeStorage'
 
-export { VaultStorageError }
+export const VAULT_STORAGE_KEY = 'harpocrates:credential-vault'
+export const VAULT_BACKUP_STORAGE_KEY = 'harpocrates:credential-vault:backup'
+export const VAULT_VERSION_V1 = 1
+export const VAULT_VERSION = 2
 
-const VAULT_STORAGE_KEY = 'harpocrates:credential-vault'
-const VAULT_VERSION = 1
-const VAULT_KDF_VERSION = 'pbkdf2-sha256-v1' as const
 const PBKDF2_ITERATIONS = 600000
 const PBKDF2_HASH = 'SHA-256' as const
 const SALT_BYTES = 16
 const AES_KEY_LENGTH_BITS = 256
 const AES_IV_BYTES = 12
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000 // 15 minutes
-const HEX_PATTERN = /^[0-9a-fA-F]+$/
+const V2_AAD_TEXT = 'harpocrates:credential-vault:v2|PBKDF2-SHA256|AES-GCM-256'
 
-export interface VaultKdfDescriptor {
-  readonly id: typeof VAULT_KDF_VERSION
-  readonly algorithm: 'PBKDF2'
-  readonly hash: typeof PBKDF2_HASH
-  readonly iterations: typeof PBKDF2_ITERATIONS
-  readonly saltBytes: typeof SALT_BYTES
-}
-
-export interface VaultCipherDescriptor {
-  readonly algorithm: 'AES-GCM'
-  readonly keyLengthBits: typeof AES_KEY_LENGTH_BITS
-  readonly ivBytes: typeof AES_IV_BYTES
-}
-
-/**
- * Machine-readable compatibility descriptor for the client-side credential vault format.
- * Documents supported envelope versions, key-derivation parameters, cipher parameters,
- * and field encoding so callers and auditors can inspect compatibility without secrets.
- */
-export interface VaultFormatCompatibilityDescriptor {
-  readonly storageKey: string
-  readonly currentEnvelopeVersion: typeof VAULT_VERSION
-  readonly supportedEnvelopeVersions: readonly [typeof VAULT_VERSION]
-  readonly currentKdfVersion: typeof VAULT_KDF_VERSION
-  readonly supportedKdfVersions: readonly [typeof VAULT_KDF_VERSION]
-  readonly kdf: VaultKdfDescriptor
-  readonly cipher: VaultCipherDescriptor
-  readonly encoding: 'hex'
-}
-
-export const VAULT_FORMAT_COMPATIBILITY: VaultFormatCompatibilityDescriptor = Object.freeze({
-  storageKey: VAULT_STORAGE_KEY,
-  currentEnvelopeVersion: VAULT_VERSION,
-  supportedEnvelopeVersions: Object.freeze([VAULT_VERSION] as const),
-  currentKdfVersion: VAULT_KDF_VERSION,
-  supportedKdfVersions: Object.freeze([VAULT_KDF_VERSION] as const),
-  kdf: Object.freeze({
-    id: VAULT_KDF_VERSION,
-    algorithm: 'PBKDF2',
-    hash: PBKDF2_HASH,
-    iterations: PBKDF2_ITERATIONS,
-    saltBytes: SALT_BYTES,
-  }),
-  cipher: Object.freeze({
-    algorithm: 'AES-GCM',
-    keyLengthBits: AES_KEY_LENGTH_BITS,
-    ivBytes: AES_IV_BYTES,
-  }),
-  encoding: 'hex',
-})
-
-/** Return the public machine-readable vault format compatibility descriptor. */
-export function getVaultFormatCompatibility(): VaultFormatCompatibilityDescriptor {
-  return VAULT_FORMAT_COMPATIBILITY
-}
-
-const SALT_HEX_LENGTH = 32 // 16 bytes
-const IV_HEX_LENGTH = 24 // 12 bytes
-const MIN_CIPHERTEXT_HEX_LENGTH = 32 // 16-byte AES-GCM authentication tag
-
-/**
- * Maximum serialized UTF-8 byte size accepted for an encrypted vault envelope.
- * Rejects oversized payloads before JSON parsing, hex decoding, or PBKDF2 key derivation.
- */
-export const MAX_VAULT_ENVELOPE_BYTES = 16 * 1024 // 16 KiB
-
-/**
- * Maximum decoded ciphertext size in bytes for a vault envelope.
- * Checked against the hex length before decoding ciphertext or deriving keys.
- */
-export const MAX_VAULT_CIPHERTEXT_BYTES = 4 * 1024 // 4 KiB
-const MAX_CIPHERTEXT_HEX_LENGTH = MAX_VAULT_CIPHERTEXT_BYTES * 2
-const HEX_PATTERN = /^[0-9a-fA-F]+$/
-
-export interface VaultEnvelope {
-  v: number
+export interface VaultEnvelopeV1 {
+  v: 1
   salt: string // hex
   iv: string // hex
   ct: string // hex (ciphertext)
@@ -279,8 +205,64 @@ export function parseVaultEnvelope(
   return validateVaultEnvelope(parsed)
 }
 
+export interface VaultEnvelopeV2 {
+  v: 2
+  kdf: 'PBKDF2-SHA256'
+  iterations: number
+  cipher: 'AES-GCM-256'
+  salt: string // hex
+  iv: string // hex
+  ct: string // hex (ciphertext)
+}
+
+export type VaultEnvelope = VaultEnvelopeV1 | VaultEnvelopeV2
+
+export interface VaultMigrationResult {
+  migrated: boolean
+  fromVersion: number
+  toVersion: number
+}
+
+export interface CredentialVaultOptions {
+  inactivityTimeoutMs?: number
+  storage?: SafeStorageLike
+}
+
+export interface VaultMigrateOptions {
+  verifyEnvelope?: (
+    serialized: string,
+    password: string,
+    expectedSeeds: SeedPair
+  ) => Promise<void>
+}
+
+class VaultDecryptionError extends Error {
+  constructor(message = 'Unable to decrypt credential vault') {
+    super(message)
+    this.name = 'VaultDecryptionError'
+  }
+}
+
+export class VaultValidationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'VaultValidationError'
+  }
+}
+
+export class VaultMigrationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'VaultMigrationError'
+  }
+}
+
 function bufToHex(buffer: ArrayBuffer): string {
   return [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+function isValidHex(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(value)
 }
 
 function hexToBuf(hex: string): Uint8Array<ArrayBuffer> {
@@ -291,7 +273,104 @@ function hexToBuf(hex: string): Uint8Array<ArrayBuffer> {
   return bytes
 }
 
-async function deriveKey(password: string, salt: ArrayBuffer): Promise<CryptoKey> {
+function v2AdditionalData(): Uint8Array<ArrayBuffer> {
+  return new TextEncoder().encode(V2_AAD_TEXT) as Uint8Array<ArrayBuffer>
+}
+
+function zeroSeeds(seeds: SeedPair | null): void {
+  if (!seeds) return
+  seeds.credentialSeed = ''
+  seeds.nullifierSeed = ''
+}
+
+function validateSeedPair(value: unknown): SeedPair {
+  if (!value || typeof value !== 'object') {
+    throw new VaultValidationError('Vault payload is not a valid seed object')
+  }
+
+  const candidate = value as Record<string, unknown>
+  if (typeof candidate.credentialSeed !== 'string' || typeof candidate.nullifierSeed !== 'string') {
+    throw new VaultValidationError('Vault payload is missing required seed strings')
+  }
+
+  const credentialSeed = candidate.credentialSeed
+  const nullifierSeed = candidate.nullifierSeed
+
+  if (
+    credentialSeed.trim().length === 0 ||
+    nullifierSeed.trim().length === 0 ||
+    credentialSeed.trim().length > 256 ||
+    nullifierSeed.trim().length > 256
+  ) {
+    throw new VaultValidationError('Vault payload contains invalid or empty seeds')
+  }
+
+  return {
+    credentialSeed,
+    nullifierSeed,
+  }
+}
+
+function parseEnvelope(raw: string): VaultEnvelope {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error('Vault corrupted: unable to parse envelope')
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Vault corrupted: unable to parse envelope')
+  }
+
+  const candidate = parsed as Record<string, unknown>
+  if (typeof candidate.v !== 'number') {
+    throw new Error('Vault corrupted: unable to parse envelope')
+  }
+
+  if (candidate.v !== VAULT_VERSION_V1 && candidate.v !== VAULT_VERSION) {
+    throw new Error(`Unsupported vault version: ${candidate.v}`)
+  }
+
+  if (!isValidHex(candidate.salt) || !isValidHex(candidate.iv) || !isValidHex(candidate.ct)) {
+    throw new Error('Vault corrupted: invalid envelope encoding')
+  }
+
+  if (candidate.v === VAULT_VERSION_V1) {
+    return {
+      v: VAULT_VERSION_V1,
+      salt: candidate.salt,
+      iv: candidate.iv,
+      ct: candidate.ct,
+    }
+  }
+
+  if (
+    candidate.kdf !== 'PBKDF2-SHA256' ||
+    candidate.cipher !== 'AES-GCM-256' ||
+    typeof candidate.iterations !== 'number' ||
+    !Number.isInteger(candidate.iterations) ||
+    candidate.iterations <= 0
+  ) {
+    throw new Error('Vault corrupted: invalid v2 envelope metadata')
+  }
+
+  return {
+    v: VAULT_VERSION,
+    kdf: 'PBKDF2-SHA256',
+    iterations: candidate.iterations,
+    cipher: 'AES-GCM-256',
+    salt: candidate.salt,
+    iv: candidate.iv,
+    ct: candidate.ct,
+  }
+}
+
+async function deriveKey(
+  password: string,
+  salt: ArrayBuffer,
+  iterations = PBKDF2_ITERATIONS
+): Promise<CryptoKey> {
   const enc = new TextEncoder()
   const keyMaterial = await crypto.subtle.importKey(
     'raw',
@@ -304,7 +383,7 @@ async function deriveKey(password: string, salt: ArrayBuffer): Promise<CryptoKey
     {
       name: 'PBKDF2',
       salt: salt,
-      iterations: PBKDF2_ITERATIONS,
+      iterations,
       hash: 'SHA-256',
     },
     keyMaterial,
@@ -314,46 +393,106 @@ async function deriveKey(password: string, salt: ArrayBuffer): Promise<CryptoKey
   )
 }
 
-async function decryptEnvelope(
+async function decryptEnvelopeIsolated(
   envelope: VaultEnvelope,
   password: string
-): Promise<{ key: CryptoKey; seeds: SeedPair } | null> {
+): Promise<{ key: CryptoKey; seeds: SeedPair }> {
   const salt = hexToBuf(envelope.salt)
   const iv = hexToBuf(envelope.iv)
   const ct = hexToBuf(envelope.ct)
+  const iterations = envelope.v === VAULT_VERSION ? envelope.iterations : PBKDF2_ITERATIONS
 
+  let key: CryptoKey
+  let pt: ArrayBuffer
   try {
-    const key = await deriveKey(password, salt as unknown as ArrayBuffer)
-    const pt = await crypto.subtle.decrypt(
-      {
-        name: 'AES-GCM',
-        iv: iv as unknown as ArrayBuffer,
-      },
-      key,
-      ct as unknown as ArrayBuffer
-    )
-
-    const dec = new TextDecoder()
-    const seedsRaw = JSON.parse(dec.decode(pt)) as Partial<SeedPair> | null
-    if (
-      !seedsRaw ||
-      typeof seedsRaw !== 'object' ||
-      typeof seedsRaw.credentialSeed !== 'string' ||
-      typeof seedsRaw.nullifierSeed !== 'string'
-    ) {
-      return null
-    }
-
-    return {
-      key,
-      seeds: {
-        credentialSeed: seedsRaw.credentialSeed,
-        nullifierSeed: seedsRaw.nullifierSeed,
-      },
-    }
+    key = await deriveKey(password, salt as unknown as ArrayBuffer, iterations)
+    const algorithm: AesGcmParams =
+      envelope.v === VAULT_VERSION
+        ? {
+            name: 'AES-GCM',
+            iv: iv as unknown as ArrayBuffer,
+            additionalData: v2AdditionalData() as unknown as ArrayBuffer,
+          }
+        : {
+            name: 'AES-GCM',
+            iv: iv as unknown as ArrayBuffer,
+          }
+    pt = await crypto.subtle.decrypt(algorithm, key, ct as unknown as ArrayBuffer)
   } catch {
-    // Typically an OperationError if decryption fails due to bad password
-    return null
+    throw new VaultDecryptionError()
+  }
+
+  let parsedPayload: unknown
+  try {
+    const dec = new TextDecoder()
+    parsedPayload = JSON.parse(dec.decode(pt))
+  } catch {
+    throw new VaultValidationError('Vault payload is not valid JSON')
+  }
+
+  const seeds = validateSeedPair(parsedPayload)
+  return { key, seeds }
+}
+
+async function encryptEnvelopeV2(
+  password: string,
+  seeds: SeedPair
+): Promise<{ key: CryptoKey; envelope: VaultEnvelopeV2; serialized: string }> {
+  const validated = validateSeedPair(seeds)
+  const salt = crypto.getRandomValues(new Uint8Array(16))
+  const key = await deriveKey(password, salt as unknown as ArrayBuffer, PBKDF2_ITERATIONS)
+
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const enc = new TextEncoder()
+  const pt = enc.encode(JSON.stringify(validated))
+
+  const ct = await crypto.subtle.encrypt(
+    {
+      name: 'AES-GCM',
+      iv: iv as unknown as ArrayBuffer,
+      additionalData: v2AdditionalData() as unknown as ArrayBuffer,
+    },
+    key,
+    pt
+  )
+
+  const envelope: VaultEnvelopeV2 = {
+    v: VAULT_VERSION,
+    kdf: 'PBKDF2-SHA256',
+    iterations: PBKDF2_ITERATIONS,
+    cipher: 'AES-GCM-256',
+    salt: bufToHex(salt as unknown as ArrayBuffer),
+    iv: bufToHex(iv as unknown as ArrayBuffer),
+    ct: bufToHex(ct),
+  }
+
+  return {
+    key,
+    envelope,
+    serialized: JSON.stringify(envelope),
+  }
+}
+
+async function verifyStagedEnvelope(
+  serialized: string,
+  password: string,
+  expectedSeeds: SeedPair
+): Promise<void> {
+  const stagedEnvelope = parseEnvelope(serialized)
+  if (stagedEnvelope.v !== VAULT_VERSION) {
+    throw new VaultMigrationError(`Expected staged vault version ${VAULT_VERSION}, got ${stagedEnvelope.v}`)
+  }
+
+  const verified = await decryptEnvelopeIsolated(stagedEnvelope, password)
+  try {
+    if (
+      verified.seeds.credentialSeed !== expectedSeeds.credentialSeed ||
+      verified.seeds.nullifierSeed !== expectedSeeds.nullifierSeed
+    ) {
+      throw new VaultMigrationError('Staged vault envelope failed round-trip verification')
+    }
+  } finally {
+    zeroSeeds(verified.seeds)
   }
 }
 
@@ -362,9 +501,16 @@ export class CredentialVault {
   private seeds: SeedPair | null = null
   private timeoutId: ReturnType<typeof setTimeout> | null = null
   private inactivityTimeoutMs: number
+  private storage: SafeStorageLike
 
-  constructor(inactivityTimeoutMs = DEFAULT_TIMEOUT_MS) {
-    this.inactivityTimeoutMs = inactivityTimeoutMs
+  constructor(optionsOrTimeout: number | CredentialVaultOptions = DEFAULT_TIMEOUT_MS) {
+    if (typeof optionsOrTimeout === 'number') {
+      this.inactivityTimeoutMs = optionsOrTimeout
+      this.storage = safeLocalStorage
+    } else {
+      this.inactivityTimeoutMs = optionsOrTimeout.inactivityTimeoutMs ?? DEFAULT_TIMEOUT_MS
+      this.storage = optionsOrTimeout.storage ?? safeLocalStorage
+    }
   }
 
   isLocked(): boolean {
@@ -377,100 +523,139 @@ export class CredentialVault {
   }
 
   hasVault(): boolean {
-    try {
-      return !!window.localStorage.getItem(VAULT_STORAGE_KEY)
-    } catch (err) {
-      throw new VaultStorageError(classifyErrorCode(err, 'VAULT_STORAGE_READ_FAILED'), 'hasVault', {
-        cause: err,
-      })
-    }
+    return !!this.storage.getItem(VAULT_STORAGE_KEY)
+  }
+
+  hasBackup(): boolean {
+    return !!this.storage.getItem(VAULT_BACKUP_STORAGE_KEY)
+  }
+
+  getVaultVersion(): number | null {
+    const stored = this.storage.getItem(VAULT_STORAGE_KEY)
+    if (!stored) return null
+    return parseEnvelope(stored).v
+  }
+
+  needsMigration(): boolean {
+    const version = this.getVaultVersion()
+    return version !== null && version < VAULT_VERSION
   }
 
   async setup(password: string, seeds: SeedPair): Promise<void> {
-    const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES))
-    const key = await deriveKey(password, salt as unknown as ArrayBuffer)
+    const { key, serialized } = await encryptEnvelopeV2(password, seeds)
 
-    const iv = crypto.getRandomValues(new Uint8Array(AES_IV_BYTES))
-    const enc = new TextEncoder()
-    const pt = enc.encode(JSON.stringify(seeds))
-
-    const ct = await crypto.subtle.encrypt(
-      {
-        name: 'AES-GCM',
-        iv: iv as unknown as ArrayBuffer,
-      },
-      key,
-      pt
-    )
-
-    const envelope: VaultEnvelope = {
-      v: VAULT_VERSION,
-      salt: bufToHex(salt as unknown as ArrayBuffer),
-      iv: bufToHex(iv as unknown as ArrayBuffer),
-      ct: bufToHex(ct),
-    }
-
+    this.storage.setItem(VAULT_STORAGE_KEY, serialized)
+    this.storage.removeItem(VAULT_BACKUP_STORAGE_KEY)
     this.memoryKey = key
     this.seeds = { credentialSeed: seeds.credentialSeed, nullifierSeed: seeds.nullifierSeed }
     this.resetTimeout()
   }
 
-  async unlock(password: string): Promise<boolean> {
-    let stored: string | null
+  /**
+   * Staged format migration:
+   * 1. Decrypts and validates the existing envelope into isolated memory without mutating storage or unlocked state.
+   * 2. Encrypts a new v2 envelope in isolated memory and verifies it via round-trip decryption.
+   * 3. Preserves the previous encrypted envelope until the new envelope verifies and primary storage readback succeeds.
+   */
+  async migrate(
+    password: string,
+    options: VaultMigrateOptions = {}
+  ): Promise<VaultMigrationResult> {
+    const previousRaw = this.storage.getItem(VAULT_STORAGE_KEY)
+    if (!previousRaw) throw new Error('Vault is empty')
+
+    const previousEnvelope = parseEnvelope(previousRaw)
+    if (previousEnvelope.v === VAULT_VERSION) {
+      return {
+        migrated: false,
+        fromVersion: VAULT_VERSION,
+        toVersion: VAULT_VERSION,
+      }
+    }
+
+    const isolated = await decryptEnvelopeIsolated(previousEnvelope, password)
     try {
-      stored = window.localStorage.getItem(VAULT_STORAGE_KEY)
-    } catch (err) {
-      throw new VaultStorageError(classifyErrorCode(err, 'VAULT_STORAGE_READ_FAILED'), 'unlock', {
-        cause: err,
-      })
-    }
-    if (!stored) {
-      throw new VaultStorageError('VAULT_EMPTY', 'unlock', { message: 'Vault is empty' })
-    }
+      const staged = await encryptEnvelopeV2(password, isolated.seeds)
+      const verifyFn = options.verifyEnvelope ?? verifyStagedEnvelope
+      await verifyFn(staged.serialized, password, isolated.seeds)
 
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(stored)
-    } catch {
-      throw new Error('Vault corrupted: unable to parse envelope')
-    }
+      // Preserve the previous encrypted envelope in backup storage before replacing primary storage.
+      this.storage.setItem(VAULT_BACKUP_STORAGE_KEY, previousRaw)
 
-    const envelope = validateVaultEnvelope(parsed)
+      try {
+        this.storage.setItem(VAULT_STORAGE_KEY, staged.serialized)
+        const persisted = this.storage.getItem(VAULT_STORAGE_KEY)
+        if (persisted !== staged.serialized) {
+          throw new VaultMigrationError('Primary vault storage readback mismatch after migration')
+        }
+      } catch (err) {
+        try {
+          this.storage.setItem(VAULT_STORAGE_KEY, previousRaw)
+        } catch {
+          // Previous envelope remains preserved in VAULT_BACKUP_STORAGE_KEY.
+        }
+        throw err instanceof VaultMigrationError
+          ? err
+          : new VaultMigrationError('Failed to persist verified vault envelope; previous envelope preserved')
+      }
+
+      this.storage.removeItem(VAULT_BACKUP_STORAGE_KEY)
+      return {
+        migrated: true,
+        fromVersion: previousEnvelope.v,
+        toVersion: VAULT_VERSION,
+      }
+    } finally {
+      zeroSeeds(isolated.seeds)
+    }
+  }
 
   async unlock(password: string): Promise<boolean> {
-    const stored = window.localStorage.getItem(VAULT_STORAGE_KEY)
+    const stored = this.storage.getItem(VAULT_STORAGE_KEY)
     if (!stored) throw new Error('Vault is empty')
 
-    const envelope = parseVaultEnvelope(stored)
-    const decrypted = await decryptEnvelope(envelope, password)
-    if (!decrypted) return false
+    const envelope = parseEnvelope(stored)
 
-    this.memoryKey = decrypted.key
-    this.seeds = decrypted.seeds
-    this.resetTimeout()
-    return true
+    if (envelope.v < VAULT_VERSION) {
+      try {
+        await this.migrate(password)
+      } catch (err) {
+        if (err instanceof VaultDecryptionError) {
+          return false
+        }
+        throw err
+      }
+    }
+
+    const currentRaw = this.storage.getItem(VAULT_STORAGE_KEY)
+    if (!currentRaw) throw new Error('Vault is empty')
+    const currentEnvelope = parseEnvelope(currentRaw)
+
+    try {
+      const decrypted = await decryptEnvelopeIsolated(currentEnvelope, password)
+      this.memoryKey = decrypted.key
+      this.seeds = decrypted.seeds
+      this.resetTimeout()
+      return true
+    } catch (err) {
+      if (err instanceof VaultDecryptionError) {
+        return false
+      }
+      throw err
+    }
   }
 
   lock(): void {
     this.memoryKey = null
-    // Zero out references
-    if (this.seeds) {
-      this.seeds.credentialSeed = ''
-      this.seeds.nullifierSeed = ''
-    }
+    zeroSeeds(this.seeds)
     this.seeds = null
     this.clearTimeout()
   }
 
   destroy(): void {
     this.lock()
-    try {
-      window.localStorage.removeItem(VAULT_STORAGE_KEY)
-    } catch (err) {
-      throw new VaultStorageError(classifyErrorCode(err, 'VAULT_STORAGE_REMOVE_FAILED'), 'destroy', {
-        cause: err,
-      })
-    }
+    this.storage.removeItem(VAULT_STORAGE_KEY)
+    this.storage.removeItem(VAULT_BACKUP_STORAGE_KEY)
   }
 
   private resetTimeout(): void {
