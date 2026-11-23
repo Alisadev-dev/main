@@ -140,6 +140,85 @@ export type BatchRunOptions = {
   onCheckpoint?: (checkpoint: BatchVerificationCheckpoint) => void
 }
 
+export const BATCH_CHECKPOINT_PROTOCOL = 'harpocrates-batch-checkpoint' as const
+export const BATCH_CHECKPOINT_VERSION = 1 as const
+
+export type BatchFileFingerprint = {
+  index: number
+  fileName: string
+  fileSizeBytes: number
+  lastModified: number
+  mimeType: string
+  sampleHash: string
+}
+
+export type BatchCheckpointPolicy = {
+  maxFileSizeBytes: number
+  maxTotalSizeBytes: number
+}
+
+export type BatchCheckpointNetworkContext = {
+  apiBase: string
+  contractId: string
+  network: string
+}
+
+export type BatchCheckpointCompletedItem = {
+  index: number
+  fileName: string
+  fileSizeBytes: number
+  status: BatchOutcome
+  videoHash: string | null
+  metadataHash: string | null
+  sourceHash: string | null
+  tier: string | null
+  chainStatus: string | null
+  message: string
+  duplicateOf: string | null
+  failureReason: string | null
+  durationMs: number | null
+}
+
+export type BatchVerificationCheckpoint = {
+  protocol: typeof BATCH_CHECKPOINT_PROTOCOL
+  version: typeof BATCH_CHECKPOINT_VERSION
+  createdAt: string
+  updatedAt: string
+  policy: BatchCheckpointPolicy
+  networkContext: BatchCheckpointNetworkContext
+  files: BatchFileFingerprint[]
+  completed: BatchCheckpointCompletedItem[]
+}
+
+export type CheckpointMismatchReason =
+  | 'invalid-format'
+  | 'policy-mismatch'
+  | 'network-mismatch'
+  | 'files-mismatch'
+
+export type CheckpointValidationResult =
+  | { ok: true }
+  | {
+      ok: false
+      reason: CheckpointMismatchReason
+      message: string
+    }
+
+export class BatchCheckpointError extends Error {
+  public readonly reason: CheckpointMismatchReason
+
+  constructor(reason: CheckpointMismatchReason, message: string) {
+    super(message)
+    this.name = 'BatchCheckpointError'
+    this.reason = reason
+  }
+}
+
+export type BatchRunOptions = {
+  checkpoint?: BatchVerificationCheckpoint
+  onCheckpoint?: (checkpoint: BatchVerificationCheckpoint) => void
+}
+
 /**
  * Explicit input descriptor binding a selected File to a caller-supplied
  * identity and zero-based selection index so batch results remain stably
@@ -722,7 +801,8 @@ export class BatchVerifier {
   }
 
   public async runBatch(
-    inputs: readonly BatchInput[],
+    files: File[],
+    checkpoint: BatchVerificationCheckpoint,
     onProgress?: (progress: BatchProgress, items: BatchItemResult[]) => void,
     options?: BatchRunOptions,
   ): Promise<{ items: BatchItemResult[]; summary: BatchSummary; checkpoint: BatchVerificationCheckpoint }> {
@@ -993,86 +1073,19 @@ export class BatchVerifier {
         return
       }
 
-      // Duplicate Check — deterministic by original inputIndex, not completion order
-      const existingClaim = this.hashClaims.get(videoHash)
-      if (existingClaim) {
-        if (this.compareInputOrder(item, existingClaim.owner) < 0) {
-          // An item with a later inputIndex hashed first; await its single
-          // verification pass and transfer canonical ownership to this earlier item.
-          await existingClaim.verificationPromise
-          if (signal.aborted) {
-            item.status = 'cancelled'
-            item.message = 'Cancelled.'
-            item.failureReason = 'Batch execution was aborted by user request.'
-            item.durationMs = performance.now() - itemStart
-            return
-          }
-          if (this.compareInputOrder(item, existingClaim.owner) < 0) {
-            const previousOwner = existingClaim.owner
-            item.videoHash = previousOwner.videoHash ?? videoHash
-            item.metadataHash = previousOwner.metadataHash
-            item.sourceHash = previousOwner.sourceHash
-            item.tier = previousOwner.tier
-            item.chainProof = previousOwner.chainProof
-            item.chainStatus = previousOwner.chainStatus
-            item.status = previousOwner.status
-            item.message = previousOwner.message
-            item.events = [...previousOwner.events]
-            item.failureReason = previousOwner.failureReason
-            item.duplicateOf = null
-            item.durationMs = performance.now() - itemStart
-
-            previousOwner.metadataHash = null
-            previousOwner.sourceHash = null
-            previousOwner.tier = null
-            previousOwner.chainProof = null
-            previousOwner.chainStatus = null
-            previousOwner.events = []
-            previousOwner.failureReason = null
-            existingClaim.duplicates.push(previousOwner)
-            existingClaim.owner = item
-
-            for (const dup of existingClaim.duplicates) {
-              dup.status = 'duplicate'
-              dup.duplicateOf = item.fileName
-              dup.message = `Duplicate file detected (identical hash to ${item.fileName}).`
-            }
-            return
-          }
-        }
-
-        this.markAsDuplicate(item, existingClaim.owner, itemStart)
-        existingClaim.duplicates.push(item)
+      // Duplicate Check
+      if (this.processedHashes.has(videoHash)) {
+        const existingId = this.processedHashes.get(videoHash)!
+        const originalItem = this.items.find((i) => i.id === existingId)
+        item.status = 'duplicate'
+        item.duplicateOf = originalItem ? originalItem.fileName : existingId
+        item.message = `Duplicate file detected (identical hash to ${item.duplicateOf}).`
+        item.durationMs = performance.now() - itemStart
         return
       }
 
-      const verificationPromise = this.runVerification(item, signal, itemStart)
-      this.hashClaims.set(videoHash, {
-        owner: item,
-        duplicates: [],
-        verificationPromise,
-      })
-      await verificationPromise
-    } catch (err) {
-      if (signal.aborted) {
-        item.status = 'cancelled'
-        item.message = 'Cancelled.'
-        item.failureReason = 'Batch execution was aborted by user request.'
-      } else {
-        item.status = 'error'
-        item.message = err instanceof Error ? err.message : 'Unknown error.'
-        item.failureReason = item.message
-      }
-      item.durationMs = performance.now() - itemStart
-    }
-  }
+      this.processedHashes.set(videoHash, item.id)
 
-  private async runVerification(
-    item: BatchItemResult,
-    signal: AbortSignal,
-    itemStart: number,
-  ): Promise<void> {
-    try {
       // Verification Flow
       item.status = 'processing'
       item.message = 'Extracting stego metadata and checking Stellar registry...'

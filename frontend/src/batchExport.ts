@@ -536,9 +536,15 @@ export function exportBatchArchiveManifest(
  */
 export function exportBatchJSON(results: BatchItemResult[]): string {
   const clean = sanitizeBatchResults(results)
-  const report: BatchResultManifest = {
-    protocol: BATCH_REPORT_PROTOCOL,
-    version: BATCH_REPORT_VERSION,
+  const counts = {
+    verified: clean.filter((item) => item.resultCategory === 'verified').length,
+    skipped: clean.filter((item) => item.resultCategory === 'skipped').length,
+    cancelled: clean.filter((item) => item.resultCategory === 'cancelled').length,
+    failed: clean.filter((item) => item.resultCategory === 'failed').length,
+  }
+  const report = {
+    protocol: 'harpocrates-batch-report',
+    version: 1,
     exportedAt: new Date().toISOString(),
     totalCount: clean.length,
     counts,
@@ -599,8 +605,8 @@ export function exportReceiptCollection(results: BatchItemResult[]): string {
   const validated = validateBatchExportResults(results)
   const manifests: ProofManifest[] = []
 
-  for (const item of validated) {
-    if (item.manifest) {
+  for (const item of results) {
+    if (item.manifest && item.status === 'manifest-valid') {
       manifests.push(item.manifest)
     } else if (item.status === 'confirmed' && item.videoHash && item.metadataHash && item.tier) {
       manifests.push({
