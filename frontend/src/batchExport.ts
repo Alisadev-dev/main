@@ -1,4 +1,4 @@
-import type { BatchItemResult } from './batchVerifier'
+import { orderBatchResults, type BatchItemResult } from './batchVerifier'
 import type { ProofManifest } from './proofManifest'
 
 export type StatementConflict = {
@@ -29,7 +29,13 @@ export class BatchExportConflictError extends Error {
   }
 }
 
+/**
+ * Privacy-safe, serializable batch report entry bound to its original selected
+ * input identity (`id` and `inputIndex`) without raw `File` handles or media bytes.
+ */
 export type CleanBatchReportItem = {
+  id: string
+  inputIndex: number
   fileName: string
   fileSizeBytes: number
   status: string
@@ -168,10 +174,16 @@ export function validateBatchExportResults(results: BatchItemResult[]): BatchIte
 
 /**
  * Strips raw File handles and sensitive memory states, returning a clean,
- * privacy-safe serializable representation of batch verification results.
+ * privacy-safe serializable representation of batch verification results
+ * ordered by original selected `inputIndex` (never by completion order).
  */
 export function sanitizeBatchResults(results: BatchItemResult[]): CleanBatchReportItem[] {
-  return results.map((item) => ({
+  return orderBatchResults(results).map((item, idx) => ({
+    id: item.id,
+    inputIndex:
+      typeof item.inputIndex === 'number' && Number.isFinite(item.inputIndex)
+        ? item.inputIndex
+        : idx,
     fileName: item.fileName,
     fileSizeBytes: item.fileSizeBytes,
     status: item.status,
@@ -183,7 +195,7 @@ export function sanitizeBatchResults(results: BatchItemResult[]): CleanBatchRepo
     message: item.message,
     duplicateOf: item.duplicateOf,
     failureReason: item.failureReason,
-    durationMs: item.durationMs ? Math.round(item.durationMs) : null,
+    durationMs: item.durationMs !== null ? Math.round(item.durationMs) : null,
   }))
 }
 
@@ -226,6 +238,8 @@ export function exportBatchCSV(results: BatchItemResult[]): string {
     'Duplicate Of',
     'Failure Reason',
     'Duration (ms)',
+    'Input Index',
+    'Input ID',
   ]
 
   const rows = clean.map((item) => [
@@ -241,6 +255,8 @@ export function exportBatchCSV(results: BatchItemResult[]): string {
     escapeCSV(item.duplicateOf ?? ''),
     escapeCSV(item.failureReason ?? ''),
     item.durationMs !== null ? String(item.durationMs) : '',
+    String(item.inputIndex),
+    escapeCSV(item.id),
   ])
 
   return [headers.join(','), ...rows.map((r) => r.join(','))].join('\n')
