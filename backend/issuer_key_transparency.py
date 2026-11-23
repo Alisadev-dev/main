@@ -910,344 +910,313 @@ def create_rotation_event(
     )
 
 
-# ── Trust-policy simulation for captured evidence ──────────────────────────
-
-
 @dataclass(frozen=True)
-class TrustPolicy:
-    """Immutable trust policy version for evaluating captured evidence."""
+class KeyLifecycleChange:
+    """Proposed key lifecycle transition reported by a directory import preview."""
 
-    policy_version: str
-    allowed_trust_levels: frozenset[int] = frozenset({1, 2})
-    allowed_privacy_scopes: frozenset[str] = frozenset(VALID_PRIVACY_SCOPES)
-    require_secure_time: bool = False
-    allowed_time_sources: frozenset[str] = frozenset(VALID_TIME_SOURCES)
-    max_time_drift_ms: int | None = None
-    allowed_integrity_claims: frozenset[str] | None = None
-    require_signing_digest: bool = False
-    allow_compromised_pre_compromise_key: bool = True
-    allow_rotated_key: bool = True
-    max_checkpoint_age_seconds: int = DEFAULT_FRESHNESS_SECONDS
-    high_assurance_max_checkpoint_age_seconds: int = HIGH_ASSURANCE_FRESHNESS_SECONDS
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.policy_version, str) or not self.policy_version.strip():
-            raise TransparencyError("policy_version must be a non-empty string")
-        if not self.allowed_trust_levels or not self.allowed_trust_levels.issubset(
-            VALID_TRUST_LEVELS
-        ):
-            raise TransparencyError("allowed_trust_levels must be a non-empty subset of valid trust levels")
-        if not self.allowed_privacy_scopes or not self.allowed_privacy_scopes.issubset(
-            VALID_PRIVACY_SCOPES
-        ):
-            raise TransparencyError("allowed_privacy_scopes must be a non-empty subset of valid privacy scopes")
-        if not self.allowed_time_sources or not self.allowed_time_sources.issubset(
-            VALID_TIME_SOURCES
-        ):
-            raise TransparencyError("allowed_time_sources must be a non-empty subset of valid time sources")
-        if self.max_time_drift_ms is not None and self.max_time_drift_ms < 0:
-            raise TransparencyError("max_time_drift_ms must be non-negative")
-        if self.allowed_integrity_claims is not None and (
-            not self.allowed_integrity_claims
-            or not self.allowed_integrity_claims.issubset(VALID_INTEGRITY_CLAIMS)
-        ):
-            raise TransparencyError(
-                "allowed_integrity_claims must be a non-empty subset of valid integrity claims"
-            )
-        if self.max_checkpoint_age_seconds < 0:
-            raise TransparencyError("max_checkpoint_age_seconds must be non-negative")
-        if self.high_assurance_max_checkpoint_age_seconds < 0:
-            raise TransparencyError("high_assurance_max_checkpoint_age_seconds must be non-negative")
+    key_id: str
+    public_key_hash: str
+    previous_status: KeyStatus | None
+    proposed_status: KeyStatus
+    event_types: tuple[EventType, ...]
+    valid_from: int
+    valid_until: int | None = None
+    related_key_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
-            "allowCompromisedPreCompromiseKey": self.allow_compromised_pre_compromise_key,
-            "allowRotatedKey": self.allow_rotated_key,
-            "allowedPrivacyScopes": sorted(self.allowed_privacy_scopes),
-            "allowedTimeSources": sorted(self.allowed_time_sources),
-            "allowedTrustLevels": sorted(self.allowed_trust_levels),
-            "highAssuranceMaxCheckpointAgeSeconds": self.high_assurance_max_checkpoint_age_seconds,
-            "maxCheckpointAgeSeconds": self.max_checkpoint_age_seconds,
-            "policyVersion": self.policy_version,
-            "requireSecureTime": self.require_secure_time,
-            "requireSigningDigest": self.require_signing_digest,
+            "eventTypes": [et.value for et in self.event_types],
+            "keyId": self.key_id,
+            "previousStatus": self.previous_status.value if self.previous_status else None,
+            "proposedStatus": self.proposed_status.value,
+            "publicKeyHash": self.public_key_hash,
+            "validFrom": self.valid_from,
         }
-        if self.max_time_drift_ms is not None:
-            d["maxTimeDriftMs"] = self.max_time_drift_ms
-        if self.allowed_integrity_claims is not None:
-            d["allowedIntegrityClaims"] = sorted(self.allowed_integrity_claims)
+        if self.valid_until is not None:
+            d["validUntil"] = self.valid_until
+        if self.related_key_id is not None:
+            d["relatedKeyId"] = self.related_key_id
         return d
 
 
-def trust_policy_hash(policy: TrustPolicy) -> str:
-    """Deterministic SHA-256 digest of a canonical trust policy."""
-    return _sha256_hex(_canonical_json(policy.to_dict()))
+@dataclass(frozen=True)
+class CheckpointLineage:
+    """Before/after checkpoint and manifest lineage for a directory import preview."""
+
+    organization_identity_hash: str
+    current_event_count: int
+    proposed_event_count: int
+    added_event_count: int
+    current_tree_head_hash: str
+    proposed_tree_head_hash: str
+    current_manifest_hash: str | None
+    proposed_manifest_hash: str | None
+    manifest_chain_hashes: tuple[str, ...]
+    previously_seen_checkpoint_hash: str | None = None
+    incoming_checkpoint_hash: str | None = None
+    incoming_checkpoint_event_count: int | None = None
+    incoming_checkpoint_tree_head_hash: str | None = None
+    extends_current_head: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "addedEventCount": self.added_event_count,
+            "currentEventCount": self.current_event_count,
+            "currentManifestHash": self.current_manifest_hash,
+            "currentTreeHeadHash": self.current_tree_head_hash,
+            "extendsCurrentHead": self.extends_current_head,
+            "manifestChainHashes": list(self.manifest_chain_hashes),
+            "organizationIdentityHash": self.organization_identity_hash,
+            "proposedEventCount": self.proposed_event_count,
+            "proposedManifestHash": self.proposed_manifest_hash,
+            "proposedTreeHeadHash": self.proposed_tree_head_hash,
+        }
+        if self.previously_seen_checkpoint_hash is not None:
+            d["previouslySeenCheckpointHash"] = self.previously_seen_checkpoint_hash
+        if self.incoming_checkpoint_hash is not None:
+            d["incomingCheckpointHash"] = self.incoming_checkpoint_hash
+        if self.incoming_checkpoint_event_count is not None:
+            d["incomingCheckpointEventCount"] = self.incoming_checkpoint_event_count
+        if self.incoming_checkpoint_tree_head_hash is not None:
+            d["incomingCheckpointTreeHeadHash"] = self.incoming_checkpoint_tree_head_hash
+        return d
 
 
 @dataclass(frozen=True)
-class CapturedEvidenceSample:
-    """Synthetic or captured evidence attestation bound to optional issuer key context."""
+class DirectoryImportPreview:
+    """Non-mutating preview of a proposed issuer directory import."""
 
-    evidence_id: str
-    attestation: CaptureAttestation
-    key_id: str | None = None
-    signature_timestamp: int | None = None
-    high_assurance: bool = False
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.evidence_id, str) or not self.evidence_id.strip():
-            raise TransparencyError("evidence_id must be a non-empty string")
-
-
-@dataclass(frozen=True)
-class PolicyEvaluationOutcome:
-    """Privacy-preserving evaluation result for a single evidence sample."""
-
-    evidence_id: str
-    attestation_hash: str
-    policy_version: str
-    policy_hash: str
-    accepted: bool
-    reasons: tuple[str, ...]
+    organization_identity_hash: str
+    acceptable: bool
+    errors: tuple[str, ...]
+    key_changes: tuple[KeyLifecycleChange, ...]
+    checkpoint_lineage: CheckpointLineage
+    proposed_events: tuple[DirectoryEvent, ...]
+    proposed_manifests: tuple[IssuerManifest, ...]
+    incoming_checkpoint: DirectoryCheckpoint | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "accepted": self.accepted,
-            "attestationHash": self.attestation_hash,
-            "evidenceId": self.evidence_id,
-            "policyHash": self.policy_hash,
-            "policyVersion": self.policy_version,
-            "reasons": list(self.reasons),
+            "acceptable": self.acceptable,
+            "checkpointLineage": self.checkpoint_lineage.to_dict(),
+            "errors": list(self.errors),
+            "keyChanges": [c.to_dict() for c in self.key_changes],
+            "organizationIdentityHash": self.organization_identity_hash,
         }
 
 
-@dataclass(frozen=True)
-class PolicyOutcomeDiff:
-    """Changed evaluation outcome between baseline and candidate trust policies."""
-
-    evidence_id: str
-    attestation_hash: str
-    change_type: str  # newly_rejected | newly_accepted | reasons_changed
-    baseline_accepted: bool
-    candidate_accepted: bool
-    baseline_reasons: tuple[str, ...]
-    candidate_reasons: tuple[str, ...]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "attestationHash": self.attestation_hash,
-            "baselineAccepted": self.baseline_accepted,
-            "baselineReasons": list(self.baseline_reasons),
-            "candidateAccepted": self.candidate_accepted,
-            "candidateReasons": list(self.candidate_reasons),
-            "changeType": self.change_type,
-            "evidenceId": self.evidence_id,
-        }
-
-
-@dataclass(frozen=True)
-class PolicySimulationReport:
-    """Non-mutating comparison report across two trust policy versions."""
-
-    baseline_policy_version: str
-    baseline_policy_hash: str
-    candidate_policy_version: str
-    candidate_policy_hash: str
-    total_evaluated: int
-    unchanged_count: int
-    changed_count: int
-    newly_rejected_count: int
-    newly_accepted_count: int
-    reason_changed_count: int
-    changes: tuple[PolicyOutcomeDiff, ...]
-    active_policy_mutated: bool = False
-    version: int = VERSION
-    protocol: str = PROTOCOL
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "activePolicyMutated": self.active_policy_mutated,
-            "baselinePolicyHash": self.baseline_policy_hash,
-            "baselinePolicyVersion": self.baseline_policy_version,
-            "candidatePolicyHash": self.candidate_policy_hash,
-            "candidatePolicyVersion": self.candidate_policy_version,
-            "changedCount": self.changed_count,
-            "changes": [c.to_dict() for c in self.changes],
-            "newlyAcceptedCount": self.newly_accepted_count,
-            "newlyRejectedCount": self.newly_rejected_count,
-            "protocol": self.protocol,
-            "reasonChangedCount": self.reason_changed_count,
-            "totalEvaluated": self.total_evaluated,
-            "unchangedCount": self.unchanged_count,
-            "version": self.version,
-        }
-
-
-def evaluate_captured_evidence(
-    sample: CapturedEvidenceSample,
-    policy: TrustPolicy,
-    *,
-    directory: IssuerDirectory | None = None,
-    cache: DirectoryCache | None = None,
-    now: int | None = None,
-) -> PolicyEvaluationOutcome:
-    """Evaluate a single captured evidence sample under a trust policy (fail-closed)."""
-    att = sample.attestation
-    reasons: list[str] = []
-
-    if att.trust_level not in policy.allowed_trust_levels:
-        reasons.append("trust_level_not_allowed")
-    if att.privacy_scope not in policy.allowed_privacy_scopes:
-        reasons.append("privacy_scope_not_allowed")
-    if policy.require_signing_digest and not att.app_identity.signing_digest:
-        reasons.append("missing_app_signing_digest")
-
-    if policy.require_secure_time and att.secure_time is None:
-        reasons.append("missing_secure_time")
-    if att.secure_time is not None:
-        if att.secure_time.source not in policy.allowed_time_sources:
-            reasons.append("time_source_not_allowed")
-        if (
-            policy.max_time_drift_ms is not None
-            and abs(att.secure_time.drift_ms) > policy.max_time_drift_ms
-        ):
-            reasons.append("time_drift_exceeded")
-
-    if policy.allowed_integrity_claims is not None:
-        claimed = att.camera_pipeline.claimed_integrity if att.camera_pipeline else None
-        if claimed not in policy.allowed_integrity_claims:
-            reasons.append("camera_integrity_not_allowed")
-
-    if sample.key_id is not None:
-        if directory is None:
-            reasons.append("missing_issuer_directory")
-        elif sample.signature_timestamp is None:
-            reasons.append("missing_signature_timestamp")
-        else:
-            if not key_valid_for_historical_signature(
-                directory, sample.key_id, sample.signature_timestamp
-            ):
-                reasons.append("key_invalid_at_signature_time")
-            key = directory.keys.get(sample.key_id)
-            if key is not None:
-                if (
-                    key.status == KeyStatus.COMPROMISED
-                    and not policy.allow_compromised_pre_compromise_key
-                ):
-                    reasons.append("key_compromised_disallowed")
-                if key.status == KeyStatus.ROTATED and not policy.allow_rotated_key:
-                    reasons.append("rotated_key_disallowed")
-                if key_was_compromised_at(directory, sample.key_id, sample.signature_timestamp):
-                    reasons.append("key_compromised_at_signature_time")
-
-    if cache is not None:
-        max_age = (
-            policy.high_assurance_max_checkpoint_age_seconds
-            if sample.high_assurance
-            else policy.max_checkpoint_age_seconds
-        )
-        if not cache.is_fresh(now=now, max_age=max_age):
-            reasons.append("stale_directory_checkpoint")
-
-    sorted_reasons = tuple(sorted(set(reasons)))
-    return PolicyEvaluationOutcome(
-        evidence_id=sample.evidence_id,
-        attestation_hash=canonical_attestation_hash(att),
-        policy_version=policy.policy_version,
-        policy_hash=trust_policy_hash(policy),
-        accepted=len(sorted_reasons) == 0,
-        reasons=sorted_reasons,
+def _clone_directory(directory: IssuerDirectory) -> IssuerDirectory:
+    return IssuerDirectory(
+        organization_identity_hash=directory.organization_identity_hash,
+        events=list(directory.events),
+        keys=dict(directory.keys),
+        current_manifest=directory.current_manifest,
+        manifests_by_hash=dict(directory.manifests_by_hash),
     )
 
 
-def simulate_trust_policy(
-    samples: Iterable[CapturedEvidenceSample],
-    baseline_policy: TrustPolicy,
-    candidate_policy: TrustPolicy,
+def preview_directory_import(
+    current_directory: IssuerDirectory,
+    incoming_events: list[DirectoryEvent],
     *,
-    directory: IssuerDirectory | None = None,
-    cache: DirectoryCache | None = None,
-    now: int | None = None,
-) -> PolicySimulationReport:
-    """Simulate a candidate trust policy against a baseline without modifying active policy.
+    incoming_manifests: list[IssuerManifest] | None = None,
+    incoming_checkpoint: DirectoryCheckpoint | None = None,
+    previously_seen_checkpoint: DirectoryCheckpoint | None = None,
+) -> DirectoryImportPreview:
+    """Preview proposed key lifecycle changes and checkpoint lineage without mutating trust state.
 
-    Evaluates each synthetic or captured attestation under both policies and
-    returns a canonical report containing only the changed outcomes and summary
-    counts. Both policies, the directory, and the cache are treated as read-only.
+    Accepts either a full event log starting at sequence 0 (whose prefix must match
+    `current_directory.events`) or delta events starting at `len(current_directory.events)`.
+    No mutation is performed on `current_directory`; call `apply_directory_import` only
+    after reviewing and accepting a valid preview.
     """
-    sample_list = list(samples)
-    if len(sample_list) > MAX_SIMULATION_ITEMS:
-        raise TransparencyError(
-            f"simulation batch exceeds bound ({len(sample_list)} > {MAX_SIMULATION_ITEMS})"
-        )
+    errors: list[str] = []
+    extends_current_head = True
+    current_count = len(current_directory.events)
+    current_head = current_directory.tree_head()
+    current_mh = (
+        manifest_hash(current_directory.current_manifest)
+        if current_directory.current_manifest is not None
+        else None
+    )
 
-    seen_ids: set[str] = set()
-    for s in sample_list:
-        if s.evidence_id in seen_ids:
-            raise TransparencyError(f"duplicate evidence_id in simulation batch: {s.evidence_id}")
-        seen_ids.add(s.evidence_id)
-
-    changes: list[PolicyOutcomeDiff] = []
-    unchanged_count = 0
-    newly_rejected_count = 0
-    newly_accepted_count = 0
-    reason_changed_count = 0
-
-    for sample in sample_list:
-        base_out = evaluate_captured_evidence(
-            sample, baseline_policy, directory=directory, cache=cache, now=now
-        )
-        cand_out = evaluate_captured_evidence(
-            sample, candidate_policy, directory=directory, cache=cache, now=now
-        )
-
-        if base_out.accepted == cand_out.accepted and base_out.reasons == cand_out.reasons:
-            unchanged_count += 1
-            continue
-
-        if base_out.accepted and not cand_out.accepted:
-            change_type = "newly_rejected"
-            newly_rejected_count += 1
-        elif not base_out.accepted and cand_out.accepted:
-            change_type = "newly_accepted"
-            newly_accepted_count += 1
+    # Determine delta events while checking prefix consistency / rollback.
+    delta_events: list[DirectoryEvent] = []
+    if incoming_events:
+        first_seq = incoming_events[0].sequence
+        if current_count > 0 and first_seq == 0:
+            if len(incoming_events) < current_count:
+                errors.append("incoming event log shorter than current directory (rollback)")
+                extends_current_head = False
+            else:
+                for idx in range(current_count):
+                    if event_hash(incoming_events[idx]) != event_hash(current_directory.events[idx]):
+                        errors.append(
+                            f"incoming event log diverges from current directory at sequence {idx} (split view)"
+                        )
+                        extends_current_head = False
+                        break
+                if extends_current_head:
+                    delta_events = list(incoming_events[current_count:])
         else:
-            change_type = "reasons_changed"
-            reason_changed_count += 1
+            delta_events = list(incoming_events)
 
-        changes.append(
-            PolicyOutcomeDiff(
-                evidence_id=sample.evidence_id,
-                attestation_hash=base_out.attestation_hash,
-                change_type=change_type,
-                baseline_accepted=base_out.accepted,
-                candidate_accepted=cand_out.accepted,
-                baseline_reasons=base_out.reasons,
-                candidate_reasons=cand_out.reasons,
+    # Filter out already-published manifests if a full manifest history was supplied.
+    delta_manifests: list[IssuerManifest] = []
+    for manifest in incoming_manifests or []:
+        try:
+            mh = manifest_hash(manifest)
+        except TransparencyError as exc:
+            errors.append(str(exc))
+            continue
+        if mh not in current_directory.manifests_by_hash:
+            delta_manifests.append(manifest)
+
+    candidate = _clone_directory(current_directory)
+    applied_events: list[DirectoryEvent] = []
+    applied_manifests: list[IssuerManifest] = []
+    manifest_chain_hashes: list[str] = []
+
+    if extends_current_head:
+        for ev in delta_events:
+            try:
+                candidate.append_event(ev)
+                applied_events.append(ev)
+            except TransparencyError as exc:
+                errors.append(str(exc))
+                extends_current_head = False
+                break
+
+        for manifest in delta_manifests:
+            try:
+                mh = candidate.publish_manifest(manifest)
+                applied_manifests.append(manifest)
+                manifest_chain_hashes.append(mh)
+            except TransparencyError as exc:
+                errors.append(str(exc))
+                break
+
+    # Checkpoint lineage and rollback/equivocation checks.
+    if incoming_checkpoint is not None:
+        errors.extend(verify_checkpoint_consistency(candidate, incoming_checkpoint))
+        if previously_seen_checkpoint is not None:
+            errors.extend(detect_rollback(previously_seen_checkpoint, incoming_checkpoint))
+    elif previously_seen_checkpoint is not None:
+        if len(candidate.events) < previously_seen_checkpoint.event_count:
+            errors.append("candidate directory shorter than previously seen checkpoint (rollback)")
+            extends_current_head = False
+        else:
+            prefix_head = compute_tree_head(
+                candidate.events[: previously_seen_checkpoint.event_count]
             )
-        )
+            if prefix_head != previously_seen_checkpoint.tree_head_hash:
+                errors.append(
+                    "candidate directory diverges from previously seen checkpoint (split view)"
+                )
+                extends_current_head = False
 
-    return PolicySimulationReport(
-        baseline_policy_version=baseline_policy.policy_version,
-        baseline_policy_hash=trust_policy_hash(baseline_policy),
-        candidate_policy_version=candidate_policy.policy_version,
-        candidate_policy_hash=trust_policy_hash(candidate_policy),
-        total_evaluated=len(sample_list),
-        unchanged_count=unchanged_count,
-        changed_count=len(changes),
-        newly_rejected_count=newly_rejected_count,
-        newly_accepted_count=newly_accepted_count,
-        reason_changed_count=reason_changed_count,
-        changes=tuple(changes),
-        active_policy_mutated=False,
+    # Compute proposed key lifecycle changes by comparing current vs candidate state.
+    events_by_key: dict[str, list[EventType]] = {}
+    related_by_key: dict[str, str] = {}
+    for ev in applied_events:
+        if ev.event_type == EventType.CHECKPOINT:
+            continue
+        events_by_key.setdefault(ev.key_id, []).append(ev.event_type)
+        if ev.related_key_id:
+            related_by_key[ev.key_id] = ev.related_key_id
+            events_by_key.setdefault(ev.related_key_id, []).append(ev.event_type)
+
+    key_changes: list[KeyLifecycleChange] = []
+    for key_id in sorted(set(current_directory.keys) | set(candidate.keys)):
+        before = current_directory.keys.get(key_id)
+        after = candidate.keys.get(key_id)
+        if after is None:
+            continue
+        if before != after:
+            key_changes.append(
+                KeyLifecycleChange(
+                    key_id=key_id,
+                    public_key_hash=after.public_key_hash,
+                    previous_status=before.status if before is not None else None,
+                    proposed_status=after.status,
+                    event_types=tuple(events_by_key.get(key_id, ())),
+                    valid_from=after.valid_from,
+                    valid_until=after.valid_until,
+                    related_key_id=related_by_key.get(key_id),
+                )
+            )
+
+    proposed_mh = (
+        manifest_hash(candidate.current_manifest)
+        if candidate.current_manifest is not None
+        else None
+    )
+    lineage = CheckpointLineage(
+        organization_identity_hash=current_directory.organization_identity_hash,
+        current_event_count=current_count,
+        proposed_event_count=len(candidate.events),
+        added_event_count=len(applied_events),
+        current_tree_head_hash=current_head,
+        proposed_tree_head_hash=candidate.tree_head(),
+        current_manifest_hash=current_mh,
+        proposed_manifest_hash=proposed_mh,
+        manifest_chain_hashes=tuple(manifest_chain_hashes),
+        previously_seen_checkpoint_hash=(
+            checkpoint_hash(previously_seen_checkpoint)
+            if previously_seen_checkpoint is not None
+            else None
+        ),
+        incoming_checkpoint_hash=(
+            checkpoint_hash(incoming_checkpoint) if incoming_checkpoint is not None else None
+        ),
+        incoming_checkpoint_event_count=(
+            incoming_checkpoint.event_count if incoming_checkpoint is not None else None
+        ),
+        incoming_checkpoint_tree_head_hash=(
+            incoming_checkpoint.tree_head_hash if incoming_checkpoint is not None else None
+        ),
+        extends_current_head=extends_current_head and not errors,
+    )
+
+    return DirectoryImportPreview(
+        organization_identity_hash=current_directory.organization_identity_hash,
+        acceptable=len(errors) == 0,
+        errors=tuple(errors),
+        key_changes=tuple(key_changes),
+        checkpoint_lineage=lineage,
+        proposed_events=tuple(applied_events),
+        proposed_manifests=tuple(applied_manifests),
+        incoming_checkpoint=incoming_checkpoint,
     )
 
 
-def canonicalize_simulation_report(report: PolicySimulationReport) -> str:
-    """Deterministic JSON encoding for a trust-policy simulation report."""
-    return _canonical_json(report.to_dict()).decode("utf-8")
+def apply_directory_import(
+    directory: IssuerDirectory,
+    preview: DirectoryImportPreview,
+) -> IssuerDirectory:
+    """Apply an accepted directory import preview to `directory` (fail-closed)."""
+    if not preview.acceptable:
+        raise TransparencyError(
+            "cannot apply rejected directory import preview: " + "; ".join(preview.errors)
+        )
+    lineage = preview.checkpoint_lineage
+    if directory.organization_identity_hash != preview.organization_identity_hash:
+        raise TransparencyError("directory organizationIdentityHash mismatch")
+    if (
+        len(directory.events) != lineage.current_event_count
+        or directory.tree_head() != lineage.current_tree_head_hash
+    ):
+        raise TransparencyError("directory state changed since preview was generated")
+    current_mh = (
+        manifest_hash(directory.current_manifest)
+        if directory.current_manifest is not None
+        else None
+    )
+    if current_mh != lineage.current_manifest_hash:
+        raise TransparencyError("directory manifest changed since preview was generated")
 
-
-def simulation_report_hash(report: PolicySimulationReport) -> str:
-    """Deterministic SHA-256 digest of a canonical trust-policy simulation report."""
-    return _sha256_hex(canonicalize_simulation_report(report).encode("utf-8"))
+    for ev in preview.proposed_events:
+        directory.append_event(ev)
+    for manifest in preview.proposed_manifests:
+        directory.publish_manifest(manifest)
+    return directory
