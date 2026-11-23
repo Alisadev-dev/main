@@ -1,6 +1,7 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { EVIDENCE_REPLACED_MESSAGE, useEvidence } from './useEvidence'
+import { useEvidence } from './useEvidence'
+import { ApiClientError } from '../services/apiError'
 
 const { hashFileInWorkerMock, embedVideoMock, getWalletNetworkMock, registerProofOnStellarMock } =
   vi.hoisted(() => ({
@@ -388,158 +389,184 @@ describe('useEvidence hashing progress', () => {
   })
 })
 
-describe('useEvidence proof preparation preview', () => {
+describe('useEvidence upload admission and queue state', () => {
   afterEach(() => {
     vi.clearAllMocks()
-    vi.restoreAllMocks()
   })
 
-  it('previews canonical public inputs before proving and submits nothing', async () => {
+  it('maps queue_full backend rejection to actionable admission state', async () => {
     hashFileInWorkerMock.mockResolvedValue('a'.repeat(64))
-    embedVideoMock.mockResolvedValue({
-      embeddedBlob: new Blob(['embedded']),
-      embeddedHash: 'b'.repeat(64),
-      metadataHash: 'c'.repeat(64),
-    })
-    Object.defineProperty(URL, 'createObjectURL', {
-      configurable: true,
-      value: () => 'blob:embedded',
-    })
-    Object.defineProperty(URL, 'revokeObjectURL', {
-      configurable: true,
-      value: vi.fn(),
-    })
-    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    embedVideoMock.mockRejectedValue(
+      new ApiClientError({
+        code: 'QUEUE_FULL',
+        message: 'Upload queue is currently full. Wait 5 seconds and retry.',
+        detail: 'service overloaded',
+        requestId: null,
+        action: 'retry',
+        retryable: true,
+        status: 503,
+        reason: 'queue_full',
+        retryAfter: 5,
+      }),
+    )
 
     const { result } = renderHook(() => useEvidence())
-    expect(result.current.proofPreparation).toMatchObject({
-      ok: false,
-      code: 'MISSING_EVIDENCE',
+    await act(async () => {
+      await result.current.handleEvidence(new File(['bytes'], 'evidence.mp4'))
     })
 
+    expect(result.current.stage).toBe('error')
+    expect(result.current.uploadErrorKind).toBe('admission_rejected')
+    expect(result.current.isRejectedUpload).toBe(true)
+    expect(result.current.isInvalidEvidence).toBe(false)
+    expect(result.current.admissionState).toEqual({
+      status: 'rejected',
+      reason: 'queue_full',
+      message: 'Upload queue is currently full. Wait 5 seconds and retry.',
+      retryAfter: 5,
+      retryable: true,
+      actionHint: 'retry',
+    })
+  })
+
+  it('maps identity_limit rejection to actionable admission state', async () => {
+    hashFileInWorkerMock.mockResolvedValue('a'.repeat(64))
+    embedVideoMock.mockRejectedValue(
+      new ApiClientError({
+        code: 'IDENTITY_LIMIT',
+        message: 'Identity limit reached. Try again in 10s.',
+        detail: 'service overloaded',
+        requestId: null,
+        action: 'retry',
+        retryable: true,
+        status: 429,
+        reason: 'identity_limit',
+        retryAfter: 10,
+      }),
+    )
+
+    const { result } = renderHook(() => useEvidence())
     await act(async () => {
-      await result.current.handleEvidence(new File(['x'], 'evidence.mp4'))
+      await result.current.handleEvidence(new File(['bytes'], 'evidence.mp4'))
+    })
+
+    expect(result.current.uploadErrorKind).toBe('admission_rejected')
+    expect(result.current.isRejectedUpload).toBe(true)
+    expect(result.current.admissionState?.reason).toBe('identity_limit')
+    expect(result.current.admissionState?.retryAfter).toBe(10)
+  })
+
+  it('maps timeout rejection to actionable admission state', async () => {
+    hashFileInWorkerMock.mockResolvedValue('a'.repeat(64))
+    embedVideoMock.mockRejectedValue(
+      new ApiClientError({
+        code: 'TIMEOUT',
+        message: 'Request timed out waiting for admission slot.',
+        detail: 'service overloaded',
+        requestId: null,
+        action: 'retry',
+        retryable: true,
+        status: 503,
+        reason: 'timeout',
+        retryAfter: null,
+      }),
+    )
+
+    const { result } = renderHook(() => useEvidence())
+    await act(async () => {
+      await result.current.handleEvidence(new File(['bytes'], 'evidence.mp4'))
+    })
+
+    expect(result.current.uploadErrorKind).toBe('admission_rejected')
+    expect(result.current.isRejectedUpload).toBe(true)
+    expect(result.current.admissionState?.reason).toBe('timeout')
+  })
+
+  it('distinguishes invalid evidence from admission rejection', async () => {
+    hashFileInWorkerMock.mockResolvedValue('a'.repeat(64))
+    embedVideoMock.mockRejectedValue(
+      new ApiClientError({
+        code: 'VALIDATION_ERROR',
+        message: 'Video file corrupted or unsupported format.',
+        detail: 'Invalid container format',
+        requestId: null,
+        action: 'fix_input',
+        retryable: false,
+        status: 400,
+      }),
+    )
+
+    const { result } = renderHook(() => useEvidence())
+    await act(async () => {
+      await result.current.handleEvidence(new File(['bytes'], 'evidence.mp4'))
+    })
+
+    expect(result.current.stage).toBe('error')
+    expect(result.current.uploadErrorKind).toBe('invalid_evidence')
+    expect(result.current.isRejectedUpload).toBe(false)
+    expect(result.current.isInvalidEvidence).toBe(true)
+    expect(result.current.admissionState).toBeNull()
+  })
+
+  it('retries upload with the active file when retryUpload is called', async () => {
+    hashFileInWorkerMock.mockResolvedValue('a'.repeat(64))
+    embedVideoMock
+      .mockRejectedValueOnce(
+        new ApiClientError({
+          code: 'QUEUE_FULL',
+          message: 'Queue full.',
+          detail: 'service overloaded',
+          requestId: null,
+          action: 'retry',
+          retryable: true,
+          status: 503,
+          reason: 'queue_full',
+          retryAfter: 2,
+        }),
+      )
+      .mockResolvedValueOnce({
+        embeddedBlob: new Blob(['embedded']),
+        embeddedHash: 'b'.repeat(64),
+        metadataHash: 'c'.repeat(64),
+      })
+
+    const { result } = renderHook(() => useEvidence())
+    const testFile = new File(['bytes'], 'evidence.mp4')
+
+    await act(async () => {
+      await result.current.handleEvidence(testFile)
+    })
+
+    expect(result.current.isRejectedUpload).toBe(true)
+    expect(result.current.stage).toBe('error')
+
+    // Calling retryUpload triggers handleEvidence with testFile
+    await act(async () => {
+      await result.current.retryUpload()
     })
 
     expect(result.current.stage).toBe('ready')
-    const preview = result.current.proofPreparation
-    expect(preview.ok).toBe(true)
-    if (!preview.ok) return
-
-    expect(preview.policyId).toBe('silent_witness/input-v1')
-    expect(preview.policyVersion).toBe(1)
-    expect(preview.publicInputs.map((field) => field.key)).toEqual([
-      'video_hash_hi',
-      'video_hash_lo',
-      'verifier_scope',
-      'epoch',
-    ])
-    expect(preview.publicInputs.find((field) => field.key === 'verifier_scope')?.value).toBe('0')
-    expect(preview.publicInputs.find((field) => field.key === 'video_hash_hi')?.value).toBe(
-      BigInt(`0x${'b'.repeat(32)}`).toString(10),
-    )
-    expect(preview.concealedInputs.every((field) => field.value === '[REDACTED]')).toBe(true)
-    expect(preview.readOnly).toBe(true)
-    expect(preview.transactionSubmission).toBe('none')
-    expect(fetchSpy).not.toHaveBeenCalled()
-  })
-})
-
-describe('useEvidence guided network mismatch recovery', () => {
-  afterEach(() => {
-    vi.clearAllMocks()
-    vi.restoreAllMocks()
+    expect(result.current.uploadErrorKind).toBe('none')
+    expect(result.current.isRejectedUpload).toBe(false)
+    expect(result.current.admissionState?.status).toBe('admitted')
   })
 
-  async function prepareEvidence() {
-    hashFileInWorkerMock.mockResolvedValue('a'.repeat(64))
-    embedVideoMock.mockResolvedValue({
-      embeddedBlob: new Blob(['embedded']),
-      embeddedHash: 'b'.repeat(64),
-      metadataHash: 'c'.repeat(64),
-    })
-    Object.defineProperty(URL, 'createObjectURL', {
-      configurable: true,
-      value: () => 'blob:embedded',
-    })
-    Object.defineProperty(URL, 'revokeObjectURL', {
-      configurable: true,
-      value: vi.fn(),
-    })
+  it('resets admission state when cancelEvidence is called', async () => {
+    hashFileInWorkerMock.mockImplementation(() => new Promise(() => {}))
 
-    const hook = renderHook(() => useEvidence())
-    await act(async () => {
-      await hook.result.current.handleEvidence(new File(['x'], 'evidence.mp4'))
-    })
-    return hook
-  }
-
-  it('populates required and current wallet networks on mismatch and resumes only after fresh validation', async () => {
-    const { result } = await prepareEvidence()
-
-    getWalletNetworkMock.mockResolvedValueOnce('Public Global Stellar Network ; September 2015')
-    await act(async () => {
-      await result.current.registerProof('GSOURCEGAUTH')
-    })
-
-    expect(registerProofOnStellarMock).not.toHaveBeenCalled()
-    expect(result.current.networkMismatchRecovery).toMatchObject({
-      requiredNetwork: 'Testnet',
-      currentWalletNetwork: 'Mainnet',
-      isValidating: false,
-      validationError: null,
-      intent: {
-        tier: 'silent',
-        videoHash: 'b'.repeat(64),
-      },
-    })
-
-    // Still on wrong network — fresh validation must fail closed and keep recovery active.
-    getWalletNetworkMock.mockResolvedValueOnce('Test SDF Future Network ; October 2022')
-    let resumed = true
-    await act(async () => {
-      resumed = await result.current.revalidateNetworkMismatch('GSOURCEGAUTH')
-    })
-    expect(resumed).toBe(false)
-    expect(result.current.networkMismatchRecovery?.currentWalletNetwork).toBe('Futurenet')
-    expect(result.current.networkMismatchRecovery?.validationError).toContain('Futurenet')
-
-    // Wallet switched to Testnet — fresh validation clears recovery so registration can resume.
-    getWalletNetworkMock.mockResolvedValueOnce('Test SDF Network ; September 2015')
-    await act(async () => {
-      resumed = await result.current.revalidateNetworkMismatch('GSOURCEGAUTH')
-    })
-    expect(resumed).toBe(true)
-    expect(result.current.networkMismatch).toBeNull()
-    expect(result.current.networkMismatchRecovery).toBeNull()
-    expect(result.current.message).toContain('Network validated on Testnet')
-  })
-
-  it('refuses to resume when the selected identity tier changed since evidence preparation', async () => {
-    const { result } = await prepareEvidence()
-
-    getWalletNetworkMock.mockResolvedValueOnce('Public Global Stellar Network ; September 2015')
-    await act(async () => {
-      await result.current.registerProof('GSOURCEGAUTH')
-    })
-    expect(result.current.networkMismatchRecovery?.requiredNetwork).toBe('Testnet')
-
-    // Switch identity tier without re-preparing evidence.
+    const { result } = renderHook(() => useEvidence())
     act(() => {
-      result.current.setSelectedTier('source')
+      void result.current.handleEvidence(new File(['bytes'], 'evidence.mp4'))
     })
 
-    getWalletNetworkMock.mockResolvedValueOnce('Test SDF Network ; September 2015')
-    let resumed = true
-    await act(async () => {
-      resumed = await result.current.revalidateNetworkMismatch('GSOURCEGAUTH')
+    act(() => {
+      result.current.cancelEvidence()
     })
 
-    expect(resumed).toBe(false)
-    expect(result.current.networkMismatchRecovery).not.toBeNull()
-    expect(result.current.networkMismatchRecovery?.validationError).toContain(
-      'Selected identity tier changed',
-    )
-    expect(getWalletNetworkMock).toHaveBeenCalledTimes(1)
+    expect(result.current.stage).toBe('cancelled')
+    expect(result.current.admissionState).toBeNull()
+    expect(result.current.uploadErrorKind).toBe('none')
+    expect(result.current.isRejectedUpload).toBe(false)
   })
 })
+

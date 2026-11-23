@@ -81,12 +81,16 @@ Credential or nullifier seeds, proof witnesses, generated proofs, raw private
 inputs, and every other field are prohibited from both `localStorage` and
 `sessionStorage`. Keep secret proof-generation data in memory only.
 
-## Result tabs and statement digest binding
+## Upload Admission & Queue State
 
-`VerificationResultTabs` (`src/components/VerificationResultTabs.tsx`) and
-`resolveVerifiedStatementIdentity` (`src/services/verificationFlow.ts`) bind the
-canonical verified statement digest and matching proof identifier across the
-`Summary`, `Chain binding`, and `Event corroboration` result tabs. Switching
-tabs preserves the exact statement identity across panels, while changing the
-underlying statement digest automatically resets active tab selection and
-dependent commitment/event inspection views.
+Evidence Studio exposes backend upload admission and queue limits, mapping backend capacity reasons to actionable UI states:
+
+- **Queue & Capacity Reasons**:
+  - `queue_full` (HTTP 503): Service concurrency queue is saturated. Displays actionable wait time from `Retry-After` header and provides a single-click Retry button.
+  - `identity_limit` (HTTP 429): Concurrent in-flight uploads for the active identity tier or address exceeded limits. Displays queue timeout and retry button.
+  - `timeout` (HTTP 503): Request queued but timed out waiting for backend processing slot. Actionable retry state.
+  - `rate_limited` (HTTP 429): Standard API rate limiting with retry-after hint.
+- **Distinct from Invalid Evidence**:
+  - Admission rejections (queue / capacity overloads) are treated as transient and retryable, rendering the `.admission-queue-banner`.
+  - Invalid evidence rejections (e.g., 400 Bad Request, 413 Payload Too Large, 415 Unsupported Media Type, or payload integrity mismatches) are distinct failure states representing malformed inputs or integrity violations, rendering the `.invalid-evidence-banner` without falsely attributing capacity limits.
+

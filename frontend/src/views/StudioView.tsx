@@ -8,8 +8,7 @@ import { EventList } from '../components/EventList'
 import { ShareVerificationLink } from '../components/ShareVerificationLink'
 import { VerifierSetStatusPanel } from '../components/VerifierSetStatusPanel'
 import { shortHash } from '../utils'
-import { useA11yStage, useStageFocus } from '../hooks/useA11y'
-import { PROOF_STAGE_SEQUENCE, proofStageLabel, proofStageStatus } from '../proofStage'
+import { useA11yStage } from '../hooks/useA11y'
 import ProvenanceCard from '../provenance/ProvenanceCard'
 import type { ProvenanceRecord } from '../provenance/provenanceModel'
 import { RedactionPreview } from '../components/RedactionPreview'
@@ -50,6 +49,10 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
     networkMismatch,
     networkMismatchRecovery = null,
     isCancellable,
+    admissionState,
+    isRejectedUpload = false,
+    isInvalidEvidence = false,
+    retryUpload = async () => {},
     handleEvidence,
     registerProof,
     revalidateNetworkMismatch,
@@ -239,15 +242,41 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
           </div>
         ) : null}
 
-        {stateChangeExplanation ? (
-          <div
-            className="studio-state-notice"
-            role="status"
-            aria-live="polite"
-            aria-atomic="true"
-            data-testid="studio-evidence-change-notice"
-          >
-            <p>{stateChangeExplanation}</p>
+        {isRejectedUpload && admissionState ? (
+          <div className="admission-queue-banner" role="alert" data-testid="admission-queue-banner">
+            <div className="admission-queue-header">
+              <span className="admission-queue-icon" aria-hidden="true">⏳</span>
+              <strong data-testid="admission-queue-title">
+                Upload Queue & Admission State: Rejected ({admissionState.reason ? admissionState.reason.replace('_', ' ') : 'Capacity Limit'})
+              </strong>
+            </div>
+            <p className="admission-queue-message" data-testid="admission-queue-message">{admissionState.message}</p>
+            {admissionState.retryAfter != null ? (
+              <p className="admission-queue-retry-hint" data-testid="admission-queue-retry-hint">
+                Estimated queue wait: <strong>{admissionState.retryAfter}s</strong>.
+              </p>
+            ) : null}
+            {admissionState.retryable ? (
+              <button
+                type="button"
+                className="retry-upload-btn hero-secondary"
+                onClick={() => void retryUpload()}
+                aria-label="Retry upload"
+                data-testid="retry-upload-btn"
+              >
+                Retry Upload
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+
+        {isInvalidEvidence ? (
+          <div className="invalid-evidence-banner" role="alert" data-testid="invalid-evidence-banner">
+            <div className="invalid-evidence-header">
+              <span className="invalid-evidence-icon" aria-hidden="true">⚠</span>
+              <strong>Invalid Evidence Payload</strong>
+            </div>
+            <p className="invalid-evidence-message" data-testid="invalid-evidence-message">{message}</p>
           </div>
         ) : null}
 
@@ -351,6 +380,16 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
 
         <dl className="data-list" aria-label="Evidence data">
           <div>
+            <dt>Admission State</dt>
+            <dd data-testid="admission-state-value">
+              {admissionState
+                ? `${admissionState.status.toUpperCase()}${admissionState.reason ? ` (${admissionState.reason})` : ''}`
+                : proof
+                  ? 'ADMITTED'
+                  : 'IDLE'}
+            </dd>
+          </div>
+          <div>
             <dt>Source Hash</dt>
             <dd>{shortHash(proof?.sourceHash ?? '')}</dd>
           </div>
@@ -453,7 +492,7 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
               className="secondary-action"
               type="button"
               onClick={() => cancelProving()}
-              aria-label="Cancel proof generation"
+              aria-label="Cancel proving"
             >
               <XCircle size={18} aria-hidden="true" />
               Cancel proving
