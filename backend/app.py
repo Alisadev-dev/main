@@ -88,12 +88,35 @@ except ImportError:
     default_min_confirmations = None
     reconcile_pending_registrations = None
     reconcile_registration = None
-from idempotency import (
-    IntentConflictError,
-    idempotent,
-    persist_registration_intent,
-    registration_intent_digest,
-)
+
+try:
+    from registration_quarantine import record_registration_conflict
+except ImportError:
+    record_registration_conflict = None  # type: ignore[assignment]
+
+
+def build_reconcile_batch_report(
+    *,
+    limit: int,
+    selected: int,
+    processed: int,
+    deferred: int,
+) -> dict:
+    """Describe a reconciliation batch for administrative responses.
+
+    ``complete_batch`` is true when every selected item in this batch was
+    processed.  ``complete_backlog`` is true only when nothing was deferred,
+    meaning no further pending work remains beyond this batch.
+    """
+    return {
+        "limit": int(limit),
+        "selected": int(selected),
+        "processed": int(processed),
+        "deferred": int(deferred),
+        "complete_batch": int(processed) == int(selected),
+        "complete_backlog": int(deferred) == 0 and int(processed) == int(selected),
+    }
+from idempotency import idempotent
 from lineage import (
     LineageValidationError,
     canonical_lineage_manifest,
@@ -1744,6 +1767,16 @@ def create_app() -> Flask:
                 claimed_capture_time=claimed_capture_time,
             )
         except ConflictError as exc:
+            # Retain the contradictory claim for operator review without
+            # publishing private evidence metadata in the diagnostic.
+            exc._proof_id = proof_id  # type: ignore[attr-defined]
+            exc._video_hash = video_hash  # type: ignore[attr-defined]
+            exc._source_address = validated_source_address  # type: ignore[attr-defined]
+            if record_registration_conflict is not None:
+                try:
+                    record_registration_conflict(exc, tx_hash=normalized_tx_hash)
+                except Exception:
+                    pass  # quarantine failure must never suppress the 409
             return jsonify({
                 "error": "idempotency key reused with conflicting payload",
                 "conflict_field": exc.field,
