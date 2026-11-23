@@ -25,10 +25,10 @@ const TIERS = new Set(['silent', 'source', 'seal'])
  * Everything else is excluded by construction. In particular, seeds, proof
  * witnesses, generated proofs, and raw private inputs must remain in memory.
  * 
- * Note: Credential seeds may be stored locally ONLY in the encrypted VaultEnvelope
- * managed by `CredentialVault`, which provides explicit lock/unlock semantics and
- * staged format migration (preserving the previous encrypted envelope in
- * `harpocrates:credential-vault:backup` until the replacement envelope verifies).
+ * Note: Credential seeds may be stored locally ONLY in the encrypted VaultEnvelope 
+ * managed by `CredentialVault`, which provides explicit lock/unlock semantics.
+ * Vault backup export destinations and encrypted backup payloads are never persisted
+ * in `safeStorage`; destinations must be explicitly selected by the user per export.
  */
 function sanitizePreferences(value: unknown): PersistedUiPreferences {
   if (!value || typeof value !== 'object') return {}

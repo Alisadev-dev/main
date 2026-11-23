@@ -81,16 +81,18 @@ Credential or nullifier seeds, proof witnesses, generated proofs, raw private
 inputs, and every other field are prohibited from both `localStorage` and
 `sessionStorage`. Keep secret proof-generation data in memory only.
 
-## Batch Verification Export Privacy Profiles
+## Vault backup export preview
 
-Batch verification exports (`src/batchExport.ts`) support two privacy profiles
-selectable in the Batch Verification Workspace UI (defaulting to `public`):
+`CredentialVault` (`src/credentialVault.ts`) and `VaultBackupExportPreview`
+(`src/components/VaultBackupExportPreview.tsx`) provide a fail-closed backup
+export preview:
 
-- `public`: Shareable verification outcomes and cryptographic commitments only
-  (`status`, `videoHash`, `metadataHash`, `sourceHash`, `tier`, `chainStatus`,
-  `fileSizeBytes`, `durationMs`). Excludes raw filenames, duplicate filename
-  references, diagnostic messages, failure reasons, and private issuer notes.
-- `owner-only`: Full local audit export adding `fileName`, `message`,
-  `duplicateOf`, `failureReason`, and `issuerNote` for owner-controlled storage.
-
-Unsupported profile identifiers fail closed with an error.
+- `getBackupExportPreview()` / `buildVaultBackupPreview()` inspect the stored
+  encrypted `VaultEnvelope` without decrypting it and return only the envelope
+  version and nonsecret compatibility metadata (`kdf`, `kdfIterations`, `cipher`,
+  and byte lengths). Passphrases, seeds, and raw `salt`/`iv`/`ct` values are
+  never included in preview metadata.
+- `prepareEncryptedBackupExport(destination)` and `VaultBackupExportPreview`
+  require explicit user selection of an encrypted export destination
+  (`file-download` or `encrypted-clipboard`) before releasing the serialized
+  encrypted envelope. Export destinations are never persisted in `safeStorage`.

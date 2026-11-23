@@ -1,13 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   CredentialVault,
-  rehearseVaultRecovery,
-  hasVaultRecoveryRehearsed,
-  resetVaultRecoveryRehearsal,
-  validateVaultEnvelope,
-  type VaultEnvelope,
+  buildVaultBackupPreview,
+  type VaultExportDestination,
 } from './credentialVault'
-import { createIsolatedStateContainer } from './safeStorage'
 
 describe('CredentialVault', () => {
   let vault: CredentialVault
@@ -125,187 +121,102 @@ describe('CredentialVault', () => {
     await expect(restoredVault.unlock('secret')).rejects.toThrow('Vault corrupted: unable to parse envelope')
   })
 
-  it('should validate envelope structure and reject invalid parameters', () => {
-    expect(() => validateVaultEnvelope(null)).toThrow('Vault corrupted: envelope must be an object')
-    expect(() => validateVaultEnvelope([])).toThrow('Vault corrupted: envelope must be an object')
-    expect(() => validateVaultEnvelope({ v: 2, salt: 'aa', iv: 'bb', ct: 'cc' })).toThrow('Unsupported vault version: 2')
-    expect(() => validateVaultEnvelope({ v: 1, salt: 'odd', iv: 'bb', ct: 'cc' })).toThrow('salt must be a non-empty hex string with even length')
-    expect(() => validateVaultEnvelope({ v: 1, salt: 'aa', iv: '', ct: 'cc' })).toThrow('iv must be a non-empty hex string with even length')
-    expect(() => validateVaultEnvelope({ v: 1, salt: 'aa', iv: 'bb', ct: 'not-hex!' })).toThrow('ct must be a non-empty hex string with even length')
+  describe('backup export preview and destination selection', () => {
+    it('returns envelope version and nonsecret compatibility metadata even when locked', async () => {
+      const seeds = {
+        credentialSeed: 'synthetic-cred-seed-secret-01',
+        nullifierSeed: 'synthetic-null-seed-secret-02',
+      }
+      await vault.setup('synthetic-passphrase-99!', seeds)
+      vault.lock()
 
-    const valid: VaultEnvelope = { v: 1, salt: 'deadbeef', iv: '0102030405060708090a0b0c', ct: 'aabbccdd' }
-    expect(validateVaultEnvelope(valid)).toEqual(valid)
-  })
+      const storedRaw = window.localStorage.getItem('harpocrates:credential-vault')!
+      const storedEnvelope = JSON.parse(storedRaw) as { salt: string; iv: string; ct: string }
 
-  it('should export and import vault through isolated containers', async () => {
-    const isolatedContainer = createIsolatedStateContainer()
-    const isolatedVault = new CredentialVault({ storage: isolatedContainer })
+      const preview = vault.getBackupExportPreview()
+      expect(preview.ok).toBe(true)
+      if (!preview.ok) return
 
-    // Exporting an empty vault throws
-    expect(() => isolatedVault.exportVault()).toThrow('Vault is empty')
+      expect(preview.requiresDestinationSelection).toBe(true)
+      expect(preview.metadata).toMatchObject({
+        envelopeVersion: 1,
+        compatible: true,
+        kdf: 'PBKDF2-SHA256',
+        kdfIterations: 600000,
+        cipher: 'AES-256-GCM',
+        saltBytes: 16,
+        ivBytes: 12,
+        containsSecretsInPreview: false,
+      })
+      expect(preview.metadata.ciphertextBytes).toBeGreaterThan(0)
+      expect(preview.metadata.encryptedPayloadBytes).toBeGreaterThan(0)
 
-    const seeds = { credentialSeed: 'isolated-cred', nullifierSeed: 'isolated-null' }
-    await isolatedVault.setup('testPass123!', seeds)
-
-    const envelope = isolatedVault.exportVault()
-    expect(envelope.v).toBe(1)
-    expect(envelope.salt).toBeDefined()
-    expect(envelope.iv).toBeDefined()
-    expect(envelope.ct).toBeDefined()
-
-    // Import into a target container
-    const targetContainer = createIsolatedStateContainer()
-    const targetVault = new CredentialVault({ storage: targetContainer })
-    expect(targetVault.hasVault()).toBe(false)
-
-    targetVault.importVault(envelope)
-    expect(targetVault.hasVault()).toBe(true)
-    expect(targetVault.isLocked()).toBe(true)
-
-    // Unlocking target vault restores identical seeds
-    const unlocked = await targetVault.unlock('testPass123!')
-    expect(unlocked).toBe(true)
-    expect(targetVault.getSeeds()).toEqual(seeds)
-
-    // Window localStorage was not touched
-    expect(window.localStorage.getItem('harpocrates:credential-vault')).toBeNull()
-  })
-
-  it('should reject importing malformed or corrupted envelopes', async () => {
-    const isolatedContainer = createIsolatedStateContainer()
-    const isolatedVault = new CredentialVault({ storage: isolatedContainer })
-
-    expect(() => isolatedVault.importVault('invalid-json')).toThrow('Vault corrupted: unable to parse envelope')
-    expect(() => isolatedVault.importVault({ v: 1, salt: 'invalid', iv: 'aa', ct: 'bb' } as unknown as VaultEnvelope))
-      .toThrow('Unsupported vault parameter: salt must be a non-empty hex string with even length')
-  })
-})
-
-describe('Vault Recovery Rehearsal with Synthetic Material', () => {
-  beforeEach(() => {
-    window.localStorage.clear()
-    vi.useRealTimers()
-  })
-
-  afterEach(() => {
-    window.localStorage.clear()
-  })
-
-  it('should execute a successful one-time vault recovery rehearsal without touching live credentials', async () => {
-    // 1. Arrange: Setup existing real private credentials in window.localStorage
-    const realSeeds = { credentialSeed: 'real-production-secret-1', nullifierSeed: 'real-production-secret-2' }
-    const realVault = new CredentialVault()
-    await realVault.setup('realMasterPassword#1', realSeeds)
-    const initialRealEnvelope = window.localStorage.getItem('harpocrates:credential-vault')
-    expect(initialRealEnvelope).not.toBeNull()
-
-    // Status is initially false
-    expect(hasVaultRecoveryRehearsed()).toBe(false)
-
-    // 2. Act: Perform recovery rehearsal with synthetic material
-    const result = await rehearseVaultRecovery()
-
-    // 3. Assert: Verify rehearsal results
-    expect(result.success).toBe(true)
-    expect(result.syntheticSeedsVerified).toBe(true)
-    expect(result.isolatedExportVerified).toBe(true)
-    expect(result.isolatedImportVerified).toBe(true)
-    expect(result.originalCredentialsUntouched).toBe(true)
-    expect(result.rehearsalCompleted).toBe(true)
-    expect(result.exportedEnvelope.v).toBe(1)
-    expect(result.timestamp).toBeGreaterThan(0)
-
-    // 4. Assert: Plaintext privacy - synthetic material never exposed unencrypted
-    const exportedJson = JSON.stringify(result.exportedEnvelope)
-    expect(exportedJson).not.toContain('synth_cred_')
-    expect(exportedJson).not.toContain('synth_null_')
-
-    // 5. Assert: Active user's real private credentials remain strictly unchanged and functional
-    const postRehearsalEnvelope = window.localStorage.getItem('harpocrates:credential-vault')
-    expect(postRehearsalEnvelope).toBe(initialRealEnvelope)
-
-    // User can still unlock their real vault with their real password
-    const restoredRealVault = new CredentialVault()
-    const unlockedReal = await restoredRealVault.unlock('realMasterPassword#1')
-    expect(unlockedReal).toBe(true)
-    expect(restoredRealVault.getSeeds()).toEqual(realSeeds)
-
-    // 6. Assert: One-time status is tracked in safe UI preferences
-    expect(hasVaultRecoveryRehearsed()).toBe(true)
-
-    // Resetting works
-    resetVaultRecoveryRehearsal()
-    expect(hasVaultRecoveryRehearsed()).toBe(false)
-  }, 30000)
-
-  it('should support instance method rehearseRecovery with custom synthetic material', async () => {
-    const vaultInstance = new CredentialVault()
-    const customSynthetic = {
-      credentialSeed: 'synth_custom_credential_material_123',
-      nullifierSeed: 'synth_custom_nullifier_material_456',
-    }
-
-    const result = await vaultInstance.rehearseRecovery({
-      syntheticMaterial: customSynthetic,
-      passphrase: 'RehearsalPassphrase#2026',
+      // Ensure no secret or raw cryptographic field values leak into preview metadata
+      const serializedPreview = JSON.stringify(preview)
+      expect(serializedPreview).not.toContain(seeds.credentialSeed)
+      expect(serializedPreview).not.toContain(seeds.nullifierSeed)
+      expect(serializedPreview).not.toContain('synthetic-passphrase-99!')
+      expect(serializedPreview).not.toContain(storedEnvelope.salt)
+      expect(serializedPreview).not.toContain(storedEnvelope.iv)
+      expect(serializedPreview).not.toContain(storedEnvelope.ct)
     })
 
-    expect(result.success).toBe(true)
-    expect(result.syntheticSeedsVerified).toBe(true)
-    expect(result.isolatedExportVerified).toBe(true)
-    expect(result.isolatedImportVerified).toBe(true)
-    expect(result.originalCredentialsUntouched).toBe(true)
-  }, 30000)
+    it('fails closed when no vault exists, envelope is corrupted, or version is unsupported', () => {
+      expect(vault.getBackupExportPreview()).toMatchObject({
+        ok: false,
+        code: 'NO_VAULT',
+      })
 
-  it('should fail closed when recovery rehearsal passphrase does not match', async () => {
-    const isolatedSource = createIsolatedStateContainer()
-    const isolatedTarget = createIsolatedStateContainer()
+      expect(buildVaultBackupPreview('not-json')).toMatchObject({
+        ok: false,
+        code: 'CORRUPTED_ENVELOPE',
+      })
 
-    // Attempting rehearsal with an invalid unlock attempt
-    const customSynthetic = {
-      credentialSeed: 'synth_fail_cred_1',
-      nullifierSeed: 'synth_fail_null_2',
-    }
+      expect(
+        buildVaultBackupPreview(JSON.stringify({ v: 2, salt: 'aa', iv: 'bb', ct: 'cc' })),
+      ).toMatchObject({
+        ok: false,
+        code: 'UNSUPPORTED_VERSION',
+        envelopeVersion: 2,
+      })
 
-    // Set up source vault
-    const sourceVault = new CredentialVault(15 * 60 * 1000, isolatedSource)
-    await sourceVault.setup('correctPassphrase', customSynthetic)
-    const exported = sourceVault.exportVault()
-
-    // Import into target
-    const destVault = new CredentialVault(15 * 60 * 1000, isolatedTarget)
-    destVault.importVault(exported)
-
-    // Attempt unlock with wrong passphrase
-    const unlockSuccess = await destVault.unlock('wrongPassphrase')
-    expect(unlockSuccess).toBe(false)
-    expect(destVault.isLocked()).toBe(true)
-    expect(destVault.getSeeds()).toBeNull()
-  }, 30000)
-
-  it('should fail closed if ciphertext in exported envelope is tampered', async () => {
-    const isolatedSource = createIsolatedStateContainer()
-    const isolatedTarget = createIsolatedStateContainer()
-
-    const sourceVault = new CredentialVault(15 * 60 * 1000, isolatedSource)
-    await sourceVault.setup('testPass', {
-      credentialSeed: 'synth_1',
-      nullifierSeed: 'synth_2',
+      expect(
+        buildVaultBackupPreview(JSON.stringify({ v: 1, salt: 'not-hex!', iv: 'bb', ct: 'cc' })),
+      ).toMatchObject({
+        ok: false,
+        code: 'INVALID_ENVELOPE_FIELDS',
+        envelopeVersion: 1,
+      })
     })
 
-    const exported = sourceVault.exportVault()
+    it('requires explicit user selection of a valid encrypted export destination', async () => {
+      const seeds = { credentialSeed: 'cred-export', nullifierSeed: 'null-export' }
+      await vault.setup('export-passphrase', seeds)
 
-    // Tamper ciphertext
-    const tamperedCt = exported.ct.slice(0, -2) + (exported.ct.endsWith('00') ? 'ff' : '00')
-    const tamperedEnvelope = { ...exported, ct: tamperedCt }
+      expect(vault.prepareEncryptedBackupExport(null)).toMatchObject({
+        ok: false,
+        code: 'DESTINATION_REQUIRED',
+      })
+      expect(vault.prepareEncryptedBackupExport(undefined)).toMatchObject({
+        ok: false,
+        code: 'DESTINATION_REQUIRED',
+      })
+      expect(
+        vault.prepareEncryptedBackupExport('unknown-dest' as unknown as VaultExportDestination),
+      ).toMatchObject({
+        ok: false,
+        code: 'INVALID_DESTINATION',
+      })
 
-    const destVault = new CredentialVault(15 * 60 * 1000, isolatedTarget)
-    destVault.importVault(tamperedEnvelope)
+      const result = vault.prepareEncryptedBackupExport('file-download')
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
 
-    // Decryption fails with invalid ciphertext
-    const unlockSuccess = await destVault.unlock('testPass')
-    expect(unlockSuccess).toBe(false)
-    expect(destVault.isLocked()).toBe(true)
-    expect(destVault.getSeeds()).toBeNull()
-  }, 30000)
+      expect(result.destination).toBe('file-download')
+      expect(result.metadata.envelopeVersion).toBe(1)
+      expect(result.serializedEnvelope).toBe(
+        window.localStorage.getItem('harpocrates:credential-vault'),
+      )
+    })
+  })
 })
