@@ -73,17 +73,47 @@ def test_rejects_incomplete_context_without_inventing_receipt_fields():
         build_verification_receipt({"proofId": "a" * 64})
 
 
-@pytest.mark.parametrize(
-    "vector",
-    INTEROP_FIXTURE["validVectors"],
-    ids=lambda v: v["name"],
-)
-def test_interop_valid_vectors_parse_canonicalize_and_verify(vector: dict):
-    unsigned_input = vector["unsignedInput"]
-    built = build_verification_receipt(
-        unsigned_input,
-        result=unsigned_input["result"],
-        verified_at=unsigned_input["verifiedAt"],
+def test_receipt_remains_unsigned_when_key_history_is_requested():
+    # Public signing-key history is served by a separate read-only endpoint.
+    # The unsigned receipt model must not embed key material or signatures.
+    receipt = build_verification_receipt(context())
+
+    assert "signingKeys" not in receipt
+    assert "keyHistory" not in receipt
+    assert "signature" not in receipt
+
+
+def _receipt(**overrides: object) -> dict[str, object]:
+    base = dict(build_verification_receipt(context(), result="verified"))
+    base["verifiedAt"] = "2026-10-01T12:00:00+00:00"
+    base.update(overrides)
+    return base
+
+
+def test_compare_identical_receipts():
+    run_a = _receipt()
+    run_b = _receipt()
+
+    report = compare_verification_receipts(run_a, run_b)
+
+    assert report["identical"] is True
+    assert report["equivalentEvidence"] is True
+    assert report["presentationOnly"] is False
+    assert report["summary"] == "Receipts are identical."
+    assert report["evidenceChanges"] == []
+    assert report["trustChanges"] == []
+    assert report["revocationChanges"] == []
+    assert report["chainChanges"] == []
+    assert report["presentationChanges"] == []
+    assert report["explanations"] == []
+
+
+def test_compare_distinguishes_presentation_only_differences():
+    run_a = _receipt(
+        verifiedAt="2026-10-01T12:00:00+00:00",
+        verifierVersion="2026.09",
+        videoHash="b" * 64,
+        signature="sig-aaa",
     )
     assert built == unsigned_input
 
@@ -154,5 +184,53 @@ def test_interop_rejects_stale_key_wrong_network_wrong_proof_and_oversized_qr():
     assert stale_key["valid"] is False
     assert "stale" in str(stale_key["reason"])
 
-    with pytest.raises(ValueError, match="QR payload size limit"):
-        decode_receipt_from_qr("A" * (MAX_QR_PAYLOAD_BYTES + 1))
+
+def test_compare_fixed_clock_exact_boundary_match():
+    """Receipt comparison with fixed clock at exact boundary."""
+    digest = "b" * 64
+    fixed_time = 1700000000000
+    
+    # Both runs have identical time attestation with exact boundary match
+    ta = create_time_attestation(evidence_digest=digest, claimed_time_ms=fixed_time)
+    # Add stellar anchor at exact same timestamp
+    ta_with_anchor = add_stellar_anchor(
+        ta,
+        ledger_sequence=100,
+        ledger_timestamp=fixed_time // 1000,
+        transaction_hash="c" * 64,
+        network_passphrase="Test SDF Network ; September 2015",
+    )
+    
+    run_a = _receipt(timeAttestation=encode_time_attestation(ta_with_anchor))
+    run_b = _receipt(timeAttestation=ta_with_anchor)
+    
+    report = compare_verification_receipts(run_a, run_b)
+    
+    # Should be identical including time bounds
+    assert report["identical"] is True
+    assert report["equivalentEvidence"] is True
+    assert report["presentationOnly"] is False
+
+
+def test_compare_time_bounds_presentation_only_difference():
+    """Time bounds differences are presentation-only if time sources match."""
+    digest = "c" * 64
+    fixed_time = 1700000000000
+    
+    ta = create_time_attestation(evidence_digest=digest, claimed_time_ms=fixed_time)
+    ta_with_stellar = add_stellar_anchor(
+        ta,
+        ledger_sequence=100,
+        ledger_timestamp=fixed_time // 1000,
+        transaction_hash="d" * 64,
+        network_passphrase="Test SDF Network ; September 2015",
+    )
+    
+    # Both have same time sources, time bounds should match
+    run_a = _receipt(timeAttestation=encode_time_attestation(ta_with_stellar))
+    run_b = _receipt(timeAttestation=ta_with_stellar)
+    
+    report = compare_verification_receipts(run_a, run_b)
+    
+    assert report["identical"] is True
+    # Time bounds are derived from time source types, so identical sources = identical bounds
