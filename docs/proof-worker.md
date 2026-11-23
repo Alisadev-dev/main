@@ -218,20 +218,12 @@ cd frontend
 npx vitest run src/workers/multiBrowserWorkerSupport.test.ts src/proofWorkerMemory.test.ts src/workers/proofWorkerClient.test.ts src/workers/crashRecoveryFixtureProtocol.test.ts
 ```
 
-## Synthetic worker crash-recovery fixture protocol
-
-`frontend/src/workers/crashRecoveryFixtureProtocol.ts` provides a deterministic,
-non-secret fixture protocol for verifying browser proof-worker failure and UI
-recovery paths without live cryptographic secrets or real media.
-
-Modelled failure scenarios:
-- `init_failure` — worker startup failure or CSP origin rejection (`INIT_FAILED`, `ORIGIN_REJECTED`).
-- `malformed_message` — malformed, untyped, or mismatched-id worker frames and `onmessageerror` deserialization failures (`MALFORMED_WORKER_MESSAGE`).
-- `interrupted_proving` — mid-proof worker crash, forced termination, or `proofWorkerMemory` ceiling violations (`WORKER_CRASHED`, `MEMORY_LIMIT_EXCEEDED`).
-
-Protocol guarantees:
-- **Fail-closed frame validation** (`isValidWorkerResponse`) rejects invalid frames before they can influence UI state.
-- **Generation fencing** drops late/stale frames from terminated workers after `recover()` spawns a fresh generation.
-- **Deterministic UI recovery** records explicit `RecoveryTransition` sequences (`idle -> initializing -> failed -> recovering -> recovered -> proving -> ready`) with privacy-safe error codes.
 
 
+## Worker / Main-Thread Protocol Versioning
+
+`ProofWorkerManager` (`frontend/src/workers/proof-worker-manager.ts`) and `proof.worker.ts` enforce a strict integer protocol version (`PROOF_WORKER_PROTOCOL_VERSION = 1` in `frontend/src/workers/proof.worker.types.ts`) on worker/main-thread messages:
+
+- **Fail-closed before buffer transfer**: `validateWorkerProtocolVersion()` and `ProofWorkerManager.handleWorkerMessage()` check `protocolVersion` before invoking buffer-acceptance callbacks or parsing payload fields.
+- **No unsafe fallback parsing**: Missing, non-integer, stringified (e.g. `"1"`), zero, negative, `NaN`, or mismatched versions are rejected immediately without coercion.
+- **Clear reload-required result**: Mismatches return a privacy-safe `ProofWorkerResponse` with `type: 'error'`, `error.code = 'PROTOCOL_VERSION_MISMATCH'`, `error.reloadRequired = true`, and `error.privacySafe = true`, settling any matching pending request immediately.
