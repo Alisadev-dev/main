@@ -6,6 +6,7 @@ import hashlib
 import logging
 import re
 import os
+import threading
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone
@@ -1198,62 +1199,9 @@ def purge_expired_events(batch_size: int = RETENTION_BATCH_DEFAULT_SIZE) -> list
 
 
 _JOBS: dict[int, dict[str, Any]] = {}
-
-# Bounded per-job attempt history (see docs/job-status.md). Each lease opens an
-# attempt; progress and the terminal outcome are recorded on it. Only the
-# newest JOB_ATTEMPT_HISTORY_LIMIT attempts are kept; ``attempt`` keeps
-# counting, so dropped attempts show up as a gap in the numbering.
-JOB_ATTEMPT_HISTORY_LIMIT = 10
-# Outcomes recorded on an attempt.
-ATTEMPT_COMPLETED = "completed"
-ATTEMPT_FAILED = "failed"
-ATTEMPT_RELEASED = "released"
-# Attempt history is public, so free text (error messages may quote paths or
-# payload values) is never stored. Values that are not a plain code are
-# dropped entirely rather than cleaned, so nothing derived from them leaks.
-_ATTEMPT_REASON_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
-_ATTEMPT_WORKER_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
-
-
-def _attempt_code(value: Any, pattern: re.Pattern[str] = _ATTEMPT_REASON_RE) -> str | None:
-    """Return ``value`` if it is a plain code (e.g. an exception class name), else None."""
-    if isinstance(value, str) and pattern.fullmatch(value):
-        return value
-    return None
-
-
-def _open_attempt(job: dict[str, Any], worker_id: str) -> None:
-    attempts = job.setdefault("attempts", [])
-    number = job.get("_attempt_count", 0) + 1
-    job["_attempt_count"] = number
-    attempts.append(
-        {
-            "attempt": number,
-            "worker_id": _attempt_code(worker_id, _ATTEMPT_WORKER_RE),
-            "leased_at": datetime.now(UTC).isoformat(),
-            "ended_at": None,
-            "outcome": None,
-            "reason": None,
-            "progress": None,
-        }
-    )
-    del attempts[:-JOB_ATTEMPT_HISTORY_LIMIT]
-
-
-def _current_attempt(job: dict[str, Any]) -> dict[str, Any] | None:
-    attempts = job.get("attempts") or []
-    if attempts and attempts[-1].get("outcome") is None:
-        return attempts[-1]
-    return None
-
-
-def _close_attempt(job: dict[str, Any], outcome: str, reason: Any = None) -> None:
-    attempt = _current_attempt(job)
-    if attempt is None:
-        return
-    attempt["outcome"] = outcome
-    attempt["reason"] = _attempt_code(reason)
-    attempt["ended_at"] = datetime.now(UTC).isoformat()
+# Guards check-then-write on job records: a worker's main loop and its work
+# thread can touch the same job concurrently (release vs. late completion).
+_JOBS_LOCK = threading.RLock()
 _next_job_id = 1
 _TENANT_LAST_LEASED_SEQ: dict[str, int] = {}
 _lease_seq = 0
@@ -1388,6 +1336,26 @@ def is_job_cancelled(job_id: int) -> bool:
     return bool(job and job.get("status") == "cancelled")
 
 
+def _claim_is_current(job: dict[str, Any], generation: int | None, action: str) -> bool:
+    """Return whether a write from the claim ``generation`` may touch ``job``.
+
+    Every lease and every release bumps the job's ``_claim_generation``, so a
+    worker that lost its claim (for example after the shutdown grace period
+    expired and the job was released or re-leased) holds a stale generation.
+    ``None`` keeps the pre-fencing behaviour for callers that do not pass one.
+    """
+    if generation is None or generation == job.get("_claim_generation", 0):
+        return True
+    logger.warning(
+        "job_claim_stale job_id=%s action=%s claim_generation=%s current_generation=%s",
+        job.get("id"),
+        action,
+        generation,
+        job.get("_claim_generation", 0),
+    )
+    return False
+
+
 def lease_job(
     worker_id: str,
     job_types: list[str],
@@ -1405,6 +1373,11 @@ def lease_job(
     ``WORKER_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT``). Jobs whose independent
     ``deadline_at`` has already elapsed are failed without consuming a tenant
     concurrency slot or blocking other tenants.
+
+    The returned job carries ``_claim_generation`` (internal; stripped from
+    the public job view): pass it back to :func:`complete_job`,
+    :func:`fail_job`, :func:`report_job_progress` and :func:`heartbeat_job`
+    so writes from a superseded claim are ignored.
     """
     global _lease_seq
     lease_seconds = float(lease_duration)
@@ -1423,72 +1396,71 @@ def lease_job(
         current = current.replace(tzinfo=timezone.utc)
     current_iso = current.isoformat()
 
-    running_video_by_tenant: dict[str, int] = {}
-    for job in _JOBS.values():
-        if job.get("status") == "running" and job.get("type") in EXPENSIVE_VIDEO_JOB_TYPES:
-            tenant = job.get("tenant_id", DEFAULT_TENANT_ID)
-            running_video_by_tenant[tenant] = running_video_by_tenant.get(tenant, 0) + 1
+    with _JOBS_LOCK:
+        running_video_by_tenant: dict[str, int] = {}
+        for job in _JOBS.values():
+            if job.get("status") == "running" and job.get("type") in EXPENSIVE_VIDEO_JOB_TYPES:
+                tenant = job.get("tenant_id", DEFAULT_TENANT_ID)
+                running_video_by_tenant[tenant] = running_video_by_tenant.get(tenant, 0) + 1
 
-    eligible_video: list[dict[str, Any]] = []
-    eligible_other: list[dict[str, Any]] = []
-    for job in _JOBS.values():
-        if job.get("status") != "pending" or job.get("type") not in job_types:
-            continue
-        deadline = _parse_iso_utc(job.get("deadline_at"))
-        if deadline is not None and current >= deadline:
-            job["status"] = "failed"
-            job["error"] = "processing deadline exceeded"
-            job["failed_at"] = current_iso
-            job["processing_state"] = {
-                "reason": DEADLINE_EXCEEDED_REASON,
-                "retryable": False,
-                "category": PROCESSING_STATE_CATEGORY,
-                "cryptographic_failure": False,
-                "detected_at": current_iso,
-            }
-            continue
-        if job.get("type") in EXPENSIVE_VIDEO_JOB_TYPES:
-            tenant = job.get("tenant_id", DEFAULT_TENANT_ID)
-            if running_video_by_tenant.get(tenant, 0) >= concurrent_limit:
+        eligible_video: list[dict[str, Any]] = []
+        eligible_other: list[dict[str, Any]] = []
+        for job in _JOBS.values():
+            if job.get("status") != "pending" or job.get("type") not in job_types:
                 continue
-            eligible_video.append(job)
+            deadline = _parse_iso_utc(job.get("deadline_at"))
+            if deadline is not None and current >= deadline:
+                job["status"] = "failed"
+                job["error"] = "processing deadline exceeded"
+                job["failed_at"] = current_iso
+                job["processing_state"] = {
+                    "reason": DEADLINE_EXCEEDED_REASON,
+                    "retryable": False,
+                    "category": PROCESSING_STATE_CATEGORY,
+                    "cryptographic_failure": False,
+                    "detected_at": current_iso,
+                }
+                continue
+            if job.get("type") in EXPENSIVE_VIDEO_JOB_TYPES:
+                tenant = job.get("tenant_id", DEFAULT_TENANT_ID)
+                if running_video_by_tenant.get(tenant, 0) >= concurrent_limit:
+                    continue
+                eligible_video.append(job)
+            else:
+                eligible_other.append(job)
+
+        chosen: dict[str, Any] | None = None
+        best_video: dict[str, Any] | None = None
+        if eligible_video:
+            best_video = min(
+                eligible_video,
+                key=lambda j: (
+                    running_video_by_tenant.get(j.get("tenant_id", DEFAULT_TENANT_ID), 0),
+                    _TENANT_LAST_LEASED_SEQ.get(j.get("tenant_id", DEFAULT_TENANT_ID), -1),
+                    j["id"],
+                ),
+            )
+        best_other = min(eligible_other, key=lambda j: j["id"]) if eligible_other else None
+
+        if best_video is not None and best_other is not None:
+            chosen = best_other if best_other["id"] < best_video["id"] else best_video
         else:
-            eligible_other.append(job)
+            chosen = best_video if best_video is not None else best_other
 
-    chosen: dict[str, Any] | None = None
-    best_video: dict[str, Any] | None = None
-    if eligible_video:
-        best_video = min(
-            eligible_video,
-            key=lambda j: (
-                running_video_by_tenant.get(j.get("tenant_id", DEFAULT_TENANT_ID), 0),
-                _TENANT_LAST_LEASED_SEQ.get(j.get("tenant_id", DEFAULT_TENANT_ID), -1),
-                j["id"],
-            ),
-        )
-    best_other = min(eligible_other, key=lambda j: j["id"]) if eligible_other else None
+        if chosen is None:
+            return None
 
-    if best_video is not None and best_other is not None:
-        chosen = best_other if best_other["id"] < best_video["id"] else best_video
-    else:
-        chosen = best_video if best_video is not None else best_other
-
-    if chosen is None:
-        return None
-
-    chosen["status"] = "running"
-    chosen["worker_id"] = worker_id
-    chosen["leased_at"] = current_iso
-    chosen["heartbeat_at"] = current_iso
-    chosen["lease_duration_seconds"] = lease_seconds
-    chosen.pop("processing_state", None)
-    _open_attempt(chosen, worker_id)
-    if chosen.get("type") in EXPENSIVE_VIDEO_JOB_TYPES:
-        _lease_seq += 1
-        _TENANT_LAST_LEASED_SEQ[chosen.get("tenant_id", DEFAULT_TENANT_ID)] = _lease_seq
-    leased = dict(chosen)
-    leased["attempts"] = [dict(attempt) for attempt in chosen["attempts"]]
-    return leased
+        chosen["status"] = "running"
+        chosen["worker_id"] = worker_id
+        chosen["leased_at"] = current_iso
+        chosen["heartbeat_at"] = current_iso
+        chosen["lease_duration_seconds"] = lease_seconds
+        chosen.pop("processing_state", None)
+        chosen["_claim_generation"] = chosen.get("_claim_generation", 0) + 1
+        if chosen.get("type") in EXPENSIVE_VIDEO_JOB_TYPES:
+            _lease_seq += 1
+            _TENANT_LAST_LEASED_SEQ[chosen.get("tenant_id", DEFAULT_TENANT_ID)] = _lease_seq
+        return dict(chosen)
 
 
 def heartbeat_job(
@@ -1497,26 +1469,28 @@ def heartbeat_job(
     lease_duration: int = 300,
     *,
     now: datetime | None = None,
+    generation: int | None = None,
 ) -> None:
     """Record a heartbeat against an in-memory job lease.
 
     The heartbeat only extends the lease. Progress is reported separately via
     :func:`report_job_progress`; ``progress`` is accepted for backwards
     compatibility and ignored so a heartbeat never overwrites real progress.
+    A heartbeat from a stale claim ``generation`` is ignored.
     """
     del progress
     lease_seconds = float(lease_duration)
     if lease_seconds <= 0:
         raise ValueError("lease_duration must be positive")
-    job = _JOBS.get(job_id)
-    if job and job.get("status") == "running":
-        current = now if now is not None else datetime.now(timezone.utc)
-        if current.tzinfo is None:
-            current = current.replace(tzinfo=timezone.utc)
-        job["heartbeat_at"] = current.isoformat()
-        job["lease_duration_seconds"] = lease_seconds
-        job.pop("processing_state", None)
-
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job and job.get("status") == "running" and _claim_is_current(job, generation, "heartbeat"):
+            current = now if now is not None else datetime.now(timezone.utc)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            job["heartbeat_at"] = current.isoformat()
+            job["lease_duration_seconds"] = lease_seconds
+            job.pop("processing_state", None)
 
 def get_job_heartbeat_state(
     job: dict[str, Any],
@@ -1600,36 +1574,39 @@ def reclaim_stale_jobs(
     current_iso = current.isoformat()
 
     reclaimed: list[dict[str, Any]] = []
-    for job in _JOBS.values():
-        if job.get("status") != "running":
-            continue
-        state = get_job_heartbeat_state(
-            job,
-            now=current,
-            stale_after_seconds=stale_after_seconds,
-        )
-        if not state["stale"]:
-            continue
-        _close_attempt(job, ATTEMPT_RELEASED, STALE_HEARTBEAT_REASON)
-        job["status"] = "pending"
-        job.pop("worker_id", None)
-        job["processing_state"] = {
-            "reason": STALE_HEARTBEAT_REASON,
-            "retryable": True,
-            "category": PROCESSING_STATE_CATEGORY,
-            "cryptographic_failure": False,
-            "detected_at": current_iso,
-            "heartbeat_age_seconds": state["heartbeat_age_seconds"],
-            "stale_after_seconds": state["stale_after_seconds"],
-        }
-        reclaimed.append(
-            {
-                "id": job["id"],
-                "type": job["type"],
-                "status": job["status"],
-                "processing_state": dict(job["processing_state"]),
+    with _JOBS_LOCK:
+        for job in _JOBS.values():
+            if job.get("status") != "running":
+                continue
+            state = get_job_heartbeat_state(
+                job,
+                now=current,
+                stale_after_seconds=stale_after_seconds,
+            )
+            if not state["stale"]:
+                continue
+            job["status"] = "pending"
+            job.pop("worker_id", None)
+            # Reclaiming releases the claim: fence late writes from the
+            # worker whose heartbeat went stale.
+            job["_claim_generation"] = job.get("_claim_generation", 0) + 1
+            job["processing_state"] = {
+                "reason": STALE_HEARTBEAT_REASON,
+                "retryable": True,
+                "category": PROCESSING_STATE_CATEGORY,
+                "cryptographic_failure": False,
+                "detected_at": current_iso,
+                "heartbeat_age_seconds": state["heartbeat_age_seconds"],
+                "stale_after_seconds": state["stale_after_seconds"],
             }
-        )
+            reclaimed.append(
+                {
+                    "id": job["id"],
+                    "type": job["type"],
+                    "status": job["status"],
+                    "processing_state": dict(job["processing_state"]),
+                }
+            )
     return reclaimed
 
 
@@ -1647,82 +1624,98 @@ def report_job_progress(
     *,
     stage_revision: int | None = None,
     now: float | None = None,
+    generation: int | None = None,
 ) -> bool:
     """Record ``{"phase", "percent"}`` progress for a running job.
 
     ``phase`` is a short machine-readable step name (for example
     ``"embedding"``); ``percent`` is 0-100 or ``None`` when the step has no
-    measurable fraction. When ``stage_revision`` is supplied, it must be a
-    non-negative integer and is enforced monotonically so late updates from a
-    completed stage are rejected regardless of wall-clock ordering. Updates are
-    throttled to at most one per ``JOB_PROGRESS_MIN_INTERVAL_SECONDS`` per job,
-    and only running jobs are updated. Returns True when the update was stored.
+    measurable fraction. Updates are throttled to at most one per
+    ``JOB_PROGRESS_MIN_INTERVAL_SECONDS`` per job, and only running jobs are
+    updated; an update from a stale claim ``generation`` is ignored. Returns
+    True when the update was stored.
     """
-    job = _JOBS.get(job_id)
-    if not job or job.get("status") != "running":
-        return False
-    if not isinstance(phase, str) or not phase.strip():
-        raise ValueError("progress phase must be a non-empty string")
-    phase = phase.strip()[:JOB_PROGRESS_PHASE_MAX_LENGTH]
-    if percent is not None:
-        try:
-            percent = float(percent)
-        except (TypeError, ValueError):
-            raise ValueError("progress percent must be a number or None") from None
-        if percent != percent:  # NaN
-            raise ValueError("progress percent must be a number or None")
-        percent = round(min(100.0, max(0.0, percent)), 1)
-    if stage_revision is not None:
-        if isinstance(stage_revision, bool) or not isinstance(stage_revision, int) or stage_revision < 0:
-            raise ValueError("progress stage_revision must be a non-negative integer")
-        current_revision = job.get("_stage_revision")
-        if current_revision is not None and stage_revision < current_revision:
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job or job.get("status") != "running":
             return False
-        if current_revision is None or stage_revision > current_revision:
-            job["_stage_revision"] = stage_revision
-    current = time.monotonic() if now is None else now
-    last = job.get("_progress_at")
-    if last is not None and current - last < JOB_PROGRESS_MIN_INTERVAL_SECONDS:
-        return False
-    job["_progress_at"] = current
-    job["progress"] = {"phase": phase, "percent": percent}
-    attempt = _current_attempt(job)
-    if attempt is not None:
-        attempt["progress"] = {"phase": phase, "percent": percent}
-    return True
+        if not _claim_is_current(job, generation, "progress"):
+            return False
+        if not isinstance(phase, str) or not phase.strip():
+            raise ValueError("progress phase must be a non-empty string")
+        phase = phase.strip()[:JOB_PROGRESS_PHASE_MAX_LENGTH]
+        if percent is not None:
+            try:
+                percent = float(percent)
+            except (TypeError, ValueError):
+                raise ValueError("progress percent must be a number or None") from None
+            if percent != percent:  # NaN
+                raise ValueError("progress percent must be a number or None")
+            percent = round(min(100.0, max(0.0, percent)), 1)
+        current = time.monotonic() if now is None else now
+        last = job.get("_progress_at")
+        if last is not None and current - last < JOB_PROGRESS_MIN_INTERVAL_SECONDS:
+            return False
+        job["_progress_at"] = current
+        job["progress"] = {"phase": phase, "percent": percent}
+        return True
 
 
-def complete_job(job_id: int, result: Any = None) -> None:
-    """Mark an in-memory job completed. Terminal jobs are never modified."""
-    job = _JOBS.get(job_id)
-    if not job or job.get("status") in TERMINAL_JOB_STATUSES:
-        return
-    _close_attempt(job, ATTEMPT_COMPLETED)
-    job["status"] = "completed"
-    job["result"] = result
-    job["completed_at"] = datetime.now(timezone.utc).isoformat()
+def complete_job(job_id: int, result: Any = None, *, generation: int | None = None) -> bool:
+    """Mark an in-memory job completed.
+
+    With ``generation``, the result is committed only if that claim is still
+    the current one, so a replaced worker cannot overwrite a newer result.
+    Returns True when the result was committed.
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job or not _claim_is_current(job, generation, "complete"):
+            return False
+        if generation is not None and job.get("status") != "running":
+            # The claim was already settled (for example failed by its
+            # processing deadline): a late result must not overwrite it.
+            logger.warning("job_claim_settled job_id=%s status=%s", job_id, job.get("status"))
+            return False
+        job["status"] = "completed"
+        job["result"] = result
+        job["completed_at"] = datetime.now(timezone.utc).isoformat()
+        return True
 
 
-def fail_job(job_id: int, error: str, *, is_fatal: bool = False) -> None:
+def fail_job(
+    job_id: int,
+    error: str,
+    *,
+    is_fatal: bool = False,
+    generation: int | None = None,
+) -> bool:
     """Mark an in-memory job failed (fatal) or pending for retry.
 
-    Terminal jobs (completed, failed, cancelled) are never transitioned back to
-    pending or running.
+    A retryable failure releases the claim: the job goes back to ``pending``
+    and its ``_claim_generation`` is bumped, which fences any late write from
+    the worker that held it. With ``generation``, a failure reported by a
+    stale claim, or for a job that is no longer running, is ignored. Returns
+    True when the job was updated.
     """
-    job = _JOBS.get(job_id)
-    if not job or job.get("status") in TERMINAL_JOB_STATUSES:
-        return
-    _close_attempt(job, ATTEMPT_FAILED if is_fatal else ATTEMPT_RELEASED, reason)
-    job["error"] = sanitize_job_error(error)
-    job["failed_at"] = datetime.now(timezone.utc).isoformat()
-    if is_fatal:
-        job["status"] = "failed"
-    else:
-        job["retry_count"] = int(job.get("retry_count", 0)) + 1
-        job["status"] = "pending"
-        job.pop("worker_id", None)
-        job.pop("_stage_revision", None)
-        job.pop("_progress_at", None)
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job or not _claim_is_current(job, generation, "fail"):
+            return False
+        if generation is not None and job.get("status") != "running":
+            # The claim already finished (for example it completed just as the
+            # grace period expired): never turn a settled job back into pending.
+            logger.warning("job_claim_settled job_id=%s status=%s", job_id, job.get("status"))
+            return False
+        job["error"] = sanitize_job_error(error)
+        job["failed_at"] = datetime.now(timezone.utc).isoformat()
+        if is_fatal:
+            job["status"] = "failed"
+        else:
+            job["status"] = "pending"
+            job.pop("worker_id", None)
+            job["_claim_generation"] = job.get("_claim_generation", 0) + 1
+        return True
 
 
 def get_job_queue_metrics() -> dict[str, Any]:

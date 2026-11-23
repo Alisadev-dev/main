@@ -55,6 +55,18 @@ Intentional cancellation (via `POST /api/jobs/<id>/cancel` or a worker raising
 - Failure fields (`error`, `failed_at`) are not set, and late `complete_job` or
   `fail_job` calls do not overwrite an already-cancelled job.
 
+## Claim generations (stale-worker fencing)
+
+Every lease and every retryable release (`fail_job(..., is_fatal=False)`, used
+for example when the shutdown grace period expires) increments the job's
+internal `_claim_generation`. The worker passes the generation it leased to
+`complete_job`, `fail_job`, `report_job_progress` and `heartbeat_job`
+(`generation=`); a write from an older generation is ignored, returns `False`
+and logs `job_claim_stale`. This keeps a worker that lost its claim from
+overwriting a newer result, progress or failure state. Calls without
+`generation` behave as before. The field is internal and never part of the
+response above.
+
 ## What the response never contains
 
 The job's request `payload` (filenames, metadata, proof secrets) and internal
