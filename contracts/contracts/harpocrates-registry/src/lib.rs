@@ -17,7 +17,7 @@ pub mod verifier_inputs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod wasm_budget;
 
-use verifier_inputs::{RejectCode, PUBLIC_INPUTS_LEN, REVOCATION_PUBLIC_INPUTS_LEN};
+use verifier_inputs::{RejectCode, PUBLIC_INPUTS_LEN, REVOCATION_PUBLIC_INPUTS_LEN, SILENT_WITNESS_PUBLIC_INPUTS_LEN, SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN};
 
 /// Schema selectors accepted by [`HarpocratesRegistry::classify_public_inputs`].
 pub const SCHEMA_ID_SILENT_WITNESS: u32 = 1;
@@ -504,51 +504,15 @@ pub struct RegistryConfig {
     pub paused_domains: u32,
 }
 
-/// Readiness report for revoking an institutional role (#1193).
-///
-/// Evaluates the standing, affected evidence authorization boundaries
-/// (delegations), and administrative governance dependencies (outstanding
-/// approvals, council proposals, rotation grace) before executing revocation.
-///
-/// Strictly read-only; preserves the approved revocation policy
-/// (single-admin or multi-party admin council).
+/// Current registry input and metadata limits.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RoleRevocationReadinessReport {
-    /// The account evaluated.
-    pub role: Address,
-    /// True if an issuer record exists for this address.
-    pub is_issuer: bool,
-    /// True if the address currently holds active issuer authority.
-    pub is_active_issuer: bool,
-    /// True if the address is an active member of the admin council.
-    pub is_council_member: bool,
-    /// True if the address is the current registry administrator.
-    pub is_admin: bool,
-    /// Number of delegations granted by this role that will become inactive.
-    pub delegations_affected: u32,
-    /// Number of active/unexpired council proposals approved by this address.
-    pub outstanding_approvals: u32,
-    /// Number of pending unexecuted revocation proposals targeting this role.
-    pub pending_revocation_proposals: u32,
-    /// Highest approval count among pending revocation council proposals targeting this role.
-    pub revocation_proposal_approvals: u32,
-    /// True if this issuer currently has an unexpired rotation grace window.
-    pub has_active_rotation_grace: bool,
-    /// True if multi-party admin council governance is currently effective.
-    pub council_governance_active: bool,
-    /// True if all prerequisites under the approved revocation policy are satisfied.
-    pub revocation_ready: bool,
-}
-
-impl RoleRevocationReadinessReport {
-    pub fn role_address(&self) -> &Address {
-        &self.role
-    }
-
-    pub fn is_ready(&self) -> bool {
-        self.revocation_ready
-    }
+pub struct RegistryLimits {
+    pub silent_witness_v1_inputs_len: u32,
+    pub silent_witness_v2_inputs_len: u32,
+    pub revocation_inputs_len: u32,
+    pub evidence_metadata_hash_bytes: u32,
+    pub schema_version: u32,
 }
 
 /// A verifier's declared circuit-version window (#343).
@@ -2298,6 +2262,16 @@ pub struct HarpocratesRegistry;
 
 #[contractimpl]
 impl HarpocratesRegistry {
+    pub fn get_registry_limits(_env: Env) -> RegistryLimits {
+        RegistryLimits {
+            silent_witness_v1_inputs_len: SILENT_WITNESS_PUBLIC_INPUTS_LEN as u32,
+            silent_witness_v2_inputs_len: SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN as u32,
+            revocation_inputs_len: REVOCATION_PUBLIC_INPUTS_LEN as u32,
+            evidence_metadata_hash_bytes: MAX_EVIDENCE_METADATA_HASH_BYTES,
+            schema_version: METADATA_ENVELOPE_VERSION_MAX,
+        }
+    }
+
     pub fn get_role_policy_digest(env: Env) -> BytesN<32> {
         let now = env.ledger().timestamp();
         let mut paused_domains = 0u32;
@@ -9764,3 +9738,6 @@ mod test_uninitialized;
 #[cfg(test)]
 mod test_preflight;
 
+
+#[cfg(test)]
+mod test_events_conformance;
