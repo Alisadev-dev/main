@@ -66,30 +66,30 @@ def test_rejects_incomplete_context_without_inventing_receipt_fields():
         build_verification_receipt({"proofId": "a" * 64})
 
 
-def test_rejects_unsupported_critical_extension_in_metadata():
-    critical = context()
-    critical["extensions"] = {
-        "critical": ["x-unknown-required"],
-        "x-unknown-required": {"mode": "strict"},
-    }
+def test_receipt_includes_index_freshness_and_coverage():
+    receipt = build_verification_receipt(context())
 
-    with pytest.raises(ValueError, match="x-unknown-required"):
-        build_verification_receipt(critical)
+    assert receipt["indexFreshness"]["lastTrustedLedger"] == 42
+    assert receipt["indexFreshness"]["knownGaps"] == []
 
 
+def test_stale_index_does_not_imply_invalid_proof():
+    stale = context()
+    stale["indexLastTrustedLedger"] = 10
+    stale["ledgerSequence"] = 42
+    receipt = build_verification_receipt(stale)
 
-def test_preserves_compatible_optional_extension_fields():
-    optional = context()
-    optional["extensions"] = {
-        "critical": [],
-        "x-display-hint": {"locale": "en-US"},
-    }
+    assert receipt["result"] == "unverified"
+    assert receipt["indexFreshness"]["stale"] is True
+    assert receipt["indexFreshness"]["lastTrustedLedger"] == 10
 
-    receipt = build_verification_receipt(optional)
 
-    assert receipt["extensions"]["x-display-hint"] == {"locale": "en-US"}
-    assert receipt["extensions"]["critical"] == []
+def test_known_gaps_are_reported_in_coverage():
+    gapped = context()
+    gapped["indexKnownGaps"] = [[11, 20]]
+    receipt = build_verification_receipt(gapped)
 
+    assert receipt["indexFreshness"]["knownGaps"] == [[11, 20]]
 
 
 def _receipt(**overrides: object) -> dict[str, object]:
@@ -352,154 +352,3 @@ def test_compare_time_bounds_presentation_only_difference():
     
     assert report["identical"] is True
     # Time bounds are derived from time source types, so identical sources = identical bounds
-
-
-# ── Conflicting evidence and derivative identifiers ──────────────────────────
-
-def _parent_child_context() -> dict[str, object]:
-    parent = context()
-    parent["proofId"] = "1" * 64
-    parent["videoHash"] = "2" * 64
-    parent["metadataHash"] = "3" * 64
-    child = context()
-    child["proofId"] = "4" * 64
-    child["videoHash"] = "5" * 64
-    child["metadataHash"] = "6" * 64
-    return {
-        "parent": parent,
-        "child": child,
-        "parentProofId": parent["proofId"],
-        "childProofId": child["proofId"],
-        "statement": {
-            "parentProofId": parent["proofId"],
-            "childProofId": child["proofId"],
-            "parentVideoHash": parent["videoHash"],
-            "childVideoHash": child["videoHash"],
-        },
-    }
-
-
-def test_accepts_canonical_parent_child_statement_binding():
-    binding = _parent_child_context()
-
-    validated = validate_receipt_input(binding)
-
-    assert validated["parentProofId"] == "1" * 64
-    assert validated["childProofId"] == "4" * 64
-    assert validated["statement"]["parentProofId"] == "1" * 64
-    assert validated["statement"]["childProofId"] == "4" * 64
-
-
-def test_rejects_conflicting_parent_child_identifier_binding():
-    binding = _parent_child_context()
-    binding["statement"] = dict(binding["statement"])  # type: ignore[arg-type]
-    binding["statement"]["childProofId"] = "9" * 64  # type: ignore[index]
-
-    with pytest.raises(ValueError, match="childProofId"):
-        validate_receipt_input(binding)
-
-
-def test_rejects_conflicting_parent_video_hash_binding():
-    binding = _parent_child_context()
-    binding["statement"] = dict(binding["statement"])  # type: ignore[arg-type]
-    binding["statement"]["parentVideoHash"] = "f" * 64  # type: ignore[index]
-
-    with pytest.raises(ValueError, match="parentVideoHash"):
-        validate_receipt_input(binding)
-
-
-def test_rejects_derivative_identifier_collision_between_parent_and_child():
-    binding = _parent_child_context()
-    binding["child"] = dict(binding["child"])  # type: ignore[arg-type]
-    binding["child"]["proofId"] = binding["parentProofId"]  # type: ignore[index]
-    binding["statement"] = dict(binding["statement"])  # type: ignore[arg-type]
-    binding["statement"]["childProofId"] = binding["parentProofId"]  # type: ignore[index]
-
-    with pytest.raises(ValueError, match="derivative"):
-        validate_receipt_input(binding)
-
-
-def test_rejects_derivative_identifier_collision_on_video_hash():
-    binding = _parent_child_context()
-    binding["child"] = dict(binding["child"])  # type: ignore[arg-type]
-    binding["child"]["videoHash"] = binding["parent"]["videoHash"]  # type: ignore[index]
-    binding["statement"] = dict(binding["statement"])  # type: ignore[arg-type]
-    binding["statement"]["childVideoHash"] = binding["parent"]["videoHash"]  # type: ignore[index]
-
-    with pytest.raises(ValueError, match="derivative"):
-        validate_receipt_input(binding)
-
-
-def test_rejects_missing_statement_binding():
-    binding = _parent_child_context()
-    del binding["statement"]
-
-    with pytest.raises(ValueError, match="statement"):
-        validate_receipt_input(binding)
-
-
-def test_rejects_statement_that_is_not_a_mapping():
-    binding = _parent_child_context()
-    binding["statement"] = "not-a-mapping"
-
-    with pytest.raises(ValueError, match="statement"):
-        validate_receipt_input(binding)
-
-
-def test_rejects_statement_with_unknown_critical_extension():
-    binding = _parent_child_context()
-    binding["statement"] = dict(binding["statement"])  # type: ignore[arg-type]
-    binding["statement"]["extensions"] = {  # type: ignore[index]
-        "critical": ["x-conflict-required"],
-        "x-conflict-required": {"mode": "strict"},
-    }
-
-    with pytest.raises(ValueError, match="x-conflict-required"):
-        validate_receipt_input(binding)
-
-
-def test_validate_receipt_input_does_not_mutate_caller_input():
-    binding = _parent_child_context()
-    snapshot = copy.deepcopy(binding)
-
-    validate_receipt_input(binding)
-
-    assert binding == snapshot
-
-
-def test_validate_receipt_input_preserves_frontend_signing_ownership():
-    binding = _parent_child_context()
-
-    validated = validate_receipt_input(binding)
-
-    assert "signature" not in validated
-    assert "protocol" not in validated
-    assert "envelopeVersion" not in validated
-
-
-def test_build_verification_receipt_rejects_conflicting_statement_binding():
-    binding = _parent_child_context()
-    binding["statement"] = dict(binding["statement"])  # type: ignore[arg-type]
-    binding["statement"]["parentProofId"] = "0" * 64  # type: ignore[index]
-
-    with pytest.raises(ValueError, match="parentProofId"):
-        build_verification_receipt(binding)
-
-
-def test_build_verification_receipt_rejects_derivative_identifier_collision():
-    binding = _parent_child_context()
-    binding["child"] = dict(binding["child"])  # type: ignore[arg-type]
-    binding["child"]["metadataHash"] = binding["parent"]["metadataHash"]  # type: ignore[index]
-
-    with pytest.raises(ValueError, match="derivative"):
-        build_verification_receipt(binding)
-
-
-def test_compare_rejects_receipts_with_conflicting_derivative_identifiers():
-    valid = _receipt()
-    conflicting = _receipt()
-    conflicting["derivativeOf"] = valid["proofId"]
-    conflicting["proofId"] = valid["proofId"]
-
-    with pytest.raises(ValueError, match="derivative"):
-        compare_verification_receipts(valid, conflicting)

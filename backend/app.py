@@ -183,6 +183,10 @@ from verifier_cache import VerifierCache
 from admission import AdmissionController, require_capacity, _get_client_identity
 from webhook import WebhookWorker, queue_webhook_deliveries
 from quarantine import QuarantineError, isolate_upload, sniff_media_type_stream, sniff_media_type_path
+try:
+    from chain_indexer import index_freshness_summary
+except ImportError:
+    index_freshness_summary = None
 from strkey import validate_source_address, validate_contract_id
 from streaming_upload import (
     PrematureUploadTerminationError,
