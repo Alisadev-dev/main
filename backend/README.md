@@ -391,6 +391,8 @@ HARPOCRATES_RELEASE_ID=harpocrates-1.0.0
 HARPOCRATES_RELEASE_NETWORK=testnet
 STELLAR_NETWORK_PASSPHRASE=
 HARPOCRATES_REGISTRATION_RECONCILE_DIR=/tmp/harpocrates-registration-reconcile
+HARPOCRATES_STORAGE_DIR=/tmp/harpocrates_jobs
+MASTER_ENCRYPTION_KEY=
 DATABASE_URL=postgresql://...
 VERIFIER_CACHE_MAX_SIZE=10000
 VERIFIER_CACHE_POSITIVE_TTL_SECONDS=86400.0
@@ -436,11 +438,13 @@ changes: it orphans every previously cached entry instead of silently reusing
 results derived under a different scheme. Keys are digests only — proof
 material is never stored in plaintext or logged.
 
-## Storage Quota Exhaustion vs. Evidence Corruption
+## Registration Reconciliation Checkpoint
 
-`storage.py`, `evidence_storage.py`, and `errors.py` separate operational disk
-capacity limits from cryptographic or digest corruption using stable machine
-reason codes:
+`registration_reconcile.py` persists a single checkpoint containing the last
+trusted Stellar ledger, the network name/passphrase identity, and a fingerprint
+of the deployment configuration (`HARPOCRATES_RELEASE_ID`,
+`HARPOCRATES_RELEASE_NETWORK`, and the passphrase). The file is written atomically
+under `HARPOCRATES_REGISTRATION_RECONCILE_DIR` with owner-only permissions.
 
 `CheckpointStore.record()` is idempotent for the same ledger and rejects lower
 ledgers. `load()`, `save()`, and `reconcile_registration()` refuse a checkpoint
@@ -458,50 +462,26 @@ store = CheckpointStore(deployment=deployment)
 checkpoint = store.record(1_250)
 ```
 
-## Resumable Evidence Integrity Verification
+## Encrypted Blob Collection
 
-`evidence_storage.py` provides bounded, resumable integrity verification across
-stored encrypted evidence blobs (`verify_evidence_batch()` and
-`verify_evidence_resumable()`):
+`evidence_storage.py` never removes an encrypted blob file until the metadata
+transaction has committed. `collect_unreferenced_blob()` locks the blob row,
+checks for committed `tenant_blob_refs`, deletes the `blobs` row, commits, and
+only then unlinks the ciphertext. A failed reference check or metadata deletion
+leaves the file in place and raises `StorageMetadataRetryableError` after a
+bounded number of attempts.
 
-- Blobs are scanned in deterministic `content_hash` order in bounded batches
-  (`DEFAULT_VERIFY_BATCH_SIZE=50`, clamped to `MAX_VERIFY_BATCH_SIZE=500`).
-- Each blob's metadata (`content_hash`, `size_bytes`, `storage_path`) and
-  Fernet ciphertext are verified. Unverifiable legacy blobs (e.g. missing or
-  `legacy:`-prefixed DEK, unreadable legacy master key, non-SHA-256 legacy
-  hash, or missing `size_bytes`) are counted separately under
-  `unverifiable_legacy` rather than conflated with ciphertext/metadata
-  corruption (`failed`).
-- Resumable progress is written atomically to
-  `storage.get_integrity_progress_path()` under `HARPOCRATES_STORAGE_DIR`
-  (default `/tmp/harpocrates_jobs/evidence_integrity_progress.json`).
-- Persisted progress records only nonsecret metadata (`schema_version`,
-  `run_id`, `status`, `cursor`, `batch_size`, `batches_completed`, `totals`,
-  `failure_reasons`, `legacy_reasons`, `updated_at`) — never plaintext,
-  ciphertext, DEKs, master keys, or filesystem paths.
-
-## Encryption Envelope Versions
-
-`evidence_storage.py` records an explicit `envelope_version` column on `blobs`
-(default `fernet-v1`, added in migration 13):
-
-- `classify_envelope_version()` distinguishes supported versions (`fernet-v1`),
-  known legacy envelopes (`None` for pre-versioning rows, `legacy-v0`,
-  `fernet-v0`), and unsupported formats (any unrecognized, empty, or non-string
-  identifier).
-- `record_blob()` validates and stores `envelope_version`, rejecting known
-  legacy or unsupported values on write.
-- `decrypt_blob_ciphertext()` and `verify_blob_integrity()` dispatch strictly
-  on the recorded `envelope_version` and never guess a decryption algorithm
-  from malformed ciphertext. Known legacy versions are reported as
-  `unverifiable_legacy` (`legacy_envelope_version`), while unsupported formats
-  fail closed (`unsupported_envelope_version`). Pre-versioning rows with
-  `envelope_version IS NULL` remain compatible with Fernet.
+`record_tenant_ref()` takes the same blob-row lock before writing a reference,
+so concurrent collection cannot classify an in-flight reference as unreferenced.
+Both operations reuse the existing `DB_CONNECT_MAX_ATTEMPTS`,
+`DB_CONNECT_DEADLINE_SECONDS`, and `DB_CONNECT_RETRY_BASE_SECONDS` retry budget.
+At an HTTP boundary, map the error to the existing `DEPENDENCY_UNAVAILABLE`
+(503) envelope.
 
 ## Test
 
 ```powershell
-python -m unittest test_app.py test_stego.py test_registration_reconcile.py
+python -m unittest test_app.py test_stego.py test_registration_reconcile.py test_evidence_storage.py
 ```
 
 The service uses temporary files while processing and does not persist uploaded

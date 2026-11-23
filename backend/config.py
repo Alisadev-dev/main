@@ -64,42 +64,8 @@ class AppConfig:
     external_fetch_max_response_bytes: int = 65_536
     # Owner-scoped credentials: each key may only register its own sourceAddress.
     register_scoped_keys: tuple[ScopedKey, ...] = ()
-    job_file_ttl_seconds: int = 86_400
-    # Processing deadlines; 0 disables each one (the default, today's behaviour).
-    job_queue_ttl_seconds: int = 0
-    job_execution_timeout_seconds: int = 0
-    retention_blob_gc_enabled: bool = False
-    retention_unreferenced_blobs_enabled: bool = False
-    retention_dry_run: bool = False
-    # Two-phase deletion receipts for retained evidence (audit trail only;
-    # never stores media bytes or plaintext keys).
-    deletion_receipts_enabled: bool = False
-    deletion_receipt_salt: str | None = None
-    deletion_receipt_ttl_seconds: int = 2_592_000
     registration_reconcile_state_dir: str = ""
     stellar_network_passphrase: str = ""
-
-    def redacted_summary(self) -> dict[str, object]:
-        """Return a dict representation of the config where secret fields are redacted.
-
-        Secret fields (API keys, endpoints, tokens) are replaced with a boolean indicating
-        presence (True if set, False otherwise). Non-secret fields retain their original
-        values.
-        """
-        from dataclasses import asdict
-
-        secret_fields = {
-            "metrics_token",
-            "tracing_endpoint",
-            "register_api_key",
-            "register_api_key_previous",
-            "deletion_receipt_salt",
-        }
-        raw = asdict(self)
-        for field in secret_fields:
-            if field in raw:
-                raw[field] = raw[field] is not None
-        return raw
 
 
 def load_config() -> AppConfig:
@@ -180,19 +146,6 @@ def load_config() -> AppConfig:
         external_fetch_read_timeout_seconds=_float_env("EXTERNAL_FETCH_READ_TIMEOUT_SECONDS", 10.0),
         external_fetch_max_response_bytes=_int_env("EXTERNAL_FETCH_MAX_RESPONSE_BYTES", 65_536),
         register_scoped_keys=parse_scoped_keys(_str_env("REGISTER_SCOPED_KEYS")),
-        job_file_ttl_seconds=_job_file_ttl_env(),
-        job_queue_ttl_seconds=_job_file_ttl_env(
-            "HARPOCRATES_JOB_QUEUE_TTL_SECONDS", JOB_QUEUE_TTL_SECONDS_DEFAULT
-        ),
-        job_execution_timeout_seconds=_job_file_ttl_env(
-            "HARPOCRATES_JOB_EXECUTION_TIMEOUT_SECONDS", JOB_EXECUTION_TIMEOUT_SECONDS_DEFAULT
-        ),
-        retention_blob_gc_enabled=_blob_gc_enabled_env(),
-        retention_unreferenced_blobs_enabled=_blob_gc_enabled_env(),
-        retention_dry_run=_bool_env("HARPOCRATES_RETENTION_DRY_RUN", False),
-        deletion_receipts_enabled=deletion_receipts_enabled,
-        deletion_receipt_salt=deletion_receipt_salt,
-        deletion_receipt_ttl_seconds=_int_env("DELETION_RECEIPT_TTL_SECONDS", 2_592_000),
         registration_reconcile_state_dir=_str_env("HARPOCRATES_REGISTRATION_RECONCILE_DIR") or "",
         stellar_network_passphrase=(
             _str_env("STELLAR_NETWORK_PASSPHRASE")
