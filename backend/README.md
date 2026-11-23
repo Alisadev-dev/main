@@ -434,16 +434,61 @@ material is never stored in plaintext or logged.
 capacity limits from cryptographic or digest corruption using stable machine
 reason codes:
 
-- `STORAGE_QUOTA_EXHAUSTED` (`retryable: true`, `quarantined: false`): Returned
-  when `ENOSPC`, `EDQUOT`, Windows disk-full errors, `HARPOCRATES_STORAGE_QUOTA_BYTES`,
-  or `HARPOCRATES_STORAGE_MIN_FREE_BYTES` prevent writing or staging bytes.
-  Existing valid evidence is **never** quarantined or overwritten on capacity
-  exhaustion and succeeds once free space is restored.
-- `EVIDENCE_CORRUPTED` (`retryable: false`, `quarantined: true`): Returned only
-  when Fernet AEAD authentication (`InvalidToken`) or canonical SHA-256 digest
-  verification fails.
-- `STORAGE_IO_UNAVAILABLE` (`retryable: true`, `quarantined: false`): Returned
-  for transient non-quota filesystem I/O errors without quarantining valid blobs.
+`CheckpointStore.record()` is idempotent for the same ledger and rejects lower
+ledgers. `load()`, `save()`, and `reconcile_registration()` refuse a checkpoint
+whose network or deployment fingerprint differs from the current configuration,
+so a stale or cross-network state file cannot advance confirmed registration
+state. The passphrase defaults to the known value for the configured release
+network; set `STELLAR_NETWORK_PASSPHRASE` explicitly for local or forked
+networks.
+
+```python
+from registration_reconcile import CheckpointStore, DeploymentIdentity
+
+deployment = DeploymentIdentity.from_config()
+store = CheckpointStore(deployment=deployment)
+checkpoint = store.record(1_250)
+```
+
+## Resumable Evidence Integrity Verification
+
+`evidence_storage.py` provides bounded, resumable integrity verification across
+stored encrypted evidence blobs (`verify_evidence_batch()` and
+`verify_evidence_resumable()`):
+
+- Blobs are scanned in deterministic `content_hash` order in bounded batches
+  (`DEFAULT_VERIFY_BATCH_SIZE=50`, clamped to `MAX_VERIFY_BATCH_SIZE=500`).
+- Each blob's metadata (`content_hash`, `size_bytes`, `storage_path`) and
+  Fernet ciphertext are verified. Unverifiable legacy blobs (e.g. missing or
+  `legacy:`-prefixed DEK, unreadable legacy master key, non-SHA-256 legacy
+  hash, or missing `size_bytes`) are counted separately under
+  `unverifiable_legacy` rather than conflated with ciphertext/metadata
+  corruption (`failed`).
+- Resumable progress is written atomically to
+  `storage.get_integrity_progress_path()` under `HARPOCRATES_STORAGE_DIR`
+  (default `/tmp/harpocrates_jobs/evidence_integrity_progress.json`).
+- Persisted progress records only nonsecret metadata (`schema_version`,
+  `run_id`, `status`, `cursor`, `batch_size`, `batches_completed`, `totals`,
+  `failure_reasons`, `legacy_reasons`, `updated_at`) — never plaintext,
+  ciphertext, DEKs, master keys, or filesystem paths.
+
+## Encryption Envelope Versions
+
+`evidence_storage.py` records an explicit `envelope_version` column on `blobs`
+(default `fernet-v1`, added in migration 13):
+
+- `classify_envelope_version()` distinguishes supported versions (`fernet-v1`),
+  known legacy envelopes (`None` for pre-versioning rows, `legacy-v0`,
+  `fernet-v0`), and unsupported formats (any unrecognized, empty, or non-string
+  identifier).
+- `record_blob()` validates and stores `envelope_version`, rejecting known
+  legacy or unsupported values on write.
+- `decrypt_blob_ciphertext()` and `verify_blob_integrity()` dispatch strictly
+  on the recorded `envelope_version` and never guess a decryption algorithm
+  from malformed ciphertext. Known legacy versions are reported as
+  `unverifiable_legacy` (`legacy_envelope_version`), while unsupported formats
+  fail closed (`unsupported_envelope_version`). Pre-versioning rows with
+  `envelope_version IS NULL` remain compatible with Fernet.
 
 ## Test
 

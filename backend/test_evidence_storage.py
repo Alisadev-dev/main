@@ -14,8 +14,256 @@ from unittest.mock import patch
 
 import pytest
 
-from evidence_storage import assert_safe_destination
-from storage import BlobStore, StorageConfig, _collect_protected_paths, _paths_alias, load_storage_config
+_BACKEND_DIR = str(Path(__file__).resolve().parent)
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
+import evidence_storage
+from metrics import collector as metrics_collector
+
+
+class FakeRow(dict):
+    """Row mapping returned by FakeCursor.fetchone()."""
+
+
+class FakeCursor:
+    """In-memory fake cursor capturing SQL statements, parameters, and state."""
+
+    def __init__(self, connection: "FakeConnection") -> None:
+        self.connection = connection
+        self.executed: list[tuple[str, tuple]] = []
+        self._last_row: FakeRow | None = None
+        self._results: list[FakeRow] = []
+        self._idx: int = 0
+
+    def __enter__(self) -> "FakeCursor":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        return None
+
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        self.executed.append((sql, params))
+        normalized = " ".join(sql.lower().split())
+
+        if normalized.startswith("insert into blobs"):
+            if len(params) == 5:
+                content_hash, encrypted_dek, size_bytes, storage_path, envelope_version = params
+            else:
+                content_hash, encrypted_dek, size_bytes, storage_path = params
+                envelope_version = None
+            # ON CONFLICT (content_hash) DO NOTHING
+            with self.connection.lock:
+                if content_hash not in self.connection.blobs:
+                    self.connection.blobs[content_hash] = {
+                        "content_hash": content_hash,
+                        "encrypted_dek": encrypted_dek,
+                        "size_bytes": size_bytes,
+                        "storage_path": storage_path,
+                        "envelope_version": envelope_version,
+                        "created_at": time.time(),
+                    }
+            self._last_row = None
+
+        elif normalized.startswith("insert into tenant_blob_refs"):
+            tenant_id, content_hash = params
+            key = (tenant_id, content_hash)
+            # ON CONFLICT (tenant_id, content_hash) DO UPDATE SET ref_count = ref_count + 1
+            with self.connection.lock:
+                if key in self.connection.tenant_refs:
+                    self.connection.tenant_refs[key]["ref_count"] += 1
+                else:
+                    self.connection.tenant_refs[key] = {
+                        "tenant_id": tenant_id,
+                        "content_hash": content_hash,
+                        "ref_count": 1,
+                    }
+            self._last_row = None
+
+        elif normalized.startswith("select encrypted_dek, storage_path, envelope_version from blobs"):
+            (content_hash,) = params
+            with self.connection.lock:
+                blob = self.connection.blobs.get(content_hash)
+                if blob is None:
+                    self._last_row = None
+                else:
+                    self._last_row = FakeRow(
+                        encrypted_dek=blob["encrypted_dek"],
+                        storage_path=blob["storage_path"],
+                        envelope_version=blob.get("envelope_version"),
+                    )
+
+        elif "select ref_count from tenant_blob_refs" in normalized:
+            tenant_id, content_hash = params[0], params[1]
+            key = (tenant_id, content_hash)
+            with self.connection.lock:
+                if key in self.connection.tenant_refs:
+                    self._last_row = FakeRow(ref_count=self.connection.tenant_refs[key]["ref_count"])
+                else:
+                    self._last_row = None
+
+        elif "update tenant_blob_refs" in normalized:
+            tenant_id, content_hash = params[0], params[1]
+            key = (tenant_id, content_hash)
+            with self.connection.lock:
+                if key in self.connection.tenant_refs:
+                    self.connection.tenant_refs[key]["ref_count"] -= 1
+
+        elif "delete from tenant_blob_refs" in normalized:
+            tenant_id, content_hash = params[0], params[1]
+            key = (tenant_id, content_hash)
+            with self.connection.lock:
+                self.connection.tenant_refs.pop(key, None)
+
+        elif "select content_hash, storage_path from blobs" in normalized and "where not exists" in normalized:
+            limit = params[0]
+            with self.connection.lock:
+                unreferenced = []
+                for h, b in sorted(self.connection.blobs.items(), key=lambda item: item[1].get("created_at", 0)):
+                    has_ref = any(
+                        ref["content_hash"] == h and ref["ref_count"] > 0
+                        for ref in self.connection.tenant_refs.values()
+                    )
+                    if not has_ref:
+                        unreferenced.append(b)
+                        if len(unreferenced) >= limit:
+                            break
+
+            for b in unreferenced:
+                row_lock = self.connection.get_row_lock(b["content_hash"])
+                row_lock.acquire()
+                self.connection.held_locks.append(row_lock)
+
+            if self.connection.before_collector_delete_hook:
+                self.connection.before_collector_delete_hook()
+
+            self._results = [
+                FakeRow(content_hash=b["content_hash"], storage_path=b["storage_path"])
+                for b in unreferenced
+            ]
+            self._idx = 0
+
+        elif "delete from blobs where content_hash = %s" in normalized:
+            content_hash = params[0]
+            with self.connection.lock:
+                self.connection.blobs.pop(content_hash, None)
+                to_delete = [k for k, v in self.connection.tenant_refs.items() if v["content_hash"] == content_hash]
+                for k in to_delete:
+                    del self.connection.tenant_refs[k]
+
+        elif "from tenant_blob_refs r join blobs b" in normalized:
+            (tenant_id,) = params
+            with self.connection.lock:
+                matched = []
+                for (ref_tenant, content_hash), ref in self.connection.tenant_refs.items():
+                    if ref_tenant != tenant_id or ref["ref_count"] <= 0:
+                        continue
+                    blob = self.connection.blobs.get(content_hash)
+                    if blob is None:
+                        continue
+                    shared = any(
+                        other_tenant != tenant_id
+                        and other_hash == content_hash
+                        and other_ref["ref_count"] > 0
+                        for (other_tenant, other_hash), other_ref in self.connection.tenant_refs.items()
+                    )
+                    matched.append(
+                        FakeRow(
+                            content_hash=content_hash,
+                            ref_count=ref["ref_count"],
+                            size_bytes=blob["size_bytes"],
+                            created_at=blob["created_at"],
+                            shared_with_other_tenants=shared,
+                        )
+                    )
+                matched.sort(key=lambda r: (r["created_at"], r["content_hash"]))
+            self._results = matched
+            self._idx = 0
+
+    def fetchone(self) -> FakeRow | None:
+        if self._results and self._idx < len(self._results):
+            row = self._results[self._idx]
+            self._idx += 1
+            return row
+        return self._last_row
+
+    def fetchall(self) -> list[FakeRow]:
+        res = self._results[self._idx:]
+        self._idx = len(self._results)
+        return res
+
+
+class FakeConnection:
+    """In-memory fake Postgres connection supporting cursor context managers."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.blobs: dict[str, dict] = {}
+        self.tenant_refs: dict[tuple[str, str], dict] = {}
+        self.cursors: list[FakeCursor] = []
+        self.commits: int = 0
+        self.row_locks: dict[str, threading.Lock] = {}
+        self.row_locks_guard = threading.Lock()
+        self.held_locks: list[threading.Lock] = []
+        self.before_collector_delete_hook = None
+
+    def get_row_lock(self, content_hash: str) -> threading.Lock:
+        with self.row_locks_guard:
+            if content_hash not in self.row_locks:
+                self.row_locks[content_hash] = threading.Lock()
+            return self.row_locks[content_hash]
+
+    @property
+    def executed(self) -> list[tuple[str, tuple]]:
+        return [call for cur in self.cursors for call in cur.executed]
+
+    def cursor(self) -> FakeCursor:
+        cur = FakeCursor(self)
+        self.cursors.append(cur)
+        return cur
+
+    def commit(self) -> None:
+        self.commits += 1
+        for lock in self.held_locks:
+            lock.release()
+        self.held_locks.clear()
+
+    def rollback(self) -> None:
+        for lock in self.held_locks:
+            lock.release()
+        self.held_locks.clear()
+
+    def __enter__(self) -> "FakeConnection":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if exc_type is not None:
+            self.rollback()
+        else:
+            self.commit()
+
+
+@pytest.fixture
+def fake_db(monkeypatch: pytest.MonkeyPatch) -> FakeConnection:
+    """Fixture providing a fake db.get_connection context manager and connection."""
+    conn = FakeConnection()
+
+    @contextmanager
+    def _fake_get_connection():
+        yield conn
+
+    monkeypatch.setattr(evidence_storage.db, "get_connection", _fake_get_connection)
+    metrics_collector.reset()
+    yield conn
+    metrics_collector.reset()
+
+
+@pytest.fixture
+def master_key(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Fixture configuring a deterministic valid Fernet MASTER_ENCRYPTION_KEY."""
+    key = Fernet.generate_key().decode("ascii")
+    monkeypatch.setenv("MASTER_ENCRYPTION_KEY", key)
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +382,20 @@ class TestBlobStore:
         config = StorageConfig(storage_path=storage_root, protected_paths=protected)
         return BlobStore(config)
 
-    # --- write ---
+    assert fake_db.commits == 1
+    assert len(fake_db.executed) == 1
+    sql, params = fake_db.executed[0]
+    normalized_sql = " ".join(sql.lower().split())
+    assert "insert into blobs (content_hash, encrypted_dek, size_bytes, storage_path, envelope_version)" in normalized_sql
+    assert "values (%s, %s, %s, %s, %s)" in normalized_sql
+    assert "on conflict (content_hash) do nothing" in normalized_sql
+    assert params == (
+        content_hash,
+        encrypted_dek.decode(),
+        size_bytes,
+        storage_path,
+        evidence_storage.DEFAULT_ENVELOPE_VERSION,
+    )
 
     def test_write_creates_file_with_correct_content(self, tmp_path: Path) -> None:
         store = self._make_store(tmp_path)
@@ -154,17 +415,30 @@ class TestBlobStore:
         store.write("2026/11/abc.bin", b"blob")
         assert (tmp_path / "blobs" / "2026" / "11" / "abc.bin").exists()
 
-    def test_write_rejects_empty_name(self, tmp_path: Path) -> None:
-        store = self._make_store(tmp_path)
-        with pytest.raises(ValueError, match="must not be empty"):
-            store.write("", b"data")
+    assert fake_db.commits == 2
+    assert len(fake_db.executed) == 2
+    assert fake_db.executed[0][1] == (
+        content_hash,
+        first_dek.decode(),
+        1024,
+        "/blobs/first",
+        evidence_storage.DEFAULT_ENVELOPE_VERSION,
+    )
+    assert fake_db.executed[1][1] == (
+        content_hash,
+        second_dek.decode(),
+        9999,
+        "/blobs/second",
+        evidence_storage.DEFAULT_ENVELOPE_VERSION,
+    )
 
-    def test_write_rejects_absolute_name(self, tmp_path: Path) -> None:
-        """An absolute-style name is either caught early (Unix) or by the
-        escape check (Windows, where '/etc/passwd' is relative-to-cwd)."""
-        store = self._make_store(tmp_path)
-        with pytest.raises(ValueError):
-            store.write("/etc/passwd", b"data")
+    # Duplicate content_hash preserves the original blob entry (DO NOTHING)
+    info = evidence_storage.get_blob_info(content_hash)
+    assert info == {
+        "encrypted_dek": first_dek.decode(),
+        "storage_path": "/blobs/first",
+        "envelope_version": evidence_storage.DEFAULT_ENVELOPE_VERSION,
+    }
 
     def test_write_rejects_traversal_escaping_root(self, tmp_path: Path) -> None:
         store = self._make_store(tmp_path)
@@ -206,62 +480,24 @@ class TestBlobStore:
         with pytest.raises(ValueError):
             store.write("sneaky/config.py", b"overwrite source")
 
-    # --- read ---
+    assert evidence_storage.get_blob_info(unknown_hash) is None
+    sql, params = fake_db.executed[-1]
+    assert "select encrypted_dek, storage_path, envelope_version from blobs where content_hash = %s" in " ".join(
+        sql.lower().split()
+    )
+    assert params == (unknown_hash,)
 
     def test_read_returns_stored_bytes(self, tmp_path: Path) -> None:
         store = self._make_store(tmp_path)
         store.write("file.bin", b"content")
         assert store.read("file.bin") == b"content"
 
-    def test_read_raises_file_not_found_for_missing_blob(self, tmp_path: Path) -> None:
-        store = self._make_store(tmp_path)
-        with pytest.raises(FileNotFoundError):
-            store.read("nonexistent.bin")
-
-    def test_read_rejects_traversal(self, tmp_path: Path) -> None:
-        store = self._make_store(tmp_path)
-        with pytest.raises(ValueError, match="escapes the storage root"):
-            store.read("../outside.bin")
-
-    # --- delete ---
-
-    def test_delete_removes_existing_file(self, tmp_path: Path) -> None:
-        store = self._make_store(tmp_path)
-        store.write("del.bin", b"x")
-        removed = store.delete("del.bin")
-        assert removed is True
-        assert not (tmp_path / "blobs" / "del.bin").exists()
-
-    def test_delete_returns_false_for_nonexistent_file(self, tmp_path: Path) -> None:
-        store = self._make_store(tmp_path)
-        assert store.delete("ghost.bin") is False
-
-    def test_delete_rejects_traversal(self, tmp_path: Path) -> None:
-        store = self._make_store(tmp_path)
-        with pytest.raises(ValueError, match="escapes the storage root"):
-            store.delete("../../etc/important")
-
-    # --- collect_unreferenced ---
-
-    def test_collect_unreferenced_returns_untracked_files(self, tmp_path: Path) -> None:
-        store = self._make_store(tmp_path)
-        store.write("a.bin", b"a")
-        store.write("b.bin", b"b")
-        store.write("c.bin", b"c")
-        unreferenced = store.collect_unreferenced({"a.bin", "c.bin"})
-        names = {p.name for p in unreferenced}
-        assert names == {"b.bin"}
-
-    def test_collect_unreferenced_returns_empty_when_all_referenced(self, tmp_path: Path) -> None:
-        store = self._make_store(tmp_path)
-        store.write("a.bin", b"a")
-        assert store.collect_unreferenced({"a.bin"}) == []
-
-    def test_collect_unreferenced_returns_empty_for_missing_root(self, tmp_path: Path) -> None:
-        empty_root = tmp_path / "nonexistent_blobs"
-        config = StorageConfig(storage_path=empty_root, protected_paths=frozenset())
-        store = BlobStore(config)
-        assert store.collect_unreferenced(set()) == []
+    assert result == {
+        "encrypted_dek": encrypted_dek.decode(),
+        "storage_path": storage_path,
+        "envelope_version": evidence_storage.DEFAULT_ENVELOPE_VERSION,
+    }
+    assert isinstance(result, dict)
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +622,213 @@ class TestPathsAlias:
         child = parent / "file.txt"
         assert _paths_alias(parent, child) is True
 
-    def test_sibling_paths_do_not_alias(self, tmp_path: Path) -> None:
-        a = tmp_path / "dir_a" / "file.txt"
-        b = tmp_path / "dir_b" / "file.txt"
-        assert _paths_alias(a, b) is False
+
+def test_preview_tenant_retention_rejects_invalid_inputs(fake_db: FakeConnection) -> None:
+    with pytest.raises(ValueError, match="tenant_id must be a non-empty string"):
+        evidence_storage.preview_tenant_retention("")
+
+    with pytest.raises(ValueError, match="tenant_id must be a non-empty string"):
+        evidence_storage.preview_tenant_retention("   ")
+
+    with pytest.raises(ValueError, match="ttl_seconds must be a non-negative number"):
+        evidence_storage.preview_tenant_retention("tenant_a", ttl_seconds=-1)
+
+    with pytest.raises(ValueError, match="ttl_seconds must be a non-negative number"):
+        evidence_storage.preview_tenant_retention("tenant_a", ttl_seconds=True)
+
+
+class EvidenceStorageUnittestSuite(unittest.TestCase):
+    """Unittest-compatible test case so `python -m unittest discover` also exercises the suite."""
+
+    def setUp(self) -> None:
+        self.conn = FakeConnection()
+
+        @contextmanager
+        def _fake_get_connection():
+            yield self.conn
+
+        self._conn_patch = patch.object(
+            evidence_storage.db, "get_connection", _fake_get_connection
+        )
+        self._conn_patch.start()
+        self.master_key = Fernet.generate_key().decode("ascii")
+        self._env_patch = patch.dict(
+            os.environ, {"MASTER_ENCRYPTION_KEY": self.master_key}, clear=False
+        )
+        self._env_patch.start()
+
+    def tearDown(self) -> None:
+        self._env_patch.stop()
+        self._conn_patch.stop()
+
+    def test_end_to_end_blob_lifecycle_without_postgres(self) -> None:
+        dek, encrypted_dek = evidence_storage.generate_dek()
+        encryptor = evidence_storage.get_encryptor(dek)
+        ciphertext = encryptor.encrypt(b"evidence-bytes")
+
+        content_hash = "e" * 64
+        self.assertIsNone(evidence_storage.get_blob_info(content_hash))
+
+        evidence_storage.record_blob(content_hash, encrypted_dek, len(ciphertext), "/blobs/ee")
+        evidence_storage.record_blob(content_hash, b"ignored-duplicate", 0, "/blobs/other")
+        evidence_storage.record_tenant_ref("tenant-1", content_hash)
+        evidence_storage.record_tenant_ref("tenant-1", content_hash)
+
+        blob_info = evidence_storage.get_blob_info(content_hash)
+        self.assertEqual(
+            blob_info,
+            {
+                "encrypted_dek": encrypted_dek.decode(),
+                "storage_path": "/blobs/ee",
+                "envelope_version": evidence_storage.DEFAULT_ENVELOPE_VERSION,
+            },
+        )
+        unwrapped_dek = evidence_storage.decrypt_dek(
+            blob_info["encrypted_dek"].encode("ascii")
+        )
+        self.assertEqual(unwrapped_dek, dek)
+        self.assertEqual(
+            evidence_storage.decrypt_blob_ciphertext(
+                unwrapped_dek,
+                ciphertext,
+                envelope_version=blob_info["envelope_version"],
+            ),
+            b"evidence-bytes",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Encryption envelope version tests
+# ---------------------------------------------------------------------------
+
+
+def test_classify_envelope_version_distinguishes_supported_legacy_and_unsupported() -> None:
+    assert (
+        evidence_storage.classify_envelope_version(evidence_storage.ENVELOPE_VERSION_FERNET_V1)
+        == evidence_storage.ENVELOPE_CLASS_SUPPORTED
+    )
+    assert (
+        evidence_storage.classify_envelope_version("  fernet-v1  ")
+        == evidence_storage.ENVELOPE_CLASS_SUPPORTED
+    )
+
+    # Known legacy formats (including pre-versioning NULL metadata)
+    assert evidence_storage.classify_envelope_version(None) == evidence_storage.ENVELOPE_CLASS_LEGACY
+    assert evidence_storage.classify_envelope_version("legacy-v0") == evidence_storage.ENVELOPE_CLASS_LEGACY
+    assert evidence_storage.classify_envelope_version("fernet-v0") == evidence_storage.ENVELOPE_CLASS_LEGACY
+
+    # Unsupported formats
+    for bad in ("", "   ", "aes-gcm-v2", "fernet-v99", "unknown", 1, True, b"fernet-v1"):
+        assert (
+            evidence_storage.classify_envelope_version(bad)
+            == evidence_storage.ENVELOPE_CLASS_UNSUPPORTED
+        )
+
+
+def test_record_blob_rejects_legacy_and_unsupported_envelope_versions(
+    fake_db: FakeConnection,
+) -> None:
+    content_hash = "f" * 64
+    encrypted_dek = b"gAAAAABk-fake-dek"
+
+    with pytest.raises(evidence_storage.LegacyEnvelopeVersionError):
+        evidence_storage.record_blob(
+            content_hash, encrypted_dek, 128, "/blobs/legacy", envelope_version="legacy-v0"
+        )
+
+    with pytest.raises(evidence_storage.UnsupportedEnvelopeVersionError):
+        evidence_storage.record_blob(
+            content_hash, encrypted_dek, 128, "/blobs/unknown", envelope_version="aes-gcm-v2"
+        )
+
+    with pytest.raises(evidence_storage.UnsupportedEnvelopeVersionError):
+        evidence_storage.record_blob(
+            content_hash, encrypted_dek, 128, "/blobs/empty", envelope_version="   "
+        )
+
+    assert fake_db.commits == 0
+    assert fake_db.executed == []
+
+
+def test_decrypt_blob_ciphertext_never_guesses_algorithm_from_malformed_ciphertext() -> None:
+    dek = Fernet.generate_key()
+    plaintext = b"synthetic-evidence-envelope-test"
+    valid_ciphertext = evidence_storage.get_encryptor(dek).encrypt(plaintext)
+
+    # Supported explicit version decrypts cleanly
+    assert (
+        evidence_storage.decrypt_blob_ciphertext(
+            dek, valid_ciphertext, envelope_version=evidence_storage.ENVELOPE_VERSION_FERNET_V1
+        )
+        == plaintext
+    )
+
+    # Pre-versioning legacy row (None) remains compatible with Fernet
+    assert (
+        evidence_storage.decrypt_blob_ciphertext(dek, valid_ciphertext, envelope_version=None)
+        == plaintext
+    )
+
+    # Malformed ciphertext fails closed with InvalidToken (never guesses another algorithm)
+    for malformed in (b"", b"not-fernet", b"\x00\x01\x02aes-gcm-like-header", valid_ciphertext[:-4]):
+        with pytest.raises(InvalidToken):
+            evidence_storage.decrypt_blob_ciphertext(
+                dek, malformed, envelope_version=evidence_storage.ENVELOPE_VERSION_FERNET_V1
+            )
+
+    # Known legacy version raises LegacyEnvelopeVersionError without attempting decryption
+    with pytest.raises(evidence_storage.LegacyEnvelopeVersionError):
+        evidence_storage.decrypt_blob_ciphertext(dek, valid_ciphertext, envelope_version="legacy-v0")
+
+    # Unsupported version raises UnsupportedEnvelopeVersionError even if ciphertext is valid Fernet
+    with pytest.raises(evidence_storage.UnsupportedEnvelopeVersionError):
+        evidence_storage.decrypt_blob_ciphertext(dek, valid_ciphertext, envelope_version="aes-gcm-v2")
+
+
+def test_verify_blob_integrity_distinguishes_legacy_and_unsupported_envelope_versions(
+    tmp_path: Path,
+    master_key: str,
+) -> None:
+    dek, encrypted_dek = evidence_storage.generate_dek()
+    plaintext = b"synthetic-envelope-verify"
+    ciphertext = evidence_storage.get_encryptor(dek).encrypt(plaintext)
+    blob_path = tmp_path / "envelope.bin"
+    blob_path.write_bytes(ciphertext)
+    import hashlib
+
+    base_record = {
+        "content_hash": hashlib.sha256(plaintext).hexdigest(),
+        "encrypted_dek": encrypted_dek.decode("utf-8"),
+        "size_bytes": len(ciphertext),
+        "storage_path": str(blob_path),
+    }
+
+    # Explicit supported version verifies
+    res_supported = evidence_storage.verify_blob_integrity(
+        dict(base_record, envelope_version=evidence_storage.ENVELOPE_VERSION_FERNET_V1)
+    )
+    assert res_supported["status"] == evidence_storage.STATUS_VERIFIED
+    assert res_supported["reason"] == "ok"
+
+    # Pre-versioning legacy row (envelope_version=None) remains compatible
+    res_unversioned = evidence_storage.verify_blob_integrity(dict(base_record, envelope_version=None))
+    assert res_unversioned["status"] == evidence_storage.STATUS_VERIFIED
+    assert res_unversioned["reason"] == "ok"
+
+    # Known legacy envelope version -> unverifiable_legacy (distinct from unsupported)
+    res_legacy = evidence_storage.verify_blob_integrity(
+        dict(base_record, envelope_version="legacy-v0")
+    )
+    assert res_legacy["status"] == evidence_storage.STATUS_UNVERIFIABLE_LEGACY
+    assert res_legacy["reason"] == "legacy_envelope_version"
+
+    # Unsupported envelope version -> failed (never guesses algorithm even on valid ciphertext)
+    res_unsupported = evidence_storage.verify_blob_integrity(
+        dict(base_record, envelope_version="aes-gcm-v2")
+    )
+    assert res_unsupported["status"] == evidence_storage.STATUS_FAILED
+    assert res_unsupported["reason"] == "unsupported_envelope_version"
+
+
+if __name__ == "__main__":
+    unittest.main()

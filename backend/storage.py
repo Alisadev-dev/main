@@ -59,10 +59,44 @@ def load_storage_config() -> StorageConfig | None:
 class BlobStore:
     """Write and retrieve encrypted evidence blobs under a root directory.
 
-    Parameters
-    ----------
-    config:
-        Storage configuration; obtain via :func:`load_storage_config`.
+
+def get_job_output_path(job_id: int | str) -> Path:
+    return get_storage_dir() / f"job_{job_id}_output"
+
+
+def get_integrity_progress_path(filename: str = "evidence_integrity_progress.json") -> Path:
+    if not filename or Path(filename).name != filename or filename in {".", ".."}:
+        raise ValueError("filename must be a simple file name without path separators")
+    return get_storage_dir() / filename
+
+
+def _parse_timestamp(val: Any) -> datetime:
+    if isinstance(val, datetime):
+        return val if val.tzinfo is not None else val.replace(tzinfo=timezone.utc)
+    if isinstance(val, (int, float)):
+        return datetime.fromtimestamp(val, tz=timezone.utc)
+    if isinstance(val, str):
+        try:
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
+
+
+def sweep_job_files(
+    storage_dir: Path | str | None = None,
+    ttl_seconds: int | float | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Sweep and remove expired terminal job files and orphaned files from storage.
+
+    Deletes files for jobs in terminal states older than TTL, and orphaned files
+    with no job row older than TTL.
+    Never removes files for running or pending jobs.
+    Logs counts only, never file names derived from user input.
+
+    Returns the count of deleted files.
     """
 
     def __init__(self, config: StorageConfig) -> None:
