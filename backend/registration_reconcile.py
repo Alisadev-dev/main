@@ -119,6 +119,17 @@ CHECKPOINT_VERSION = 1
 DEFAULT_CHECKPOINT_FILENAME = "registration-reconcile-checkpoint.json"
 DEFAULT_STATE_DIR = Path(tempfile.gettempdir()) / "harpocrates-registration-reconcile"
 
+LOGGER = logging.getLogger("harpocrates.registration_reconcile")
+if not LOGGER.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    LOGGER.addHandler(handler)
+LOGGER.setLevel(logging.INFO)
+
+MAX_RECONCILE_BATCH = 50
+MAX_TIMELINE_ENTRIES = 100
+DEFAULT_MIN_CONFIRMATIONS = 1
+
 KNOWN_NETWORK_PASSPHRASES = {
     "mainnet": "Public Global Stellar Network ; September 2015",
     "testnet": "Test SDF Network ; September 2015",
@@ -127,7 +138,19 @@ KNOWN_NETWORK_PASSPHRASES = {
     "standalone": "Standalone Network ; February 2017",
 }
 
-TERMINAL_STATUSES = frozenset({"confirmed", "failed"})
+# Canonical outcome classes exposed in the reconciliation timeline.
+OUTCOME_SUBMITTED = "submitted"
+OUTCOME_CONFIRMED = "confirmed"
+OUTCOME_REJECTED = "rejected"
+OUTCOME_UNKNOWN = "unknown"
+
+_STATUS_TO_OUTCOME = {
+    "pending": OUTCOME_SUBMITTED,
+    "confirmed": OUTCOME_CONFIRMED,
+    "failed": OUTCOME_REJECTED,
+    "missing": OUTCOME_UNKNOWN,
+    "error": OUTCOME_UNKNOWN,
+}
 
 
 class RegistrationReconcileError(RuntimeError):
@@ -152,6 +175,40 @@ class LedgerRollbackError(CheckpointError):
 
 class TransportError(CheckpointError):
     pass
+
+
+def classify_outcome(status: str | None) -> str:
+    """Map an internal tx status onto the canonical outcome vocabulary."""
+    if status is None:
+        return OUTCOME_UNKNOWN
+    return _STATUS_TO_OUTCOME.get(status, OUTCOME_UNKNOWN)
+
+
+def _result_payload(
+    *,
+    tx_hash: str,
+    previous_status: str | None,
+    verification: TxVerificationResult,
+    updated: bool,
+    proof_id: str | None = None,
+    event_id: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "txHash": tx_hash,
+        "previousStatus": previous_status,
+        "status": verification.status,
+        "outcome": classify_outcome(verification.status),
+        "updated": updated,
+        "reason": verification.reason,
+        "confirmations": verification.confirmations,
+        "ledger": verification.ledger,
+        "minConfirmationsApplied": None,
+    }
+    if proof_id is not None:
+        payload["proofId"] = proof_id
+    if event_id is not None:
+        payload["eventId"] = event_id
+    return payload
 
 
 def _digest(*fields: str) -> str:
@@ -529,16 +586,141 @@ def preview_registration_repairs(
             )
             continue
 
-        proposed = evidence.status if evidence.status != current else None
-        items.append(
-            RepairPreviewItem(
-                row_id=row_id,
-                tx_hash=tx_hash,
-                expected_revision=revision,
-                current_status=current,
-                proposed_status=proposed,
-                chain_evidence=evidence,
-                reason="status update proposed" if proposed else "already consistent",
+NetworkCheckpoint = LedgerObservation
+
+
+def load_checkpoint(
+    state_dir: str | os.PathLike[str] | None = None,
+    deployment: DeploymentIdentity | None = None,
+) -> RegistrationCheckpoint | None:
+    return CheckpointStore(state_dir, deployment).load()
+
+
+def save_checkpoint(
+    checkpoint: RegistrationCheckpoint,
+    state_dir: str | os.PathLike[str] | None = None,
+    deployment: DeploymentIdentity | None = None,
+) -> RegistrationCheckpoint:
+    return CheckpointStore(state_dir, deployment).save(checkpoint)
+
+
+def record_checkpoint(
+    last_trusted_ledger: int,
+    state_dir: str | os.PathLike[str] | None = None,
+    deployment: DeploymentIdentity | None = None,
+    *,
+    updated_at: str | None = None,
+) -> RegistrationCheckpoint:
+    return CheckpointStore(state_dir, deployment).record(
+        last_trusted_ledger, updated_at=updated_at
+    )
+
+
+def _call_transport(
+    transport: Callable[..., Any], deployment: DeploymentIdentity
+) -> Any:
+    try:
+        signature = inspect.signature(transport)
+    except (TypeError, ValueError):
+        return transport(deployment)
+    parameters = list(signature.parameters.values())
+    if any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
+        return transport(deployment)
+    positional = [
+        parameter
+        for parameter in parameters
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if positional:
+        return transport(deployment)
+    return transport()
+
+
+def build_reconciliation_timeline(
+    observations: list[dict[str, Any]],
+    *,
+    limit: int = MAX_TIMELINE_ENTRIES,
+) -> dict[str, Any]:
+    """Return a bounded, authorized-requester view of reconciliation history.
+
+    Each observation is a reconciliation result payload (see
+    ``_result_payload``). Only outcome classes, status transitions, and
+    confirmation/ledger metadata are surfaced; no media, envelopes, witness
+    values or credentials are ever included.
+    """
+    if limit < 1:
+        raise ValueError("limit must be a positive integer")
+    bounded_limit = min(int(limit), MAX_TIMELINE_ENTRIES)
+
+    entries: list[dict[str, Any]] = []
+    transitions: list[dict[str, Any]] = []
+    previous_outcome: str | None = None
+
+    for index, obs in enumerate(observations):
+        if not isinstance(obs, dict):
+            continue
+        outcome = classify_outcome(obs.get("status"))
+        entry = {
+            "index": index,
+            "outcome": outcome,
+            "status": obs.get("status"),
+            "reason": obs.get("reason"),
+            "confirmations": obs.get("confirmations"),
+            "ledger": obs.get("ledger"),
+            "updated": bool(obs.get("updated")),
+        }
+        entries.append(entry)
+        if previous_outcome is not None and previous_outcome != outcome:
+            transitions.append(
+                {
+                    "fromOutcome": previous_outcome,
+                    "toOutcome": outcome,
+                    "atIndex": index,
+                }
             )
+        previous_outcome = outcome
+
+    truncated = len(entries) > bounded_limit
+    entries = entries[-bounded_limit:]
+
+    return {
+        "ok": True,
+        "observations": entries,
+        "transitions": transitions,
+        "currentOutcome": previous_outcome,
+        "truncated": truncated,
+        "limit": bounded_limit,
+    }
+
+
+def reconcile_registration(
+    store: CheckpointStore | str | os.PathLike[str],
+    transport: Callable[..., Any],
+    deployment: DeploymentIdentity | None = None,
+) -> RegistrationCheckpoint:
+    if not isinstance(store, CheckpointStore):
+        store = CheckpointStore(store, deployment)
+    active_deployment = deployment or store.deployment
+    try:
+        response = _call_transport(transport, active_deployment)
+        observation = LedgerObservation.from_response(response, active_deployment)
+    except RegistrationReconcileError:
+        raise
+    except Exception as exc:
+        raise TransportError("ledger observation could not be read") from exc
+    observed = DeploymentIdentity(
+        release_id=observation.release_id,
+        network=observation.network,
+        network_passphrase=observation.network_passphrase,
+    )
+    if observed.fingerprint != active_deployment.fingerprint:
+        if (
+            observed.network != active_deployment.network
+            or observed.network_passphrase != active_deployment.network_passphrase
+        ):
+            raise NetworkMismatchError("ledger observation came from another network")
+        raise DeploymentMismatchError(
+            "ledger observation came from another deployment configuration"
         )
-    return RepairPreview(items=tuple(items))
+    return store.record(observation.last_trusted_ledger)
