@@ -1,27 +1,11 @@
-"""Local blob store for encrypted evidence files.
-
-Evidence is written to a configurable directory (``EVIDENCE_STORAGE_PATH``).
-Before any write the destination path is validated by
-:func:`evidence_storage.assert_safe_destination` so that it can never
-alias the metadata database file, encryption-key material, or the
-application's own source tree.
-
-Environment variables
----------------------
-EVIDENCE_STORAGE_PATH
-    Absolute path to the directory that receives evidence blobs.
-    Required when local storage is enabled.  The directory is created on
-    first use if it does not already exist.
-EVIDENCE_STORAGE_KEY_FILE
-    Optional path to a file that holds the symmetric encryption key.
-    When set it is added to the protected-paths set so that evidence
-    blobs can never overwrite it.
-"""
-
-from __future__ import annotations
-
+import errno
+import logging
 import os
-from dataclasses import dataclass, field
+import re
+import shutil
+import stat
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from evidence_storage import assert_safe_destination
@@ -197,62 +181,200 @@ class BlobStore:
         return destination
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+purge_stale_job_files = sweep_job_files
 
 
-def _collect_protected_paths(storage_path: Path) -> frozenset[Path]:
-    """Build the set of canonical paths that destinations must not alias.
+STORAGE_QUOTA_EXHAUSTED = "STORAGE_QUOTA_EXHAUSTED"
+EVIDENCE_CORRUPTED = "EVIDENCE_CORRUPTED"
+STORAGE_IO_UNAVAILABLE = "STORAGE_IO_UNAVAILABLE"
 
-    Always protects:
-
-    * The application source directory (the directory containing this
-      file, resolved to its real path).
-    * The key file named by ``EVIDENCE_STORAGE_KEY_FILE``, if set.
-    * The database file named by ``DATABASE_URL`` when it uses the
-      ``sqlite:///`` scheme (the PostgreSQL URL used in production does
-      not map to a local path).
-
-    Parameters
-    ----------
-    storage_path:
-        The configured storage root; included so callers can pass it
-        through ``assert_safe_destination`` for the root-conflict check.
-    """
-    protected: set[Path] = set()
-
-    # --- application source tree ---
-    source_root = Path(__file__).resolve().parent
-    protected.add(source_root)
-
-    # --- optional encryption-key file ---
-    key_file_raw = os.getenv("EVIDENCE_STORAGE_KEY_FILE", "").strip()
-    if key_file_raw:
-        protected.add(Path(key_file_raw).resolve())
-
-    # --- SQLite metadata database (if DATABASE_URL points to a file) ---
-    db_url = os.getenv("DATABASE_URL", "").strip()
-    if db_url.startswith("sqlite:///"):
-        db_file_path = db_url[len("sqlite:///"):]
-        if db_file_path:
-            protected.add(Path(db_file_path).resolve())
-
-    return frozenset(protected)
+_WINDOWS_DISK_FULL_WINERRORS = frozenset({39, 112, 1816})
 
 
-def _paths_alias(resolved_a: Path, resolved_b: Path) -> bool:
-    """Return ``True`` when *a* is equal to or a child of *b*, or vice-versa."""
-    if resolved_a == resolved_b:
+class EvidenceStorageOperationalError(RuntimeError):
+    """Privacy-safe operational storage error carrying a stable reason code."""
+
+    reason_code: str = STORAGE_IO_UNAVAILABLE
+    retryable: bool = True
+    quarantine_eligible: bool = False
+    http_status: int = 503
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(message or self.reason_code)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "reasonCode": self.reason_code,
+            "retryable": self.retryable,
+            "quarantined": False,
+        }
+
+
+class StorageQuotaExhaustedError(EvidenceStorageOperationalError):
+    """Raised when disk free space or configured storage quota is exhausted."""
+
+    reason_code = STORAGE_QUOTA_EXHAUSTED
+    retryable = True
+    quarantine_eligible = False
+    http_status = 507
+
+
+class EvidenceCorruptionError(EvidenceStorageOperationalError):
+    """Raised when ciphertext authentication or canonical digest verification fails."""
+
+    reason_code = EVIDENCE_CORRUPTED
+    retryable = False
+    quarantine_eligible = True
+    http_status = 422
+
+
+class StorageIOUnavailableError(EvidenceStorageOperationalError):
+    """Raised on non-corruption, non-quota storage I/O failures."""
+
+    reason_code = STORAGE_IO_UNAVAILABLE
+    retryable = True
+    quarantine_eligible = False
+    http_status = 503
+
+
+def is_quota_or_capacity_error(exc: BaseException) -> bool:
+    """Return True when *exc* represents disk-full or storage quota exhaustion."""
+    if isinstance(exc, StorageQuotaExhaustedError):
         return True
-    try:
-        resolved_a.relative_to(resolved_b)
+    if not isinstance(exc, OSError):
+        return False
+    quota_errnos = {errno.ENOSPC}
+    edquot = getattr(errno, "EDQUOT", None)
+    if edquot is not None:
+        quota_errnos.add(edquot)
+    if exc.errno in quota_errnos:
         return True
-    except ValueError:
-        pass
-    try:
-        resolved_b.relative_to(resolved_a)
+    winerror = getattr(exc, "winerror", None)
+    if winerror in _WINDOWS_DISK_FULL_WINERRORS:
         return True
-    except ValueError:
-        pass
     return False
+
+
+def classify_storage_exception(exc: BaseException) -> EvidenceStorageOperationalError:
+    """Map low-level storage or crypto exceptions into stable operational reason codes."""
+    if isinstance(exc, EvidenceStorageOperationalError):
+        return exc
+    if type(exc).__name__ == "InvalidToken":
+        return EvidenceCorruptionError("evidence failed cryptographic authentication")
+    if is_quota_or_capacity_error(exc):
+        return StorageQuotaExhaustedError("storage capacity or quota exhausted")
+    if isinstance(exc, OSError):
+        return StorageIOUnavailableError("storage I/O unavailable")
+    return StorageIOUnavailableError("unexpected storage operational failure")
+
+
+def _positive_env_bytes(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        parsed = int(raw.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if parsed <= 0:
+        raise RuntimeError(f"{name} must be positive")
+    return parsed
+
+
+def directory_used_bytes(target_dir: Path) -> int:
+    if not target_dir.exists():
+        return 0
+    total = 0
+    for root, _dirs, files in os.walk(target_dir):
+        for name in files:
+            try:
+                total += (Path(root) / name).stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def check_storage_capacity(
+    target_dir: Path | str,
+    required_bytes: int,
+    *,
+    quota_bytes: int | None = None,
+    min_free_bytes: int | None = None,
+) -> None:
+    """Verify configured quota and filesystem free capacity before writing bytes."""
+    if required_bytes < 0:
+        raise ValueError("required_bytes must be non-negative")
+    directory = Path(target_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    effective_quota = (
+        quota_bytes
+        if quota_bytes is not None
+        else _positive_env_bytes("HARPOCRATES_STORAGE_QUOTA_BYTES")
+    )
+    if effective_quota is not None:
+        used = directory_used_bytes(directory)
+        if used + required_bytes > effective_quota:
+            raise StorageQuotaExhaustedError("configured storage byte quota exceeded")
+
+    effective_min_free = (
+        min_free_bytes
+        if min_free_bytes is not None
+        else (_positive_env_bytes("HARPOCRATES_STORAGE_MIN_FREE_BYTES") or 0)
+    )
+    try:
+        usage = shutil.disk_usage(directory)
+    except OSError as exc:
+        raise classify_storage_exception(exc) from exc
+    if usage.free < required_bytes + effective_min_free:
+        raise StorageQuotaExhaustedError("insufficient filesystem free capacity")
+
+
+def atomic_write_blob_bytes(
+    target_path: Path | str,
+    payload: bytes,
+    *,
+    quota_bytes: int | None = None,
+    min_free_bytes: int | None = None,
+) -> int:
+    """Write blob bytes atomically while preserving existing files on quota exhaustion."""
+    dest = Path(target_path)
+    parent = dest.parent
+    check_storage_capacity(
+        parent,
+        len(payload),
+        quota_bytes=quota_bytes,
+        min_free_bytes=min_free_bytes,
+    )
+    fd: int | None = None
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=str(parent), prefix=".blob_", suffix=".tmp")
+        handle = os.fdopen(fd, "wb")
+        fd = None
+        with handle:
+            handle.write(payload)
+            handle.flush()
+        if os.name == "posix":
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+        os.replace(tmp_path, dest)
+        tmp_path = None
+        return len(payload)
+    except BaseException as exc:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        if isinstance(exc, (OSError, EvidenceStorageOperationalError)):
+            raise classify_storage_exception(exc) from exc
+        raise
