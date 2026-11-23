@@ -517,28 +517,29 @@ export class CredentialVault {
   private inactivityTimeoutMs: number
   private storage: VaultStorage
 
-  constructor(
-    inactivityTimeoutMsOrOptions?: number | CredentialVaultOptions,
-    storage?: VaultStorage
-  ) {
-    if (typeof inactivityTimeoutMsOrOptions === 'object' && inactivityTimeoutMsOrOptions !== null) {
-      this.inactivityTimeoutMs = inactivityTimeoutMsOrOptions.inactivityTimeoutMs ?? DEFAULT_TIMEOUT_MS
-      this.storage = inactivityTimeoutMsOrOptions.storage ?? this.getDefaultStorage()
-    } else {
-      this.inactivityTimeoutMs = inactivityTimeoutMsOrOptions ?? DEFAULT_TIMEOUT_MS
-      this.storage = storage ?? this.getDefaultStorage()
-    }
-  }
+  private memoryKey: CryptoKey | null = null
+  private seeds: SeedPair | null = null
+  private timeoutId: ReturnType<typeof setTimeout> | null = null
+  private inactivityTimeoutMs: number
 
-  private getDefaultStorage(): VaultStorage {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      return window.localStorage
-    }
-    return createIsolatedStateContainer()
+  constructor(inactivityTimeoutMs = DEFAULT_TIMEOUT_MS) {
+    this.inactivityTimeoutMs = inactivityTimeoutMs;
+    // Listen for lock broadcasts from other tabs
+    VAULT_LOCK_CHANNEL.addEventListener('message', (e) => {
+      if (e.data === 'lock') {
+        // Perform lock without rebroadcast to avoid loops
+        this.memoryKey = null;
+        if (this.seeds) {
+          this.seeds.credentialSeed = '';
+          this.seeds.nullifierSeed = '';
+        }
+        this.seeds = null;
+        this.clearTimeout();
+      }
+    });
+    this.inactivityTimeoutMs = inactivityTimeoutMs;
   }
-
-  getStorage(): VaultStorage {
-    return this.storage
+    this.inactivityTimeoutMs = inactivityTimeoutMs
   }
 
   isLocked(): boolean {

@@ -340,9 +340,10 @@ export function useEvidence(): UseEvidenceReturn {
           (progress) => {
             if (!isCurrentFlow()) return
             setHashProgress(progress)
-            setMessage(
-              `Hashing video locally in the browser: ${progress.percentage}% (${progress.processedBytes.toLocaleString()} / ${progress.totalBytes.toLocaleString()} bytes).`,
-            )
+            if (progress.percentage !== lastAnnouncedPercentageRef.current) {
+              setMessage(`Hashing video locally in the browser: ${progress.percentage}% (${progress.processedBytes.toLocaleString()} / ${progress.totalBytes.toLocaleString()} bytes).`);
+              lastAnnouncedPercentageRef.current = progress.percentage;
+            }
           },
           controller.signal,
         )
