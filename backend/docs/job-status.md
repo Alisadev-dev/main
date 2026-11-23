@@ -38,22 +38,18 @@ like; the value is stored at most once per second per job
 (`JOB_PROGRESS_MIN_INTERVAL_SECONDS`), and only while the job is `running`.
 Heartbeats extend the lease only and never overwrite progress.
 
-## Worker recovery plan (read-only)
+## Cancellation vs. processing failure
 
-After an unclean shutdown, `build_recovery_plan()` (also exposed as
-`worker_recovery_plan`, `plan_recovery`, `get_recovery_plan`, ...) inspects the
-in-memory job queue and on-disk job artifacts and returns a read-only plan
-listing abandoned leases and partial artifacts with explicit uncertainty.
-It never mutates job state or deletes files. Each plan carries a bounded
-`actions` list (default 10, configurable via `max_actions`).
+Intentional cancellation (via `POST /api/jobs/<id>/cancel` or a worker raising
+`worker.JobCancelledError`) is kept distinct from processing failures:
 
-```python
-from worker import build_recovery_plan
-
-plan = build_recovery_plan(now=..., max_actions=5)
-assert plan["read_only"] is True
-assert len(plan["actions"]) <= 5
-```
+- `status` transitions to `"cancelled"` and `cancelled_at` is recorded.
+- `result` preserves a stable object for the requester:
+  `{"cancelled": true, "reason": "<reason>"}` (defaults to `"Job cancelled"`).
+- `retry_count` is **not** incremented, and cancelled jobs are never re-queued
+  for automatic failure retries.
+- Failure fields (`error`, `failed_at`) are not set, and late `complete_job` or
+  `fail_job` calls do not overwrite an already-cancelled job.
 
 ## What the response never contains
 
