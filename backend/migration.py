@@ -453,9 +453,12 @@ MIGRATIONS: list[Migration] = [
     ),
     Migration(
         id=13,
-        name="add envelope_version to blobs",
+        name="add ledger to proof_events for canonical chain ordering",
         sql="""
-        ALTER TABLE blobs ADD COLUMN IF NOT EXISTS envelope_version TEXT;
+        ALTER TABLE proof_events ADD COLUMN IF NOT EXISTS ledger BIGINT;
+        CREATE INDEX IF NOT EXISTS proof_events_ledger_event_index_idx
+            ON proof_events (ledger ASC NULLS LAST, event_index ASC NULLS LAST, tx_hash ASC)
+            WHERE ledger IS NOT NULL;
         """,
     ),
 ]
