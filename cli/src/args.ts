@@ -10,8 +10,10 @@ export type Command =
   | 'compare-receipt'
   | 'c2pa'
   | 'verify-lineage'
+  | 'verify-bundle'
+  | 'compare-trust-policy'
   | 'register'
-  | 'version'
+  | 'version' main
   | 'help'
 
 export interface ParsedArgs {
@@ -156,6 +158,15 @@ const COMMAND_OPTIONS: Record<Exclude<Command, 'help'>, OptionSet> = {
     output: alias('o'),
     debug: toggle,
   },
+  'compare-trust-policy': {
+    'policy-a': text,
+    policyA: text,
+    'policy-b': text,
+    policyB: text,
+    bundle: alias('b'),
+    output: alias('o'),
+    debug: toggle,
+  },
   version: {},
 }
 
@@ -195,6 +206,10 @@ const ENV_DEFAULTS: Partial<Record<Exclude<Command, 'help'>, { keys: string[]; e
     env: '',
   },
   version: {
+    keys: [],
+    env: '',
+  },
+  'compare-trust-policy': {
     keys: [],
     env: '',
   },
