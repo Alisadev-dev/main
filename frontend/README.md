@@ -89,34 +89,11 @@ Credential or nullifier seeds, proof witnesses, generated proofs, raw private
 inputs, and every other field are prohibited from both `localStorage` and
 `sessionStorage`. Keep secret proof-generation data in memory only.
 
-## Evidence Processing Review
+## Verification Export Preview
 
-Before submitting a proof to Stellar, Evidence Studio requires an explicit
-pre-registration review step (`openReview` / `EvidenceReviewSnapshot` in
-`src/hooks/useEvidence.ts`, rendered by `src/views/StudioView.tsx`):
+`src/views/VerifyView.tsx` provides an **Export Preview** for completed verification results, backed by `buildVerificationExportPreview` and `serializeVerificationExportPreview` in `src/services/verificationFlow.ts`.
 
-- Displays the selected **Identity Tier**, the canonical **Statement Digest**
-  (SHA-256 over the public registration statement, excluding private seeds and
-  raw media), and the target **Stellar Network** name and passphrase.
-- Automatically invalidates an active review whenever the source file, identity
-  tier, or Silent Witness proof parameters (`credentialSeed`, `nullifierSeed`)
-  change, requiring a fresh review before registration can proceed.
-- Enforces fail-closed registration in `registerProof`: submission is blocked
-  unless a valid review snapshot matching the current file and proof parameters
-  is active.
-
-## Verification Timeline Observations
-
-The verification portal (`src/views/VerifyView.tsx`, `src/components/VerificationTimeline.tsx`,
-and `src/services/verificationFlow.ts`) extends the 5-stage verification timeline
-with observation provenance without replacing the stage model:
-
-- **Observation source & ledger bounds**: Each stage labels its source
-  (`Local browser`, `Backend (NeonDB)`, or `Soroban Registry`) and displays
-  observed Stellar ledger sequence bounds and on-chain expiry bounds when
-  available (`evaluateVerificationObservations`, `formatLedgerBounds`).
-- **Stale evidence vs. source disagreements**: The timeline distinguishes
-  **Stale evidence** (expired Soroban ledger bounds or backend observations
-  older than `DEFAULT_OBSERVATION_STALE_MS`) from **Source disagreement**
-  (contradictory identity tiers, mismatched video hashes, revoked on-chain
-  records vs. active backend events, or metadata envelope mismatches).
+- **Included fields**: canonical, privacy-safe summary fields (`videoHash`, `proofId`, `metadataHash`, `mode`, `status`, `summary`, `errorCode`, `chainStatus`, `tier`, `eventCount`, `contractId`, `network`).
+- **Freshness**: captures `capturedAt`, `chainRecordCreatedAt`, `latestEventAt`, and freshness `state` (`fresh`, `stale`, or `unverified`).
+- **Unresolved checks**: explicitly lists any checks that were not resolved (for example offline mode, missing on-chain record, revoked/expired status, missing backend events, or missing identifiers).
+- **No silent refresh**: opening the preview freezes the reviewed snapshot (`trustContextRefreshedOnExport: false`), and downloading or copying JSON exports that exact snapshot without re-querying the backend or Soroban registry.

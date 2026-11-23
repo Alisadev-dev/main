@@ -159,11 +159,7 @@ export type UseEvidenceReturn = {
   openReview: () => Promise<void>
   closeReview: () => void
   handleEvidence: (nextFile: File | null) => Promise<void>
-  /** Retry evidence processing tied to the reviewed file identity. */
-  retryEvidence: () => Promise<void>
-  registerProof: (wallet: string) => Promise<void>
-  /** Re-validate the wallet network and selected evidence intent before allowing registration to resume. */
-  revalidateNetworkMismatch: (wallet: string) => Promise<boolean>
+  registerProof: (wallet: string, grantor?: string) => Promise<void>
   cancelEvidence: () => void
   /** Cancel an in-flight Silent Witness proof generation (no-op if idle). */
   cancelProving: () => void
@@ -599,24 +595,7 @@ export function useEvidence(): UseEvidenceReturn {
     }
   }
 
-  async function retryEvidence() {
-    const reviewed = reviewedFileRef.current
-    if (!reviewed || !reviewed.file) {
-      return
-    }
-    // Keep the retry action strictly tied to the reviewed file identity
-    if (
-      file &&
-      (file.name !== reviewed.name ||
-        file.size !== reviewed.size ||
-        file.lastModified !== reviewed.lastModified)
-    ) {
-      return
-    }
-    await handleEvidence(reviewed.file)
-  }
-
-  async function registerProof(wallet: string) {
+  async function registerProof(wallet: string, grantor?: string) {
     if (!proof) return
 
     const activeReview = reviewRef.current
@@ -705,7 +684,10 @@ export function useEvidence(): UseEvidenceReturn {
       return
     }
 
-    const registrationKey = `${proof.proofId}:${wallet}`
+    const effectiveGrantor = grantor?.trim() ? grantor.trim() : undefined
+    const registrationKey = effectiveGrantor
+      ? `${proof.proofId}:${wallet}:${effectiveGrantor}`
+      : `${proof.proofId}:${wallet}`
     if (completedRegistrationRef.current === registrationKey) {
       setMessage('This proof has already been submitted by this wallet.')
       return

@@ -1,168 +1,177 @@
 import { describe, expect, it } from 'vitest'
+import {
+  buildVerificationExportPreview,
+  evaluateVerificationFreshness,
+  serializeVerificationExportPreview,
+} from './verificationFlow'
 import type { ChainProofRecord } from '../stellarTypes'
 import type { ProofEvent } from '../types'
-import {
-  DEFAULT_OBSERVATION_STALE_MS,
-  evaluateVerificationObservations,
-  formatLedgerBounds,
-} from './verificationFlow'
 
-const NOW_MS = Date.parse('2026-06-01T12:00:00Z')
-const VIDEO_HASH = 'a'.repeat(64)
+const SAMPLE_HASH = 'a'.repeat(64)
+const SAMPLE_META_HASH = 'b'.repeat(64)
+const SAMPLE_PROOF_ID = 'c'.repeat(64)
+
+function makeChainProof(overrides: Partial<ChainProofRecord> = {}): ChainProofRecord {
+  return {
+    videoHash: SAMPLE_HASH,
+    metadataHash: SAMPLE_META_HASH,
+    tier: 1,
+    status: 1,
+    createdAt: '2026-11-19T12:00:00.000Z',
+    expiresAt: 0,
+    ...overrides,
+  }
+}
 
 function makeEvent(overrides: Partial<ProofEvent> = {}): ProofEvent {
   return {
     id: 1,
-    event_type: 'registered',
+    event_type: 'proof_registered',
     file_name: null,
-    video_hash: VIDEO_HASH,
-    proof_id: 'b'.repeat(64),
-    tier: 'silent',
-    created_at: '2026-06-01T11:00:00Z',
-    time_attestation: {
-      version: 1,
-      protocol: 'harpocrates-time',
-      evidenceDigest: VIDEO_HASH,
-      stellarAnchors: [
-        {
-          ledgerSequence: 1024,
-          ledgerTimestamp: Math.floor(NOW_MS / 1000) - 3600,
-          transactionHash: 'c'.repeat(64),
-          networkPassphrase: 'Test SDF Network ; September 2015',
-        },
-      ],
-      rfc3161Anchors: [],
-    },
+    video_hash: SAMPLE_HASH,
+    proof_id: SAMPLE_PROOF_ID,
+    tier: 'source',
+    tx_hash: 'tx123',
+    tx_status: 'confirmed',
+    created_at: '2026-11-19T12:01:00.000Z',
     ...overrides,
   }
 }
 
-function makeChainProof(overrides: Partial<ChainProofRecord> = {}): ChainProofRecord {
-  return {
-    videoHash: VIDEO_HASH,
-    metadataHash: 'd'.repeat(64),
-    tier: 1,
-    status: 1,
-    createdAt: '2026-06-01T11:00:00Z',
-    expiresAt: 0,
-    source: null,
-    issuer: null,
-    ...overrides,
-  }
-}
+describe('verificationFlow export preview', () => {
+  it('builds a complete snapshot with included fields, freshness, and zero unresolved checks for a confirmed online result', () => {
+    const capturedAt = '2026-11-19T12:05:00.000Z'
+    const now = new Date('2026-11-19T12:06:00.000Z')
 
-describe('evaluateVerificationObservations', () => {
-  it('marks fresh and matching backend + Soroban observations as aligned with ledger bounds', () => {
-    const result = evaluateVerificationObservations({
-      events: [
-        makeEvent(),
-        makeEvent({
-          id: 2,
-          time_attestation: {
-            version: 1,
-            protocol: 'harpocrates-time',
-            evidenceDigest: VIDEO_HASH,
-            stellarAnchors: [
-              {
-                ledgerSequence: 1050,
-                ledgerTimestamp: Math.floor(NOW_MS / 1000) - 1200,
-                transactionHash: 'e'.repeat(64),
-                networkPassphrase: 'Test SDF Network ; September 2015',
-              },
-            ],
-            rfc3161Anchors: [],
-          },
-        }),
-      ],
-      chainProof: makeChainProof(),
-      nowMs: NOW_MS,
-    })
-
-    expect(result.agreement).toBe('aligned')
-    expect(result.freshness).toBe('fresh')
-    expect(result.ledgerBounds.minLedger).toBe(1024)
-    expect(result.ledgerBounds.maxLedger).toBe(1050)
-    expect(result.ledgerBounds.expiresAt).toBe(0)
-    expect(formatLedgerBounds(result.ledgerBounds)).toBe('Ledgers #1024–#1050 · No expiry bound')
-  })
-
-  it('classifies expired chain ledger bounds as stale evidence rather than contradictory', () => {
-    const expiredUnix = Math.floor(NOW_MS / 1000) - 60
-    const result = evaluateVerificationObservations({
+    const preview = buildVerificationExportPreview({
+      videoHash: SAMPLE_HASH,
+      proofId: SAMPLE_PROOF_ID,
+      metadataHash: SAMPLE_META_HASH,
+      status: 'success',
+      summary: 'Confirmed: embedded Harpocrates metadata is corroborated by database and active chain records.',
+      errorCode: null,
+      offline: false,
       events: [makeEvent()],
-      chainProof: makeChainProof({ status: 3, expiresAt: expiredUnix }),
-      errorCode: 'EXPIRED_EVIDENCE',
-      nowMs: NOW_MS,
-    })
-
-    expect(result.agreement).toBe('stale')
-    expect(result.freshness).toBe('stale')
-    expect(result.disagreementReasons).toHaveLength(0)
-    expect(result.staleReasons.length).toBeGreaterThan(0)
-    expect(result.sources.soroban.freshness).toBe('stale')
-  })
-
-  it('classifies backend observations older than the freshness window as stale evidence', () => {
-    const oldTimestamp = new Date(NOW_MS - DEFAULT_OBSERVATION_STALE_MS - 60_000).toISOString()
-    const result = evaluateVerificationObservations({
-      events: [makeEvent({ created_at: oldTimestamp })],
       chainProof: makeChainProof(),
-      nowMs: NOW_MS,
+      contractId: 'CDUMMYCONTRACTID',
+      network: 'Test SDF Future Network ; October 2022',
+      capturedAt,
+      now,
     })
 
-    expect(result.agreement).toBe('stale')
-    expect(result.freshness).toBe('stale')
-    expect(result.sources.backend.freshness).toBe('stale')
-    expect(result.sources.soroban.freshness).toBe('fresh')
-  })
-
-  it('distinguishes contradictory tier observations from stale evidence', () => {
-    const result = evaluateVerificationObservations({
-      events: [makeEvent({ tier: 'seal' })],
-      chainProof: makeChainProof({ tier: 1 }),
-      nowMs: NOW_MS,
+    expect(preview.schema).toBe('harpocrates-verification-export-preview')
+    expect(preview.version).toBe(1)
+    expect(preview.trustContextRefreshedOnExport).toBe(false)
+    expect(preview.includedFields).toEqual({
+      videoHash: SAMPLE_HASH,
+      proofId: SAMPLE_PROOF_ID,
+      metadataHash: SAMPLE_META_HASH,
+      mode: 'online',
+      status: 'success',
+      summary: 'Confirmed: embedded Harpocrates metadata is corroborated by database and active chain records.',
+      errorCode: null,
+      chainStatus: 'confirmed',
+      tier: 'source',
+      eventCount: 1,
+      contractId: 'CDUMMYCONTRACTID',
+      network: 'Test SDF Future Network ; October 2022',
     })
+    expect(preview.freshness.state).toBe('fresh')
+    expect(preview.freshness.capturedAt).toBe(capturedAt)
+    expect(preview.freshness.chainRecordCreatedAt).toBe('2026-11-19T12:00:00.000Z')
+    expect(preview.freshness.latestEventAt).toBe('2026-11-19T12:01:00.000Z')
+    expect(preview.unresolvedChecks).toEqual([])
 
-    expect(result.agreement).toBe('contradictory')
-    expect(result.disagreementReasons).toContain(
-      'Backend tier observation disagrees with the Soroban registry tier.',
-    )
+    const serialized = serializeVerificationExportPreview(preview)
+    expect(JSON.parse(serialized)).toEqual(preview)
   })
 
-  it('flags revoked Soroban status vs active backend events as contradictory', () => {
-    const result = evaluateVerificationObservations({
-      events: [makeEvent({ event_type: 'registered' })],
-      chainProof: makeChainProof({ status: 2 }),
-      errorCode: 'REVOKED_EVIDENCE',
-      nowMs: NOW_MS,
-    })
+  it('marks freshness as stale once elapsed time exceeds maxAgeMs', () => {
+    const capturedAt = '2026-11-19T12:00:00.000Z'
+    const freshNow = new Date('2026-11-19T12:05:00.000Z')
+    const staleNow = new Date('2026-11-19T12:05:00.001Z')
 
-    expect(result.agreement).toBe('contradictory')
-    expect(result.disagreementReasons[0]).toMatch(/revoked status/i)
+    expect(evaluateVerificationFreshness(capturedAt, freshNow, 5 * 60 * 1000, false)).toBe('fresh')
+    expect(evaluateVerificationFreshness(capturedAt, staleNow, 5 * 60 * 1000, false)).toBe('stale')
+    expect(evaluateVerificationFreshness(capturedAt, freshNow, 5 * 60 * 1000, true)).toBe('unverified')
   })
 
-  it('flags metadata envelope mismatch as contradictory even without backend events', () => {
-    const result = evaluateVerificationObservations({
-      events: [],
-      chainProof: makeChainProof(),
-      errorCode: 'METADATA_ENVELOPE_MISMATCH',
-      nowMs: NOW_MS,
-    })
-
-    expect(result.agreement).toBe('contradictory')
-    expect(result.disagreementReasons[0]).toMatch(/contradicts the on-chain envelope/i)
-  })
-
-  it('reports incomplete observations in offline mode without fabricating ledger bounds', () => {
-    const result = evaluateVerificationObservations({
+  it('reports unresolved checks for offline mode and missing identifiers', () => {
+    const preview = buildVerificationExportPreview({
+      videoHash: SAMPLE_HASH,
+      status: 'success',
+      summary: 'Locally verified: the artifact carries a valid Harpocrates metadata envelope.',
+      offline: true,
       events: [],
       chainProof: null,
-      offline: true,
-      nowMs: NOW_MS,
+      network: 'Test SDF Future Network ; October 2022',
+      now: new Date('2026-11-19T12:05:00.000Z'),
     })
 
-    expect(result.agreement).toBe('incomplete')
-    expect(result.freshness).toBe('unknown')
-    expect(formatLedgerBounds(result.ledgerBounds)).toBe('Ledger bounds unavailable')
+    expect(preview.includedFields.mode).toBe('offline')
+    expect(preview.includedFields.chainStatus).toBe('not_checked')
+    expect(preview.freshness.state).toBe('unverified')
+    expect(preview.unresolvedChecks).toEqual([
+      'On-chain Soroban registry status was not checked (offline mode).',
+      'Backend NeonDB event feed was not queried (offline mode).',
+      'Proof ID could not be resolved.',
+      'Metadata hash could not be resolved.',
+    ])
+  })
+
+  it('reports revoked chain status and error code as unresolved checks', () => {
+    const preview = buildVerificationExportPreview({
+      videoHash: SAMPLE_HASH,
+      status: 'error',
+      summary: 'Revoked: the chain record for this artifact has been revoked.',
+      errorCode: 'REVOKED_EVIDENCE',
+      offline: false,
+      events: [makeEvent()],
+      chainProof: makeChainProof({ status: 2 }),
+      network: 'Test SDF Future Network ; October 2022',
+      now: new Date('2026-11-19T12:05:00.000Z'),
+    })
+
+    expect(preview.includedFields.chainStatus).toBe('revoked')
+    expect(preview.unresolvedChecks).toContain('On-chain proof record is revoked.')
+    expect(preview.unresolvedChecks).toContain('Verification ended with error code: REVOKED_EVIDENCE.')
+  })
+
+  it('fails closed when verification is idle, in progress, or empty', () => {
+    expect(() =>
+      buildVerificationExportPreview({
+        videoHash: SAMPLE_HASH,
+        status: 'idle',
+        summary: 'No verification run yet.',
+        offline: false,
+        events: [],
+        chainProof: null,
+        network: 'Test SDF Future Network ; October 2022',
+      }),
+    ).toThrow(/idle or in progress/i)
+
+    expect(() =>
+      buildVerificationExportPreview({
+        videoHash: SAMPLE_HASH,
+        status: 'verifying',
+        summary: 'Inspecting evidence…',
+        offline: false,
+        events: [],
+        chainProof: null,
+        network: 'Test SDF Future Network ; October 2022',
+      }),
+    ).toThrow(/idle or in progress/i)
+
+    expect(() =>
+      buildVerificationExportPreview({
+        videoHash: '',
+        status: 'success',
+        summary: '',
+        offline: false,
+        events: [],
+        chainProof: null,
+        network: 'Test SDF Future Network ; October 2022',
+      }),
+    ).toThrow(/without a reviewed verification result/i)
   })
 })
