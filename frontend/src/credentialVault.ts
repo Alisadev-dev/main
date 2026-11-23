@@ -393,108 +393,18 @@ async function deriveKey(
   )
 }
 
-async function decryptEnvelopeIsolated(
-  envelope: VaultEnvelope,
-  password: string
-): Promise<{ key: CryptoKey; seeds: SeedPair }> {
-  const salt = hexToBuf(envelope.salt)
-  const iv = hexToBuf(envelope.iv)
-  const ct = hexToBuf(envelope.ct)
-  const iterations = envelope.v === VAULT_VERSION ? envelope.iterations : PBKDF2_ITERATIONS
-
-  let key: CryptoKey
-  let pt: ArrayBuffer
-  try {
-    key = await deriveKey(password, salt as unknown as ArrayBuffer, iterations)
-    const algorithm: AesGcmParams =
-      envelope.v === VAULT_VERSION
-        ? {
-            name: 'AES-GCM',
-            iv: iv as unknown as ArrayBuffer,
-            additionalData: v2AdditionalData() as unknown as ArrayBuffer,
-          }
-        : {
-            name: 'AES-GCM',
-            iv: iv as unknown as ArrayBuffer,
-          }
-    pt = await crypto.subtle.decrypt(algorithm, key, ct as unknown as ArrayBuffer)
-  } catch {
-    throw new VaultDecryptionError()
-  }
-
-  let parsedPayload: unknown
-  try {
-    const dec = new TextDecoder()
-    parsedPayload = JSON.parse(dec.decode(pt))
-  } catch {
-    throw new VaultValidationError('Vault payload is not valid JSON')
-  }
-
-  const seeds = validateSeedPair(parsedPayload)
-  return { key, seeds }
-}
-
-async function encryptEnvelopeV2(
-  password: string,
-  seeds: SeedPair
-): Promise<{ key: CryptoKey; envelope: VaultEnvelopeV2; serialized: string }> {
-  const validated = validateSeedPair(seeds)
-  const salt = crypto.getRandomValues(new Uint8Array(16))
-  const key = await deriveKey(password, salt as unknown as ArrayBuffer, PBKDF2_ITERATIONS)
-
-  const iv = crypto.getRandomValues(new Uint8Array(12))
-  const enc = new TextEncoder()
-  const pt = enc.encode(JSON.stringify(validated))
-
-  const ct = await crypto.subtle.encrypt(
-    {
-      name: 'AES-GCM',
-      iv: iv as unknown as ArrayBuffer,
-      additionalData: v2AdditionalData() as unknown as ArrayBuffer,
-    },
-    key,
-    pt
-  )
-
-  const envelope: VaultEnvelopeV2 = {
-    v: VAULT_VERSION,
-    kdf: 'PBKDF2-SHA256',
-    iterations: PBKDF2_ITERATIONS,
-    cipher: 'AES-GCM-256',
-    salt: bufToHex(salt as unknown as ArrayBuffer),
-    iv: bufToHex(iv as unknown as ArrayBuffer),
-    ct: bufToHex(ct),
-  }
-
-  return {
-    key,
-    envelope,
-    serialized: JSON.stringify(envelope),
+export class StorageUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StorageUnavailableError';
   }
 }
 
-async function verifyStagedEnvelope(
-  serialized: string,
-  password: string,
-  expectedSeeds: SeedPair
-): Promise<void> {
-  const stagedEnvelope = parseEnvelope(serialized)
-  if (stagedEnvelope.v !== VAULT_VERSION) {
-    throw new VaultMigrationError(`Expected staged vault version ${VAULT_VERSION}, got ${stagedEnvelope.v}`)
-  }
+// BroadcastChannel for vault lock events
+export const VAULT_LOCK_CHANNEL = new BroadcastChannel('credential-vault-lock');
 
-  const verified = await decryptEnvelopeIsolated(stagedEnvelope, password)
-  try {
-    if (
-      verified.seeds.credentialSeed !== expectedSeeds.credentialSeed ||
-      verified.seeds.nullifierSeed !== expectedSeeds.nullifierSeed
-    ) {
-      throw new VaultMigrationError('Staged vault envelope failed round-trip verification')
-    }
-  } finally {
-    zeroSeeds(verified.seeds)
-  }
-}
+// BroadcastChannel for vault lock events
+export const VAULT_LOCK_CHANNEL = new BroadcastChannel('credential-vault-lock');
 
 export class CredentialVault {
   private memoryKey: CryptoKey | null = null
@@ -503,14 +413,29 @@ export class CredentialVault {
   private inactivityTimeoutMs: number
   private storage: SafeStorageLike
 
-  constructor(optionsOrTimeout: number | CredentialVaultOptions = DEFAULT_TIMEOUT_MS) {
-    if (typeof optionsOrTimeout === 'number') {
-      this.inactivityTimeoutMs = optionsOrTimeout
-      this.storage = safeLocalStorage
-    } else {
-      this.inactivityTimeoutMs = optionsOrTimeout.inactivityTimeoutMs ?? DEFAULT_TIMEOUT_MS
-      this.storage = optionsOrTimeout.storage ?? safeLocalStorage
-    }
+  private memoryKey: CryptoKey | null = null
+  private seeds: SeedPair | null = null
+  private timeoutId: ReturnType<typeof setTimeout> | null = null
+  private inactivityTimeoutMs: number
+
+  constructor(inactivityTimeoutMs = DEFAULT_TIMEOUT_MS) {
+    this.inactivityTimeoutMs = inactivityTimeoutMs;
+    // Listen for lock broadcasts from other tabs
+    VAULT_LOCK_CHANNEL.addEventListener('message', (e) => {
+      if (e.data === 'lock') {
+        // Perform lock without rebroadcast to avoid loops
+        this.memoryKey = null;
+        if (this.seeds) {
+          this.seeds.credentialSeed = '';
+          this.seeds.nullifierSeed = '';
+        }
+        this.seeds = null;
+        this.clearTimeout();
+      }
+    });
+    this.inactivityTimeoutMs = inactivityTimeoutMs;
+  }
+    this.inactivityTimeoutMs = inactivityTimeoutMs
   }
 
   isLocked(): boolean {
@@ -646,6 +571,21 @@ export class CredentialVault {
   }
 
   lock(): void {
+    // Broadcast lock event to other tabs
+    try {
+      VAULT_LOCK_CHANNEL.postMessage('lock');
+    } catch (e) {
+      // ignore if broadcast fails
+    }
+    this.memoryKey = null;
+    // Zero out references
+    if (this.seeds) {
+      this.seeds.credentialSeed = '';
+      this.seeds.nullifierSeed = '';
+    }
+    this.seeds = null;
+    this.clearTimeout();
+  }
     this.memoryKey = null
     zeroSeeds(this.seeds)
     this.seeds = null
