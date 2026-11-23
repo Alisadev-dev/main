@@ -102,6 +102,15 @@ class BuildError(RuntimeError):
     """Fatal, non-recoverable condition. Carries no artifact content."""
 
 
+class ArtifactPathEscapeError(BuildError):
+    """A declared artifact path resolves outside the selected release directory.
+
+    The message carries only the repo-relative *declared* path and the
+    containing root — never the absolute host path — so the error is safe to
+    surface in CI logs.
+    """
+
+
 class ManifestVerificationError(BuildError):
     """Signature verification failed or required fields are missing.
 
@@ -315,6 +324,29 @@ def _rel(path: Path, root: Path = REPO_ROOT) -> str:
         return path.name
 
 
+def resolve_within_root(declared: str, root: Path) -> Path:
+    """Resolve *declared* against *root* and require the result to stay inside.
+
+    Aliases (``..`` segments and symlinks) are resolved first, then the result
+    is required to live under the resolved *root*. On any escape the helper
+    raises :class:`ArtifactPathEscapeError` naming only the declared path and
+    the root name — never the absolute host path.
+    """
+    try:
+        root_resolved = root.resolve()
+        resolved = (root_resolved / declared).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ArtifactPathEscapeError(
+            f"artifact path {declared!r} cannot be resolved: {type(exc).__name__}"
+        ) from exc
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        raise ArtifactPathEscapeError(
+            f"artifact path {declared!r} resolves outside the release directory "
+            f"{root.name!r}; refusing to read it"
+        )
+    return resolved
+
+
 @dataclass
 class ArtifactResult:
     path: str
@@ -361,7 +393,7 @@ def digest_artifact(declaration: dict, lock: Lock, root: Path) -> ArtifactResult
     kind = declaration["kind"]
     role = declaration.get("role", "unknown")
     required = bool(declaration.get("required", False))
-    target = root / relative
+    target = resolve_within_root(relative, root)
 
     result = ArtifactResult(path=relative, kind=kind, role=role, state=ArtifactState.MISSING)
 
@@ -370,6 +402,7 @@ def digest_artifact(declaration: dict, lock: Lock, root: Path) -> ArtifactResult
         signal("artifact.state", path=relative, state=result.state, required=required)
         return result
 
+    # Use the resolved path for subsequent filesystem operations.
     size = target.stat().st_size
     if size > lock.limits.max_artifact_bytes:
         result.state = ArtifactState.OVERSIZE
@@ -1047,11 +1080,6 @@ def compare_published_to_targets(lock: Lock, root: Path) -> list[str]:
     for declaration in published_acir_declarations(lock):
         published_path = declaration["path"]
         target_path = published_to_build_target(published_path)
-        published = root / published_path
-        target = root / target_path
-        if not published.is_file() or not target.is_file():
-            continue
-
         published_decl = {
             "path": published_path,
             "kind": declaration.get("kind", "json"),
@@ -1066,6 +1094,12 @@ def compare_published_to_targets(lock: Lock, root: Path) -> list[str]:
         }
         published_result = digest_artifact(published_decl, lock, root)
         target_result = digest_artifact(target_decl, lock, root)
+
+        # Missing files are not drift: either side may await a later publish.
+        if published_result.state in (ArtifactState.MISSING, ArtifactState.SKIPPED):
+            continue
+        if target_result.state in (ArtifactState.MISSING, ArtifactState.SKIPPED):
+            continue
 
         if published_result.state != ArtifactState.DIGESTED:
             findings.append(
