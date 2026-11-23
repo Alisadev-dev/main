@@ -104,10 +104,6 @@ def _reset_stego_pool() -> None:
         pool.shutdown(wait=False, cancel_futures=True)
 
 
-class StegoLimitExceededError(Exception):
-    """Raised when stego processing exceeds memory or CPU limits."""
-
-
 @dataclass(frozen=True)
 class VideoInfo:
     width: int

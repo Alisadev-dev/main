@@ -1,22 +1,20 @@
-export const PROOF_WORKER_PROTOCOL_VERSION = 1 as const;
+export interface WorkerOwnershipToken {
+  /** Monotonic generation of the worker/operation epoch. */
+  generation: number;
+  /** Unique operation identifier owned by this generation. */
+  operationId: string;
+}
 
-export type ProofWorkerProtocolVersion = typeof PROOF_WORKER_PROTOCOL_VERSION;
+export interface StaleMessageRejection {
+  accepted: false;
+  reason: 'stale_generation' | 'cancelled' | 'unowned_operation' | 'not_initialized';
+  expectedGeneration: number;
+  receivedGeneration?: number;
+}
 
-export type WorkerProtocolVersionCheckResult =
-  | {
-      readonly compatible: true;
-      readonly protocolVersion: number;
-      readonly reloadRequired: false;
-    }
-  | {
-      readonly compatible: false;
-      readonly code: 'PROTOCOL_VERSION_MISMATCH';
-      readonly expectedVersion: number;
-      readonly receivedVersion: number | null;
-      readonly reloadRequired: true;
-      readonly message: string;
-      readonly privacySafe: true;
-    };
+export type WorkerMessageDispatchResult =
+  | { accepted: true; generation: number; operationId: string }
+  | StaleMessageRejection;
 
 export interface ProofWorkerMessage {
   protocolVersion?: number;
@@ -29,16 +27,19 @@ export interface ProofWorkerMessage {
     timeout?: number;
   };
   id?: string;
+  generation?: number;
 }
 
 export interface ProofWorkerResponse {
-  protocolVersion?: number;
-  type: 'success' | 'error' | 'status';
+  type: 'success' | 'error' | 'status' | 'progress';
   id?: string;
+  generation?: number;
   data?: {
     valid?: boolean;
     result?: unknown;
     message?: string;
+    stage?: string;
+    percent?: number;
   };
   error?: {
     code: string;

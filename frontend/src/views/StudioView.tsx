@@ -29,81 +29,6 @@ import {
 const CONTRACT_ID = import.meta.env.VITE_HARPOCRATES_REGISTRY_ID ?? ''
 const STELLAR_STRKEY = /^[GC][A-Z2-7]{55}$/
 
-// ---------------------------------------------------------------------------
-// RecoveryBanner – persists interrupted-upload choices across navigation
-// ---------------------------------------------------------------------------
-
-type RecoveryBannerProps = {
-  session: InterruptedUploadSession
-  onResume: () => void
-  onDiscard: () => void
-}
-
-/**
- * Shown when the user returns to the studio after an interrupted upload.
- * The banner survives navigation because useEvidence lives in App, not in
- * StudioView — the hook's state is never torn down when the view unmounts.
- *
- * Recovery choices:
- *   resumable      → Resume + Discard buttons
- *   source-changed → Discard only (auto-retry would use the wrong source hash)
- *   expired        → Start over only (timestamp would be too old)
- *   unrecoverable  → Start over only (server rejected the payload)
- */
-function RecoveryBanner({ session, onResume, onDiscard }: RecoveryBannerProps) {
-  if (session.category === 'none') return null
-
-  const label = RECOVERY_CATEGORY_LABELS[session.category]
-  const description = RECOVERY_CATEGORY_DESCRIPTIONS[session.category]
-  const isResumable = session.category === 'resumable'
-
-  return (
-    <div
-      className="recovery-banner"
-      role="region"
-      aria-label="Interrupted upload recovery"
-      aria-live="polite"
-      aria-atomic="true"
-    >
-      <div className="recovery-banner__content">
-        <strong className="recovery-banner__heading">{label}</strong>
-        {session.fileName ? (
-          <span className="recovery-banner__filename" aria-label={`File: ${session.fileName}`}>
-            {session.fileName}
-          </span>
-        ) : null}
-        <p className="recovery-banner__description">{description}</p>
-      </div>
-      <div className="recovery-banner__actions" role="group" aria-label="Recovery actions">
-        {isResumable ? (
-          <button
-            type="button"
-            className="recovery-banner__resume"
-            onClick={onResume}
-            aria-label={`Resume upload${session.fileName ? ` of ${session.fileName}` : ''}`}
-          >
-            <RefreshCw size={14} aria-hidden="true" />
-            Resume
-          </button>
-        ) : null}
-        <button
-          type="button"
-          className="recovery-banner__discard"
-          onClick={onDiscard}
-          aria-label="Discard interrupted session and start over"
-        >
-          <Trash2 size={14} aria-hidden="true" />
-          {isResumable ? 'Discard' : 'Start over'}
-        </button>
-      </div>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// StudioView
-// ---------------------------------------------------------------------------
-
 type Props = {
   wallet: string
   evidence: UseEvidenceReturn
@@ -226,6 +151,89 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
     }
     void verifyEvidence(nextFile, wallet || undefined)
   }
+
+  const [grantorAddress, setGrantorAddress] = useState('')
+  const [delegationStatus, setDelegationStatus] = useState<
+    'idle' | 'checking' | 'active' | 'expired' | 'wrong_scope' | 'missing' | 'invalid_address' | 'self_delegation' | 'error'
+  >('idle')
+  const [delegationExpiry, setDelegationExpiry] = useState<number | null>(null)
+  const [delegationError, setDelegationError] = useState<string | null>(null)
+
+  const trimmedGrantor = grantorAddress.trim()
+
+  useEffect(() => {
+    if (selectedTier === 'silent' || !trimmedGrantor) {
+      setDelegationStatus('idle')
+      setDelegationExpiry(null)
+      setDelegationError(null)
+      return
+    }
+
+    if (!STELLAR_STRKEY.test(trimmedGrantor)) {
+      setDelegationStatus('invalid_address')
+      setDelegationExpiry(null)
+      setDelegationError('Grantor address must be a valid 56-character Stellar address (starting with G or C).')
+      return
+    }
+
+    if (wallet && trimmedGrantor.toUpperCase() === wallet.toUpperCase()) {
+      setDelegationStatus('self_delegation')
+      setDelegationExpiry(null)
+      setDelegationError('Grantor cannot be your own wallet address. Use direct registration instead.')
+      return
+    }
+
+    let isMounted = true
+    const requiredScope =
+      selectedTier === 'seal'
+        ? DELEGATION_SCOPE_REGISTER_SEAL
+        : DELEGATION_SCOPE_REGISTER_SOURCE
+
+    setDelegationStatus('checking')
+    setDelegationError(null)
+
+    async function checkDelegation() {
+      try {
+        const [active, record] = await Promise.all([
+          isDelegationActive(CONTRACT_ID, trimmedGrantor, wallet, requiredScope),
+          getDelegation(CONTRACT_ID, trimmedGrantor, wallet),
+        ])
+
+        if (!isMounted) return
+
+        if (!record) {
+          setDelegationStatus('missing')
+          setDelegationExpiry(null)
+          return
+        }
+
+        setDelegationExpiry(record.expiresAt)
+
+        if (active) {
+          setDelegationStatus('active')
+        } else {
+          const nowSeconds = Math.floor(Date.now() / 1000)
+          if (record.expiresAt <= nowSeconds) {
+            setDelegationStatus('expired')
+          } else if ((record.scope & requiredScope) !== requiredScope) {
+            setDelegationStatus('wrong_scope')
+          } else {
+            setDelegationStatus('missing')
+          }
+        }
+      } catch (err) {
+        if (!isMounted) return
+        setDelegationStatus('error')
+        setDelegationError(err instanceof Error ? err.message : 'Error checking delegation.')
+      }
+    }
+
+    void checkDelegation()
+
+    return () => {
+      isMounted = false
+    }
+  }, [trimmedGrantor, wallet, selectedTier])
 
   const [grantorAddress, setGrantorAddress] = useState('')
   const [delegationStatus, setDelegationStatus] = useState<
@@ -585,20 +593,6 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
             ) : null}
           </div>
         )}
-
-        {stage === 'error' ? (
-          <div className="verify-actions" role="group" aria-label="Evidence studio error actions">
-            <button
-              type="button"
-              className="hero-secondary retry-action-btn"
-              onClick={() => void retryEvidence()}
-              aria-label="Retry evidence processing"
-            >
-              <RotateCcw size={14} aria-hidden="true" />
-              Retry evidence processing
-            </button>
-          </div>
-        ) : null}
 
         {isCancellable ? (
           <div className="verify-actions" role="group" aria-label="Evidence studio actions">

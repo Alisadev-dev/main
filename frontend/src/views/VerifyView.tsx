@@ -227,67 +227,6 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
     }
   }
 
-  const currentContext = useMemo<VerificationContextIdentity>(() => ({
-    statement: {
-      videoHash: (videoHashInput || verifyHash).trim(),
-      proofId: proofIdInput.trim() || null,
-      metadataHash: chainProof?.metadataHash ?? provenanceRecord?.metadata.metadataHash ?? null,
-    },
-    trustSnapshot: {
-      network: provenanceRecord?.network.passphrase || CONTRACT_NETWORK_PASSPHRASE,
-      contractId: CONTRACT_ID,
-      offline,
-      networkMismatch: networkMismatch ?? null,
-    },
-  }), [
-    videoHashInput,
-    verifyHash,
-    proofIdInput,
-    chainProof?.metadataHash,
-    provenanceRecord?.metadata.metadataHash,
-    provenanceRecord?.network.passphrase,
-    offline,
-    networkMismatch,
-  ])
-
-  const resultSignature =
-    status === 'success' && verifyResult ? `${status}:${verifyHash}:${verifyResult}` : null
-
-  const [boundSuccess, setBoundSuccess] = useState<{
-    signature: string | null
-    entry: CachedVerificationEntry<string> | null
-  }>(() => ({
-    signature: resultSignature,
-    entry:
-      resultSignature && !networkMismatch
-        ? createCachedVerificationEntry(currentContext, verifyResult)
-        : null,
-  }))
-
-  if (boundSuccess.signature !== resultSignature) {
-    setBoundSuccess({
-      signature: resultSignature,
-      entry:
-        resultSignature && !networkMismatch
-          ? createCachedVerificationEntry(currentContext, verifyResult)
-          : null,
-    })
-  }
-
-  const cachedSuccess = boundSuccess.entry
-
-  const cacheResolution = useMemo(
-    () => resolveCachedVerificationResult(cachedSuccess, currentContext),
-    [cachedSuccess, currentContext],
-  )
-  const isStaleSuccess = status === 'success' && !cacheResolution.usable
-  const effectiveStatus = isStaleSuccess ? 'idle' : status
-  const staleResultMessage = isStaleSuccess
-    ? cacheResolution.reason === 'NETWORK_MISMATCH'
-      ? 'Verification context mismatch: resolve the network mismatch and run a fresh verification.'
-      : 'Verification context changed. Run a fresh verification to confirm this artifact.'
-    : null
-
   const shareLinkInput = useMemo((): VerificationShareLinkInput | null => {
     const activeHash = statementIdentity.statementDigest || videoHashInput || verifyHash
     if (status !== 'success' || !activeHash || !CONTRACT_ID) return null
