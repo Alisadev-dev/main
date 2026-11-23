@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import type { BatchItemResult } from './batchVerifier'
+import {
+  BatchCheckpointError,
+  type BatchItemResult,
+  type BatchVerificationCheckpoint,
+} from './batchVerifier'
 import {
   BATCH_COMPARISON_PROTOCOL,
   BATCH_COMPARISON_VERSION,
@@ -8,10 +12,10 @@ import {
   compareBatchManifests,
   deriveStatementIdentity,
   exportBatchCSV,
-  exportBatchComparisonJSON,
+  exportBatchCheckpoint,
   exportBatchJSON,
   exportReceiptCollection,
-  parseBatchResultManifest,
+  parseBatchCheckpoint,
   sanitizeBatchResults,
   type BatchResultManifest,
   type CleanBatchReportItem,
