@@ -23,11 +23,38 @@ import {
   getOnChainProof,
 } from './verificationService'
 
-export type VerificationFlowOptions = {
-  signal?: AbortSignal
-  sourceAddress?: string
-  /** Optional monotonic request revision bound to the returned result. */
-  revision?: number
+export type ObservationSource = 'local' | 'backend' | 'soroban'
+
+export type ObservationFreshness = 'fresh' | 'stale' | 'unknown'
+
+export type SourceAgreement = 'aligned' | 'stale' | 'contradictory' | 'incomplete'
+
+export type LedgerBounds = {
+  minLedger: number | null
+  maxLedger: number | null
+  expiresAt: number | null
+  observedAt: string | null
+}
+
+export type SourceObservation = {
+  source: ObservationSource
+  label: string
+  freshness: ObservationFreshness
+  ledgerBounds: LedgerBounds
+  detail: string
+}
+
+export type ObservationDiagnostics = {
+  agreement: SourceAgreement
+  freshness: ObservationFreshness
+  summary: string
+  ledgerBounds: LedgerBounds
+  disagreementReasons: string[]
+  staleReasons: string[]
+  sources: {
+    backend: SourceObservation
+    soroban: SourceObservation
+  }
 }
 
 export type VerificationResult = {
@@ -35,153 +62,229 @@ export type VerificationResult = {
   hasHarpocratesMetadata: boolean
   events: ProofEvent[]
   onChain: ChainProofRecord | null
-  /** Request revision supplied by the caller, when revision-bound. */
-  revision?: number
+  observations?: ObservationDiagnostics
+}
+
+/** Default threshold (24 hours) after which backend observations are marked stale. */
+export const DEFAULT_OBSERVATION_STALE_MS = 24 * 60 * 60 * 1000
+
+const CHAIN_TIER_MAP: Record<number, string> = {
+  1: 'silent',
+  2: 'source',
+  3: 'seal',
+}
+
+function normaliseToken(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim().toLowerCase()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+function extractLedgerBoundsFromEvents(events: ProofEvent[]): LedgerBounds {
+  let minLedger: number | null = null
+  let maxLedger: number | null = null
+  let latestMs: number | null = null
+  let observedAt: string | null = null
+
+  for (const event of events) {
+    const anchors = event.time_attestation?.stellarAnchors ?? []
+    for (const anchor of anchors) {
+      if (Number.isSafeInteger(anchor.ledgerSequence) && anchor.ledgerSequence > 0) {
+        minLedger = minLedger === null ? anchor.ledgerSequence : Math.min(minLedger, anchor.ledgerSequence)
+        maxLedger = maxLedger === null ? anchor.ledgerSequence : Math.max(maxLedger, anchor.ledgerSequence)
+      }
+    }
+    const parsed = Date.parse(event.created_at)
+    if (!Number.isNaN(parsed) && (latestMs === null || parsed > latestMs)) {
+      latestMs = parsed
+      observedAt = event.created_at
+    }
+  }
+
+  return {
+    minLedger,
+    maxLedger,
+    expiresAt: null,
+    observedAt,
+  }
+}
+
+export function formatLedgerBounds(bounds: LedgerBounds): string {
+  const parts: string[] = []
+  if (bounds.minLedger !== null && bounds.maxLedger !== null) {
+    parts.push(
+      bounds.minLedger === bounds.maxLedger
+        ? `Ledger #${bounds.minLedger}`
+        : `Ledgers #${bounds.minLedger}–#${bounds.maxLedger}`,
+    )
+  }
+  if (bounds.expiresAt !== null) {
+    if (bounds.expiresAt === 0) {
+      parts.push('No expiry bound')
+    } else if (Number.isSafeInteger(bounds.expiresAt) && bounds.expiresAt > 0) {
+      parts.push(`Expires ${new Date(bounds.expiresAt * 1000).toISOString().slice(0, 10)}`)
+    }
+  }
+  return parts.length > 0 ? parts.join(' · ') : 'Ledger bounds unavailable'
 }
 
 /**
- * Tracks monotonically increasing verification request revisions so late
- * asynchronous results from cancelled or superseded selections can be ignored.
+ * Evaluate observation freshness, ledger bounds, and source disagreements
+ * across backend (NeonDB) events and Soroban on-chain records.
  */
-export type VerificationRevisionGuard = {
-  /** Advance to a new active revision and return its identifier. */
-  next: () => number
-  /** Invalidate any in-flight revision (e.g. on cancel or clear) and return the new revision. */
-  invalidate: () => number
-  /** Return the current revision identifier. */
-  current: () => number
-  /** True only when `revision` is still the active revision. */
-  isCurrent: (revision: number) => boolean
-}
+export function evaluateVerificationObservations(input: {
+  events: ProofEvent[]
+  chainProof: ChainProofRecord | null
+  errorCode?: string | null
+  offline?: boolean
+  nowMs?: number
+  staleAfterMs?: number
+}): ObservationDiagnostics {
+  const nowMs = input.nowMs ?? Date.now()
+  const staleAfterMs = input.staleAfterMs ?? DEFAULT_OBSERVATION_STALE_MS
+  const { events, chainProof, errorCode = null, offline = false } = input
 
-export function createVerificationRevisionGuard(): VerificationRevisionGuard {
-  let activeRevision = 0
-  return {
-    next() {
-      activeRevision += 1
-      return activeRevision
-    },
-    invalidate() {
-      activeRevision += 1
-      return activeRevision
-    },
-    current() {
-      return activeRevision
-    },
-    isCurrent(revision: number) {
-      return revision > 0 && revision === activeRevision
-    },
+  const eventBounds = extractLedgerBoundsFromEvents(events)
+  const chainExpiresAt = chainProof?.expiresAt ?? null
+  const chainBounds: LedgerBounds = {
+    minLedger: eventBounds.minLedger,
+    maxLedger: eventBounds.maxLedger,
+    expiresAt: chainExpiresAt,
+    observedAt: chainProof?.createdAt ?? null,
   }
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) {
-    throw new DOMException('Aborted', 'AbortError')
+  const combinedBounds: LedgerBounds = {
+    minLedger: eventBounds.minLedger,
+    maxLedger: eventBounds.maxLedger,
+    expiresAt: chainExpiresAt,
+    observedAt: eventBounds.observedAt ?? chainProof?.createdAt ?? null,
   }
-}
 
-export type VerificationResultTabId = 'summary' | 'chain' | 'corroboration'
+  const staleReasons: string[] = []
+  const disagreementReasons: string[] = []
 
-export interface StatementIdentityResolutionInput {
-  verifyHash?: string | null
-  videoHashInput?: string | null
-  proofIdInput?: string | null
-  events?: ProofEvent[] | null
-  chainProof?: ChainProofRecord | null
-}
-
-export interface ResolvedVerifiedStatementIdentity {
-  statementDigest: string
-  statementKey: string
-  proofId: string | null
-  metadataHash: string | null
-  chainSource: string | null
-  matchingEvents: ProofEvent[]
-}
-
-function normalizeDigest(value?: string | null): string {
-  if (!value) return ''
-  const trimmed = value.trim()
-  if (trimmed.startsWith('0x') || trimmed.startsWith('0X')) {
-    return trimmed.slice(2).toLowerCase()
-  }
-  return trimmed.toLowerCase()
-}
-
-function normalizeProofId(value?: string | null): string | null {
-  if (!value) return null
-  const trimmed = value.trim()
-  if (!trimmed) return null
-  if (trimmed.startsWith('0x') || trimmed.startsWith('0X')) {
-    return `0x${trimmed.slice(2).toLowerCase()}`
-  }
-  if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
-    return `0x${trimmed.toLowerCase()}`
-  }
-  return trimmed
-}
-
-export function shouldResetDependentTabState(
-  previousStatementKey: string,
-  nextStatementKey: string,
-): boolean {
-  return previousStatementKey !== nextStatementKey
-}
-
-export function resolveVerifiedStatementIdentity(
-  input: StatementIdentityResolutionInput,
-): ResolvedVerifiedStatementIdentity {
-  const statementDigest = normalizeDigest(input.verifyHash)
-  const statementKey = statementDigest || '__empty_statement__'
-
-  if (!statementDigest) {
-    return {
-      statementDigest: '',
-      statementKey: '__empty_statement__',
-      proofId: null,
-      metadataHash: null,
-      chainSource: null,
-      matchingEvents: [],
+  // Backend freshness
+  let backendFreshness: ObservationFreshness = 'unknown'
+  if (events.length > 0 && eventBounds.observedAt) {
+    const parsed = Date.parse(eventBounds.observedAt)
+    if (!Number.isNaN(parsed)) {
+      if (nowMs - parsed > staleAfterMs) {
+        backendFreshness = 'stale'
+        staleReasons.push('Backend event observation exceeds the freshness window.')
+      } else {
+        backendFreshness = 'fresh'
+      }
     }
   }
 
-  const matchingEvents = (input.events || []).filter(
-    (event) => normalizeDigest(event.video_hash) === statementDigest,
-  )
+  // Soroban freshness
+  let sorobanFreshness: ObservationFreshness = 'unknown'
+  if (chainProof) {
+    const expiredByTimestamp =
+      chainExpiresAt !== null &&
+      Number.isSafeInteger(chainExpiresAt) &&
+      chainExpiresAt > 0 &&
+      chainExpiresAt * 1000 <= nowMs
+    if (chainProof.status === 3 || errorCode === 'EXPIRED_EVIDENCE' || expiredByTimestamp) {
+      sorobanFreshness = 'stale'
+      staleReasons.push('Soroban registry record has passed its expiry ledger bound.')
+    } else {
+      sorobanFreshness = 'fresh'
+    }
+  } else if (errorCode === 'EXPIRED_EVIDENCE') {
+    sorobanFreshness = 'stale'
+    staleReasons.push('Soroban registry record has passed its expiry ledger bound.')
+  }
 
-  let resolvedProofId: string | null = null
+  // Source disagreements (contradictory observations)
+  if (errorCode === 'METADATA_ENVELOPE_MISMATCH') {
+    disagreementReasons.push('Embedded metadata digest contradicts the on-chain envelope.')
+  }
 
-  for (const event of matchingEvents) {
-    if (event.proof_id && event.proof_id.trim()) {
-      resolvedProofId = normalizeProofId(event.proof_id)
-      break
+  if (chainProof && events.length > 0) {
+    const chainTier = CHAIN_TIER_MAP[chainProof.tier] ?? null
+    if (chainTier) {
+      const mismatchedTier = events.some((event) => {
+        const eventTier = normaliseToken(event.tier)
+        return eventTier !== null && eventTier !== chainTier
+      })
+      if (mismatchedTier) {
+        disagreementReasons.push('Backend tier observation disagrees with the Soroban registry tier.')
+      }
+    }
+
+    const chainVideoHash = normaliseToken(chainProof.videoHash)
+    if (chainVideoHash) {
+      const mismatchedHash = events.some((event) => {
+        const eventHash = normaliseToken(event.video_hash)
+        return eventHash !== null && eventHash !== chainVideoHash
+      })
+      if (mismatchedHash) {
+        disagreementReasons.push('Backend fingerprint observation disagrees with the Soroban registry record.')
+      }
+    }
+
+    if (chainProof.status === 2 || errorCode === 'REVOKED_EVIDENCE') {
+      const hasRevocationEvent = events.some((event) => /revok/i.test(event.event_type))
+      if (!hasRevocationEvent) {
+        disagreementReasons.push('Soroban registry reports revoked status while backend events show active registration.')
+      }
     }
   }
 
-  const chainProof = input.chainProof
-  const chainMatches = !!(chainProof && normalizeDigest(chainProof.videoHash) === statementDigest)
+  const overallFreshness: ObservationFreshness =
+    backendFreshness === 'stale' || sorobanFreshness === 'stale'
+      ? 'stale'
+      : backendFreshness === 'fresh' || sorobanFreshness === 'fresh'
+        ? 'fresh'
+        : 'unknown'
 
-  if (!resolvedProofId && chainMatches && chainProof?.proofId) {
-    resolvedProofId = normalizeProofId(chainProof.proofId)
+  let agreement: SourceAgreement
+  let summary: string
+
+  if (disagreementReasons.length > 0) {
+    agreement = 'contradictory'
+    summary = disagreementReasons[0]
+  } else if (staleReasons.length > 0) {
+    agreement = 'stale'
+    summary = staleReasons[0]
+  } else if (!offline && events.length > 0 && chainProof) {
+    agreement = 'aligned'
+    summary = 'Backend and Soroban observations are fresh and aligned.'
+  } else {
+    agreement = 'incomplete'
+    summary = offline
+      ? 'Offline mode: only local browser observations are available.'
+      : 'Waiting for corroborating backend and Soroban observations.'
   }
-
-  if (!resolvedProofId && input.proofIdInput) {
-    const videoInput = normalizeDigest(input.videoHashInput)
-    if (!videoInput || videoInput === statementDigest) {
-      resolvedProofId = normalizeProofId(input.proofIdInput)
-    }
-  }
-
-  const metadataHash = chainMatches && chainProof?.metadataHash ? chainProof.metadataHash : null
-  const chainSource = chainMatches && chainProof?.source ? chainProof.source : null
 
   return {
-    statementDigest,
-    statementKey,
-    proofId: resolvedProofId,
-    metadataHash,
-    chainSource,
-    matchingEvents,
+    agreement,
+    freshness: overallFreshness,
+    summary,
+    ledgerBounds: combinedBounds,
+    disagreementReasons,
+    staleReasons,
+    sources: {
+      backend: {
+        source: 'backend',
+        label: 'Backend (NeonDB)',
+        freshness: backendFreshness,
+        ledgerBounds: eventBounds,
+        detail:
+          events.length > 0
+            ? `${events.length} event${events.length === 1 ? '' : 's'} · ${formatLedgerBounds(eventBounds)}`
+            : 'No backend observations',
+      },
+      soroban: {
+        source: 'soroban',
+        label: 'Soroban Registry',
+        freshness: sorobanFreshness,
+        ledgerBounds: chainBounds,
+        detail: chainProof
+          ? `Status ${chainProof.status} · ${formatLedgerBounds(chainBounds)}`
+          : 'No Soroban observations',
+      },
+    },
   }
 }
 
@@ -208,14 +311,8 @@ export async function runVerificationFlow(
     videoHash: safeHash,
     hasHarpocratesMetadata,
     events,
-    onChain,
-    trust: buildVerificationDimensions({
-      hasHarpocratesMetadata,
-      events,
-      onChain,
-      issuerRecord: options.issuerRecord,
-      nowUnixSeconds: options.nowUnixSeconds,
-    }),
+    onChain: onChain,
+    observations: evaluateVerificationObservations({ events, chainProof: onChain }),
   }
   if (options.revision !== undefined) {
     result.revision = options.revision

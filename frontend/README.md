@@ -88,15 +88,35 @@ All application-owned browser persistence must go through the wrappers in
 Credential or nullifier seeds, proof witnesses, generated proofs, raw private
 inputs, and every other field are prohibited from both `localStorage` and
 `sessionStorage`. Keep secret proof-generation data in memory only.
+## Verification Timeline Observations
 
-## Cross-tab vault change detection & recovery
+The verification portal (`src/views/VerifyView.tsx`, `src/components/VerificationTimeline.tsx`,
+and `src/services/verificationFlow.ts`) extends the 5-stage verification timeline
+with observation provenance without replacing the stage model:
 
-The client-side credential vault (`src/credentialVault.ts`) and safe-storage wrappers (`src/safeStorage.ts`) provide explicit cross-tab vault change detection:
+- **Observation source & ledger bounds**: Each stage labels its source
+  (`Local browser`, `Backend (NeonDB)`, or `Soroban Registry`) and displays
+  observed Stellar ledger sequence bounds and on-chain expiry bounds when
+  available (`evaluateVerificationObservations`, `formatLedgerBounds`).
+- **Stale evidence vs. source disagreements**: The timeline distinguishes
+  **Stale evidence** (expired Soroban ledger bounds or backend observations
+  older than `DEFAULT_OBSERVATION_STALE_MS`) from **Source disagreement**
+  (contradictory identity tiers, mismatched video hashes, revoked on-chain
+  records vs. active backend events, or metadata envelope mismatches).
 
-- **Stale view invalidation**: When another browser tab modifies, replaces, or removes the encrypted vault envelope in `localStorage`, any currently unlocked vault view in other tabs is immediately invalidated (`isStale(): true`). Active seeds and cryptographic keys in memory are quarantined and access via `getSeeds()` fails-closed (`null`) to prevent accidental generation of stale proof witnesses.
-- **Active work preservation**: In-progress witness material and user-registered session work are preserved in a quarantined recovery record (`getPreservedWork()`) and protected against inactivity auto-lock until the user selects an explicit recovery action.
-- **Explicit recovery actions**:
-  - `reload`: Discards the local stale session, reloads from storage, and prompts for the new vault passphrase (or unlocks directly if supplied).
-  - `overwrite`: Re-encrypts the preserved active work into browser storage under a new passphrase, restoring the session to a valid unlocked state.
-  - `discard`: Discards and zeroes out the quarantined active work and cleanly locks the vault.
-- **React integration**: `useCredentialVault` and `<VaultRecoveryBanner />` surface real-time stale notifications and recovery controls with accessible ARIA announcements.
+## Resumable Batch Verification Checkpoints
+
+Batch verification (`src/batchVerifier.ts`, `src/batchExport.ts`) supports
+fail-closed resumable checkpoints (`harpocrates-batch-checkpoint` v1):
+
+- **Privacy-safe persistence**: Checkpoints (`BatchVerificationCheckpoint`,
+  `exportBatchCheckpoint`, `parseBatchCheckpoint`) persist only nonsecret file
+  fingerprints (index, name, byte size, `lastModified`, MIME type, and bounded
+  head/tail SHA-256 `sampleHash`), policy limits, network context, and completed
+  sanitized results. Raw `File` handles, media bytes, and wallet addresses are
+  never persisted.
+- **Fail-closed resume validation**: `BatchVerifier.resumeBatch` (and
+  `runBatch(..., { checkpoint })`) validates input file identities, policy
+  limits (`maxFileSizeBytes`, `maxTotalSizeBytes`), and network context
+  (`apiBase`, `contractId`, `network`) via `validateBatchCheckpoint` and rejects
+  resumption with `BatchCheckpointError` on any mismatch or malformed payload.

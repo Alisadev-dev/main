@@ -1,4 +1,12 @@
-import type { BatchItemResult, BatchPreflightReport } from './batchVerifier'
+import {
+  BATCH_CHECKPOINT_PROTOCOL,
+  BATCH_CHECKPOINT_VERSION,
+  BatchCheckpointError,
+  isCompletedBatchOutcome,
+  type BatchItemResult,
+  type BatchOutcome,
+  type BatchVerificationCheckpoint,
+} from './batchVerifier'
 import type { ProofManifest } from './proofManifest'
 
 export type ExportPrivacyProfile = 'public' | 'owner-only'

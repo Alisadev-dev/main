@@ -538,6 +538,7 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
           events={events}
           chainProof={chainProof}
           errorCode={errorCode}
+          offline={offline}
         />
 
         <VerificationResultTabs

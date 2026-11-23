@@ -1,138 +1,168 @@
 import { describe, expect, it } from 'vitest'
-import {
-  resolveVerifiedStatementIdentity,
-  shouldResetDependentTabState,
-} from './verificationFlow'
 import type { ChainProofRecord } from '../stellarTypes'
 import type { ProofEvent } from '../types'
+import {
+  DEFAULT_OBSERVATION_STALE_MS,
+  evaluateVerificationObservations,
+  formatLedgerBounds,
+} from './verificationFlow'
 
-const DIGEST_A = '1'.repeat(64)
-const DIGEST_B = '2'.repeat(64)
-const PROOF_A = `0x${'a'.repeat(64)}`
-const PROOF_UNRELATED = `0x${'e'.repeat(64)}`
+const NOW_MS = Date.parse('2026-06-01T12:00:00Z')
+const VIDEO_HASH = 'a'.repeat(64)
 
-function makeChainProof(overrides: Partial<ChainProofRecord> = {}): ChainProofRecord {
+function makeEvent(overrides: Partial<ProofEvent> = {}): ProofEvent {
   return {
-    videoHash: DIGEST_A,
-    metadataHash: 'm'.repeat(64),
-    tier: 1,
-    source: 'GSRC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEF',
-    issuer: 'GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEF',
-    createdAt: '1750000000',
-    expiresAt: 0,
-    status: 1,
+    id: 1,
+    event_type: 'registered',
+    file_name: null,
+    video_hash: VIDEO_HASH,
+    proof_id: 'b'.repeat(64),
+    tier: 'silent',
+    created_at: '2026-06-01T11:00:00Z',
+    time_attestation: {
+      version: 1,
+      protocol: 'harpocrates-time',
+      evidenceDigest: VIDEO_HASH,
+      stellarAnchors: [
+        {
+          ledgerSequence: 1024,
+          ledgerTimestamp: Math.floor(NOW_MS / 1000) - 3600,
+          transactionHash: 'c'.repeat(64),
+          networkPassphrase: 'Test SDF Network ; September 2015',
+        },
+      ],
+      rfc3161Anchors: [],
+    },
     ...overrides,
   }
 }
 
-describe('resolveVerifiedStatementIdentity', () => {
-  it('resolves active verified statement digest and matching event proofId', () => {
-    const events: ProofEvent[] = [
-      {
-        id: 1,
-        video_hash: DIGEST_B,
-        proof_id: PROOF_UNRELATED,
-        tier: 'seal',
-        tx_hash: 'tx1',
-        created_at: '2026-01-01T00:00:00Z',
-      },
-      {
-        id: 2,
-        video_hash: DIGEST_A,
-        proof_id: PROOF_A,
-        tier: 'source',
-        tx_hash: 'tx2',
-        created_at: '2026-01-01T01:00:00Z',
-      },
-    ]
+function makeChainProof(overrides: Partial<ChainProofRecord> = {}): ChainProofRecord {
+  return {
+    videoHash: VIDEO_HASH,
+    metadataHash: 'd'.repeat(64),
+    tier: 1,
+    status: 1,
+    createdAt: '2026-06-01T11:00:00Z',
+    expiresAt: 0,
+    source: null,
+    issuer: null,
+    ...overrides,
+  }
+}
 
-    const result = resolveVerifiedStatementIdentity({
-      verifyHash: DIGEST_A,
-      events,
+describe('evaluateVerificationObservations', () => {
+  it('marks fresh and matching backend + Soroban observations as aligned with ledger bounds', () => {
+    const result = evaluateVerificationObservations({
+      events: [
+        makeEvent(),
+        makeEvent({
+          id: 2,
+          time_attestation: {
+            version: 1,
+            protocol: 'harpocrates-time',
+            evidenceDigest: VIDEO_HASH,
+            stellarAnchors: [
+              {
+                ledgerSequence: 1050,
+                ledgerTimestamp: Math.floor(NOW_MS / 1000) - 1200,
+                transactionHash: 'e'.repeat(64),
+                networkPassphrase: 'Test SDF Network ; September 2015',
+              },
+            ],
+            rfc3161Anchors: [],
+          },
+        }),
+      ],
       chainProof: makeChainProof(),
+      nowMs: NOW_MS,
     })
 
-    expect(result.statementDigest).toBe(DIGEST_A)
-    expect(result.statementKey).toBe(DIGEST_A)
-    expect(result.proofId).toBe(PROOF_A)
-    expect(result.matchingEvents).toHaveLength(1)
-    expect(result.matchingEvents[0].id).toBe(2)
-    expect(result.chainSource).toBe('GSRC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEF')
-    expect(result.metadataHash).toBe('m'.repeat(64))
+    expect(result.agreement).toBe('aligned')
+    expect(result.freshness).toBe('fresh')
+    expect(result.ledgerBounds.minLedger).toBe(1024)
+    expect(result.ledgerBounds.maxLedger).toBe(1050)
+    expect(result.ledgerBounds.expiresAt).toBe(0)
+    expect(formatLedgerBounds(result.ledgerBounds)).toBe('Ledgers #1024–#1050 · No expiry bound')
   })
 
-  it('never borrows proof ID from an event with a different statement digest', () => {
-    const events: ProofEvent[] = [
-      {
-        id: 1,
-        video_hash: DIGEST_B,
-        proof_id: PROOF_UNRELATED,
-        tier: 'seal',
-        tx_hash: 'tx1',
-        created_at: '2026-01-01T00:00:00Z',
-      },
-    ]
-
-    const result = resolveVerifiedStatementIdentity({
-      verifyHash: DIGEST_A,
-      events,
-      chainProof: null,
+  it('classifies expired chain ledger bounds as stale evidence rather than contradictory', () => {
+    const expiredUnix = Math.floor(NOW_MS / 1000) - 60
+    const result = evaluateVerificationObservations({
+      events: [makeEvent()],
+      chainProof: makeChainProof({ status: 3, expiresAt: expiredUnix }),
+      errorCode: 'EXPIRED_EVIDENCE',
+      nowMs: NOW_MS,
     })
 
-    expect(result.statementDigest).toBe(DIGEST_A)
-    expect(result.proofId).toBeNull()
-    expect(result.matchingEvents).toHaveLength(0)
+    expect(result.agreement).toBe('stale')
+    expect(result.freshness).toBe('stale')
+    expect(result.disagreementReasons).toHaveLength(0)
+    expect(result.staleReasons.length).toBeGreaterThan(0)
+    expect(result.sources.soroban.freshness).toBe('stale')
   })
 
-  it('ignores typed proof ID input if videoHashInput conflicts with verified statement digest', () => {
-    const result = resolveVerifiedStatementIdentity({
-      verifyHash: DIGEST_A,
-      videoHashInput: DIGEST_B,
-      proofIdInput: 'stale-typed-proof-id',
+  it('classifies backend observations older than the freshness window as stale evidence', () => {
+    const oldTimestamp = new Date(NOW_MS - DEFAULT_OBSERVATION_STALE_MS - 60_000).toISOString()
+    const result = evaluateVerificationObservations({
+      events: [makeEvent({ created_at: oldTimestamp })],
+      chainProof: makeChainProof(),
+      nowMs: NOW_MS,
+    })
+
+    expect(result.agreement).toBe('stale')
+    expect(result.freshness).toBe('stale')
+    expect(result.sources.backend.freshness).toBe('stale')
+    expect(result.sources.soroban.freshness).toBe('fresh')
+  })
+
+  it('distinguishes contradictory tier observations from stale evidence', () => {
+    const result = evaluateVerificationObservations({
+      events: [makeEvent({ tier: 'seal' })],
+      chainProof: makeChainProof({ tier: 1 }),
+      nowMs: NOW_MS,
+    })
+
+    expect(result.agreement).toBe('contradictory')
+    expect(result.disagreementReasons).toContain(
+      'Backend tier observation disagrees with the Soroban registry tier.',
+    )
+  })
+
+  it('flags revoked Soroban status vs active backend events as contradictory', () => {
+    const result = evaluateVerificationObservations({
+      events: [makeEvent({ event_type: 'registered' })],
+      chainProof: makeChainProof({ status: 2 }),
+      errorCode: 'REVOKED_EVIDENCE',
+      nowMs: NOW_MS,
+    })
+
+    expect(result.agreement).toBe('contradictory')
+    expect(result.disagreementReasons[0]).toMatch(/revoked status/i)
+  })
+
+  it('flags metadata envelope mismatch as contradictory even without backend events', () => {
+    const result = evaluateVerificationObservations({
+      events: [],
+      chainProof: makeChainProof(),
+      errorCode: 'METADATA_ENVELOPE_MISMATCH',
+      nowMs: NOW_MS,
+    })
+
+    expect(result.agreement).toBe('contradictory')
+    expect(result.disagreementReasons[0]).toMatch(/contradicts the on-chain envelope/i)
+  })
+
+  it('reports incomplete observations in offline mode without fabricating ledger bounds', () => {
+    const result = evaluateVerificationObservations({
       events: [],
       chainProof: null,
+      offline: true,
+      nowMs: NOW_MS,
     })
 
-    expect(result.statementDigest).toBe(DIGEST_A)
-    expect(result.proofId).toBeNull()
-  })
-
-  it('normalizes 0x prefixes and lowercase hex digests', () => {
-    const result = resolveVerifiedStatementIdentity({
-      verifyHash: `0x${DIGEST_A.toUpperCase()}`,
-      proofIdInput: `0X${'F'.repeat(64)}`,
-      events: [],
-      chainProof: null,
-    })
-
-    expect(result.statementDigest).toBe(DIGEST_A)
-    expect(result.proofId).toBe(`0x${'f'.repeat(64)}`)
-  })
-
-  it('handles empty statement inputs safely without throwing', () => {
-    const result = resolveVerifiedStatementIdentity({
-      verifyHash: '',
-      events: [],
-      chainProof: null,
-    })
-
-    expect(result.statementDigest).toBe('')
-    expect(result.statementKey).toBe('__empty_statement__')
-    expect(result.proofId).toBeNull()
-    expect(result.metadataHash).toBeNull()
-    expect(result.chainSource).toBeNull()
-    expect(result.matchingEvents).toHaveLength(0)
-  })
-})
-
-describe('shouldResetDependentTabState', () => {
-  it('returns true when statementKey changes', () => {
-    expect(shouldResetDependentTabState(DIGEST_A, DIGEST_B)).toBe(true)
-    expect(shouldResetDependentTabState('__empty_statement__', DIGEST_A)).toBe(true)
-  })
-
-  it('returns false when statementKey is identical', () => {
-    expect(shouldResetDependentTabState(DIGEST_A, DIGEST_A)).toBe(false)
-    expect(shouldResetDependentTabState('__empty_statement__', '__empty_statement__')).toBe(false)
+    expect(result.agreement).toBe('incomplete')
+    expect(result.freshness).toBe('unknown')
+    expect(formatLedgerBounds(result.ledgerBounds)).toBe('Ledger bounds unavailable')
   })
 })

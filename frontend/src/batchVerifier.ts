@@ -220,6 +220,85 @@ export type BatchRunOptions = {
   onCheckpoint?: (checkpoint: BatchVerificationCheckpoint) => void
 }
 
+export const BATCH_CHECKPOINT_PROTOCOL = 'harpocrates-batch-checkpoint' as const
+export const BATCH_CHECKPOINT_VERSION = 1 as const
+
+export type BatchFileFingerprint = {
+  index: number
+  fileName: string
+  fileSizeBytes: number
+  lastModified: number
+  mimeType: string
+  sampleHash: string
+}
+
+export type BatchCheckpointPolicy = {
+  maxFileSizeBytes: number
+  maxTotalSizeBytes: number
+}
+
+export type BatchCheckpointNetworkContext = {
+  apiBase: string
+  contractId: string
+  network: string
+}
+
+export type BatchCheckpointCompletedItem = {
+  index: number
+  fileName: string
+  fileSizeBytes: number
+  status: BatchOutcome
+  videoHash: string | null
+  metadataHash: string | null
+  sourceHash: string | null
+  tier: string | null
+  chainStatus: string | null
+  message: string
+  duplicateOf: string | null
+  failureReason: string | null
+  durationMs: number | null
+}
+
+export type BatchVerificationCheckpoint = {
+  protocol: typeof BATCH_CHECKPOINT_PROTOCOL
+  version: typeof BATCH_CHECKPOINT_VERSION
+  createdAt: string
+  updatedAt: string
+  policy: BatchCheckpointPolicy
+  networkContext: BatchCheckpointNetworkContext
+  files: BatchFileFingerprint[]
+  completed: BatchCheckpointCompletedItem[]
+}
+
+export type CheckpointMismatchReason =
+  | 'invalid-format'
+  | 'policy-mismatch'
+  | 'network-mismatch'
+  | 'files-mismatch'
+
+export type CheckpointValidationResult =
+  | { ok: true }
+  | {
+      ok: false
+      reason: CheckpointMismatchReason
+      message: string
+    }
+
+export class BatchCheckpointError extends Error {
+  public readonly reason: CheckpointMismatchReason
+
+  constructor(reason: CheckpointMismatchReason, message: string) {
+    super(message)
+    this.name = 'BatchCheckpointError'
+    this.reason = reason
+  }
+}
+
+export type BatchRunOptions = {
+  checkpoint?: BatchVerificationCheckpoint
+  onCheckpoint?: (checkpoint: BatchVerificationCheckpoint) => void
+}
+
 /**
  * Explicit input descriptor binding a selected File to a caller-supplied
  * identity and zero-based selection index so batch results remain stably
@@ -908,7 +987,8 @@ export class BatchVerifier {
   private onCheckpointCallback?: (checkpoint: BatchVerificationCheckpoint) => void
   private processedHashes = new Map<string, string>() // videoHash -> itemId
   private accumulatedTotalBytes = 0
-  private lastPreflight: BatchPreflightReport | null = null
+  private currentFingerprints: BatchFileFingerprint[] = []
+  private checkpointCreatedAt: string | null = null
 
   constructor(config: Partial<BatchConfig> = {}) {
     this.config = { ...DEFAULT_BATCH_CONFIG, ...config }
@@ -930,21 +1010,20 @@ export class BatchVerifier {
     this.onProgressCallback = cb
   }
 
-  /**
-   * Runs preflight check on batch inputs before expensive hashing or proving.
-   */
-  public runPreflight(files?: File[]): BatchPreflightReport {
-    const targetFiles = files ?? this.items.map((i) => i.file)
-    const report = runBatchPreflight(targetFiles, this.config)
-    this.lastPreflight = report
-    return report
+  public setOnCheckpoint(cb: (checkpoint: BatchVerificationCheckpoint) => void): void {
+    this.onCheckpointCallback = cb
   }
 
-  /**
-   * Returns the most recent preflight report, if available.
-   */
-  public getLastPreflight(): BatchPreflightReport | null {
-    return this.lastPreflight
+  public getCheckpoint(): BatchVerificationCheckpoint | null {
+    if (this.currentFingerprints.length === 0) {
+      return null
+    }
+    return createBatchCheckpoint(
+      this.currentFingerprints,
+      this.items,
+      this.config,
+      this.checkpointCreatedAt ?? undefined,
+    )
   }
 
   public cancel(): void {
@@ -967,38 +1046,6 @@ export class BatchVerifier {
     this.notifyProgress(true, true)
   }
 
-  /**
-   * Cancels a single queued (`pending`) or active (`hashing` / `processing`) item
-   * without stopping unrelated items in the batch.
-   * Returns true if the item was cancelled, or false if not found or already terminal.
-   */
-  public cancelItem(itemId: string): boolean {
-    const item = this.items.find((entry) => entry.id === itemId)
-    if (!item) {
-      return false
-    }
-    if (item.status !== 'pending' && item.status !== 'hashing' && item.status !== 'processing') {
-      return false
-    }
-
-    this.cancelledItemIds.add(itemId)
-    const itemController = this.itemAbortControllers.get(itemId)
-    if (itemController && !itemController.signal.aborted) {
-      itemController.abort()
-    }
-
-    if (item.videoHash && this.processedHashes.get(item.videoHash) === item.id) {
-      this.processedHashes.delete(item.videoHash)
-    }
-
-    item.status = 'cancelled'
-    item.message = 'Cancelled by user.'
-    item.failureReason = 'Item verification was cancelled by user request.'
-
-    this.notifyProgress(this.abortController?.signal.aborted ?? false, false)
-    return true
-  }
-
   public async resumeBatch(
     files: File[],
     checkpoint: BatchVerificationCheckpoint,
@@ -1012,7 +1059,8 @@ export class BatchVerifier {
     files: File[],
     checkpoint: BatchVerificationCheckpoint,
     onProgress?: (progress: BatchProgress, items: BatchItemResult[]) => void,
-  ): Promise<{ items: BatchItemResult[]; summary: BatchSummary; preflight: BatchPreflightReport }> {
+    options?: BatchRunOptions,
+  ): Promise<{ items: BatchItemResult[]; summary: BatchSummary; checkpoint: BatchVerificationCheckpoint }> {
     if (onProgress) {
       this.onProgressCallback = onProgress
     }
@@ -1047,15 +1095,34 @@ export class BatchVerifier {
     this.currentFingerprints = fingerprints
     this.checkpointCreatedAt = options?.checkpoint?.createdAt ?? new Date().toISOString()
 
-    // Step 1: Preflight check completes FIRST. No hashing or proving starts until preflight completes.
-    const preflight = this.runPreflight(files)
-    const unsupMap = new Map(preflight.unsupported.map((u) => [u.index, u]))
-    const dupMap = new Map(preflight.duplicates.map((d) => [d.index, d]))
-    const overMap = new Map(preflight.oversized.map((o) => [o.index, o]))
-
     this.items = files.map((file, idx) => {
       const id = `item-${idx}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-      const item: BatchItemResult = {
+      const restored = restoredByIndex.get(idx)
+      if (restored) {
+        if (restored.videoHash && restored.status !== 'duplicate') {
+          this.processedHashes.set(restored.videoHash, id)
+        }
+        return {
+          id,
+          file,
+          fileName: restored.fileName,
+          fileSizeBytes: restored.fileSizeBytes,
+          status: restored.status,
+          videoHash: restored.videoHash,
+          metadataHash: restored.metadataHash,
+          sourceHash: restored.sourceHash,
+          tier: restored.tier,
+          chainStatus: restored.chainStatus,
+          message: restored.message,
+          events: [],
+          chainProof: null,
+          duplicateOf: restored.duplicateOf,
+          manifest: null,
+          durationMs: restored.durationMs,
+          failureReason: restored.failureReason,
+        }
+      }
+      return {
         id,
         inputIndex,
         file,
@@ -1104,7 +1171,40 @@ export class BatchVerifier {
 
     this.notifyProgress(false, false)
 
-    // Execute with bounded concurrency ONLY for pending (valid, non-duplicate, supported) items
+    // Filter oversized files upfront based on total and per-file limits
+    let currentBatchBytes = 0
+    for (const item of this.items) {
+      if (item.status !== 'pending') {
+        if (item.status !== 'oversized') {
+          currentBatchBytes += item.fileSizeBytes
+        }
+        continue
+      }
+
+      if (item.fileSizeBytes > this.config.maxFileSizeBytes) {
+        item.status = 'oversized'
+        const limitMb = Math.round(this.config.maxFileSizeBytes / (1024 * 1024))
+        const fileMb = (item.fileSizeBytes / (1024 * 1024)).toFixed(1)
+        item.message = `File exceeds size limit (${fileMb}MB > ${limitMb}MB limit).`
+        item.failureReason = `Per-file limit exceeded (${item.fileSizeBytes} bytes vs max ${this.config.maxFileSizeBytes} bytes).`
+        continue
+      }
+
+      if (currentBatchBytes + item.fileSizeBytes > this.config.maxTotalSizeBytes) {
+        item.status = 'oversized'
+        const totalLimitMb = Math.round(this.config.maxTotalSizeBytes / (1024 * 1024))
+        item.message = `Total batch size limit exceeded (${totalLimitMb}MB max).`
+        item.failureReason = `Total batch memory limit exceeded by queueing ${item.fileName}.`
+        continue
+      }
+
+      currentBatchBytes += item.fileSizeBytes
+    }
+
+    this.accumulatedTotalBytes = currentBatchBytes
+    this.notifyProgress(false, false)
+
+    // Execute with bounded concurrency
     const queue = this.items.filter((item) => item.status === 'pending')
     const concurrency = Math.max(1, Math.min(8, this.config.maxConcurrency))
 
@@ -1117,24 +1217,9 @@ export class BatchVerifier {
           continue
         }
 
-        const itemController = new AbortController()
-        this.itemAbortControllers.set(item.id, itemController)
-        const onBatchAbort = () => itemController.abort()
-        if (signal.aborted) {
-          itemController.abort()
-        } else {
-          signal.addEventListener('abort', onBatchAbort, { once: true })
-        }
-
-        try {
-          await this.processItem(item, itemController.signal)
-        } finally {
-          signal.removeEventListener('abort', onBatchAbort)
-          this.itemAbortControllers.delete(item.id)
-        }
-
+        await this.processItem(item, signal)
         this.emitCheckpoint()
-        this.notifyProgress(signal.aborted, false)
+        this.notifyProgress(false, queue.length === 0)
       }
     }
 
@@ -1163,7 +1248,7 @@ export class BatchVerifier {
     this.emitCheckpoint(checkpoint)
     this.notifyProgress(signal.aborted, true)
 
-    return { items: [...this.items], summary, preflight }
+    return { items: [...this.items], summary, checkpoint }
   }
 
   private async processItem(item: BatchItemResult, signal: AbortSignal): Promise<void> {
