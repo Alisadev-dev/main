@@ -418,6 +418,11 @@ export class CredentialVault {
   private timeoutId: ReturnType<typeof setTimeout> | null = null
   private inactivityTimeoutMs: number
 
+  private memoryKey: CryptoKey | null = null
+  private seeds: SeedPair | null = null
+  private timeoutId: ReturnType<typeof setTimeout> | null = null
+  private inactivityTimeoutMs: number
+
   constructor(inactivityTimeoutMs = DEFAULT_TIMEOUT_MS) {
     this.inactivityTimeoutMs = inactivityTimeoutMs;
     // Listen for lock broadcasts from other tabs
@@ -578,6 +583,15 @@ export class CredentialVault {
       // ignore if broadcast fails
     }
     this.memoryKey = null;
+    // Zero out references
+    if (this.seeds) {
+      this.seeds.credentialSeed = '';
+      this.seeds.nullifierSeed = '';
+    }
+    this.seeds = null;
+    this.clearTimeout();
+  }
+    this.memoryKey = null
     // Zero out references
     if (this.seeds) {
       this.seeds.credentialSeed = '';
