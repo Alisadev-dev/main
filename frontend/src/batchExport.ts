@@ -11,6 +11,82 @@ import {
 } from './batchVerifier'
 import type { ProofManifest } from './proofManifest'
 
+export type ExportPrivacyProfile = 'public' | 'owner-only'
+
+export const DEFAULT_EXPORT_PRIVACY_PROFILE: ExportPrivacyProfile = 'owner-only'
+
+export const PUBLIC_EXPORT_FIELDS = [
+  'status',
+  'videoHash',
+  'metadataHash',
+  'sourceHash',
+  'tier',
+  'chainStatus',
+  'fileSizeBytes',
+  'durationMs',
+] as const
+
+export const OWNER_ONLY_EXPORT_FIELDS = [
+  'fileName',
+  'fileSizeBytes',
+  'status',
+  'videoHash',
+  'metadataHash',
+  'sourceHash',
+  'tier',
+  'chainStatus',
+  'message',
+  'duplicateOf',
+  'failureReason',
+  'durationMs',
+  'issuerNote',
+] as const
+
+export type ExportPrivacyProfileDefinition = {
+  id: ExportPrivacyProfile
+  label: string
+  description: string
+  fields: readonly string[]
+}
+
+export const EXPORT_PRIVACY_PROFILES: Record<ExportPrivacyProfile, ExportPrivacyProfileDefinition> = {
+  public: {
+    id: 'public',
+    label: 'Public (Redacted)',
+    description:
+      'Shareable verification outcomes and cryptographic commitments only. Excludes raw filenames, duplicate filename references, diagnostic messages, and private issuer notes.',
+    fields: PUBLIC_EXPORT_FIELDS,
+  },
+  'owner-only': {
+    id: 'owner-only',
+    label: 'Owner-Only (Full)',
+    description:
+      'Complete local audit export including raw filenames, duplicate references, failure diagnostics, and private issuer notes. Intended for owner-controlled storage only.',
+    fields: OWNER_ONLY_EXPORT_FIELDS,
+  },
+}
+
+export function assertValidExportPrivacyProfile(
+  profile: string,
+): asserts profile is ExportPrivacyProfile {
+  if (profile !== 'public' && profile !== 'owner-only') {
+    throw new Error(
+      `Unsupported export privacy profile "${profile}". Expected "public" or "owner-only".`,
+    )
+  }
+}
+
+export type PublicBatchReportItem = {
+  status: string
+  videoHash: string | null
+  metadataHash: string | null
+  sourceHash: string | null
+  tier: string | null
+  chainStatus: string | null
+  fileSizeBytes: number
+  durationMs: number | null
+}
+
 export const BATCH_REPORT_PROTOCOL = 'harpocrates-batch-report' as const
 export const BATCH_REPORT_VERSION = 1 as const
 export const BATCH_COMPARISON_PROTOCOL = 'harpocrates-batch-comparison' as const
@@ -83,6 +159,7 @@ export type CleanBatchReportItem = {
   duplicateOf: string | null
   failureReason: string | null
   durationMs: number | null
+  issuerNote?: string | null
 }
 
 export type BatchResultManifest = {
@@ -464,16 +541,40 @@ export function exportBatchComparisonJSON(
 /**
  * Strips raw File handles and sensitive memory states, returning a clean,
  * privacy-safe serializable representation of batch verification results
- * with bounded, collision-safe deterministic archive filenames.
+ * according to the selected privacy profile.
  */
 export function sanitizeBatchResults(
   results: BatchItemResult[],
-  options: ArchiveFilenameOptions = {},
-): CleanBatchReportItem[] {
-  const archivePaths = allocateArchivePaths(results, options)
+  profile: 'public',
+): PublicBatchReportItem[]
+export function sanitizeBatchResults(
+  results: BatchItemResult[],
+  profile?: 'owner-only',
+): CleanBatchReportItem[]
+export function sanitizeBatchResults(
+  results: BatchItemResult[],
+  profile: ExportPrivacyProfile,
+): PublicBatchReportItem[] | CleanBatchReportItem[]
+export function sanitizeBatchResults(
+  results: BatchItemResult[],
+  profile: ExportPrivacyProfile = DEFAULT_EXPORT_PRIVACY_PROFILE,
+): PublicBatchReportItem[] | CleanBatchReportItem[] {
+  assertValidExportPrivacyProfile(profile)
 
-  return results.map((item, index) => ({
-    sourceItemId: item.id,
+  if (profile === 'public') {
+    return results.map((item) => ({
+      status: item.status,
+      videoHash: item.videoHash,
+      metadataHash: item.metadataHash,
+      sourceHash: item.sourceHash,
+      tier: item.tier,
+      chainStatus: item.chainStatus,
+      fileSizeBytes: item.fileSizeBytes,
+      durationMs: item.durationMs !== null ? Math.round(item.durationMs) : null,
+    }))
+  }
+
+  return results.map((item) => ({
     fileName: item.fileName,
     archiveFileName: archivePaths[index],
     fileSizeBytes: item.fileSizeBytes,
@@ -488,6 +589,7 @@ export function sanitizeBatchResults(
     duplicateOf: item.duplicateOf,
     failureReason: item.failureReason,
     durationMs: item.durationMs !== null ? Math.round(item.durationMs) : null,
+    ...(item.issuerNote !== undefined ? { issuerNote: item.issuerNote } : {}),
   }))
 }
 
@@ -534,17 +636,16 @@ export function exportBatchArchiveManifest(
  * Throws {@link BatchExportConflictError} if duplicate conflicting statement
  * identifiers are detected.
  */
-export function exportBatchJSON(results: BatchItemResult[]): string {
-  const clean = sanitizeBatchResults(results)
-  const counts = {
-    verified: clean.filter((item) => item.resultCategory === 'verified').length,
-    skipped: clean.filter((item) => item.resultCategory === 'skipped').length,
-    cancelled: clean.filter((item) => item.resultCategory === 'cancelled').length,
-    failed: clean.filter((item) => item.resultCategory === 'failed').length,
-  }
+export function exportBatchJSON(
+  results: BatchItemResult[],
+  profile: ExportPrivacyProfile = DEFAULT_EXPORT_PRIVACY_PROFILE,
+): string {
+  assertValidExportPrivacyProfile(profile)
+  const clean = sanitizeBatchResults(results, profile)
   const report = {
     protocol: 'harpocrates-batch-report',
     version: 1,
+    privacyProfile: profile,
     exportedAt: new Date().toISOString(),
     totalCount: clean.length,
     counts,
@@ -558,9 +659,40 @@ export function exportBatchJSON(results: BatchItemResult[]): string {
  * Throws {@link BatchExportConflictError} if duplicate conflicting statement
  * identifiers are detected.
  */
-export function exportBatchCSV(results: BatchItemResult[]): string {
-  const validated = validateBatchExportResults(results)
-  const clean = sanitizeBatchResults(validated)
+export function exportBatchCSV(
+  results: BatchItemResult[],
+  profile: ExportPrivacyProfile = DEFAULT_EXPORT_PRIVACY_PROFILE,
+): string {
+  assertValidExportPrivacyProfile(profile)
+
+  if (profile === 'public') {
+    const clean = sanitizeBatchResults(results, 'public')
+    const headers = [
+      'Status',
+      'Video Hash',
+      'Metadata Hash',
+      'Source Hash',
+      'Tier',
+      'Chain Status',
+      'Size (Bytes)',
+      'Duration (ms)',
+    ]
+
+    const rows = clean.map((item) => [
+      escapeCSV(item.status),
+      escapeCSV(item.videoHash ?? ''),
+      escapeCSV(item.metadataHash ?? ''),
+      escapeCSV(item.sourceHash ?? ''),
+      escapeCSV(item.tier ?? ''),
+      escapeCSV(item.chainStatus ?? ''),
+      String(item.fileSizeBytes),
+      item.durationMs !== null ? String(item.durationMs) : '',
+    ])
+
+    return [headers.join(','), ...rows.map((r) => r.join(','))].join('\n')
+  }
+
+  const clean = sanitizeBatchResults(results, 'owner-only')
   const headers = [
     'File Name',
     'Size (Bytes)',
@@ -574,7 +706,7 @@ export function exportBatchCSV(results: BatchItemResult[]): string {
     'Duplicate Of',
     'Failure Reason',
     'Duration (ms)',
-    'Result Category',
+    'Issuer Note',
   ]
 
   const rows = clean.map((item) => [
@@ -590,7 +722,7 @@ export function exportBatchCSV(results: BatchItemResult[]): string {
     escapeCSV(item.duplicateOf ?? ''),
     escapeCSV(item.failureReason ?? ''),
     item.durationMs !== null ? String(item.durationMs) : '',
-    escapeCSV(item.resultCategory),
+    escapeCSV(item.issuerNote ?? ''),
   ])
 
   return [headers.join(','), ...rows.map((r) => r.join(','))].join('\n')
