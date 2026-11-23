@@ -32,7 +32,12 @@ import {
   type C2paExport,
 } from './c2pa.js'
 import { verifyLineageTree, formatLineageTree } from './verify-lineage.js'
-import { parseOfflineBundle, verifyOfflineBundle, formatOfflineBundleReport } from './verify-bundle.js'
+import {
+  compareReceipts,
+  formatComparisonResult,
+  parseReceiptInput,
+  type ReceiptComparisonResult,
+} from './compare-receipt.js'
 import { logStructured, redactSensitive } from './logging.js'
 import { createRequire } from 'node:module'
 import { parseCliArgs, CliUsageError, type ParsedArgs } from './args.js'
@@ -236,6 +241,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
       return await handleHash(flags)
     case 'verify-receipt':
       return await handleVerifyReceipt(flags, debugLog)
+    case 'compare-receipt':
+      return await handleCompareReceipt(flags, debugLog)
     case 'c2pa':
       return await handleC2pa(flags, debugLog)
     case 'verify-lineage':
@@ -244,6 +251,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
       return await handleVerifyBundle(flags, debugLog)
     case 'register':
       return await handleRegister(flags, debugLog)
+    case 'version':
+      return printVersion()
     case 'help':
       return printHelp()
     default:
@@ -500,6 +509,85 @@ async function handleVerifyReceipt(flags: Record<string, string>, debugLog: (eve
       printText(`❌ Invalid receipt: ${result.reason}`)
     }
     exit(EXIT_CODES.INVALID)
+  }
+}
+
+async function handleCompareReceipt(
+  flags: Record<string, string>,
+  debugLog: (event: Record<string, unknown>) => void,
+): Promise<void> {
+  const basePath = flags.base || flags.b || flags['receipt-a'] || flags.receiptA
+  const targetPath = flags.target || flags.t || flags['receipt-b'] || flags.receiptB || flags.candidate
+  const outputFormat = flags.output || flags.o || 'text'
+
+  if (!basePath || !targetPath) {
+    exit(2, '--base and --target are required for receipt comparison')
+  }
+
+  if (basePath === '-' && targetPath === '-') {
+    exit(2, 'cannot read both receipts from stdin')
+  }
+
+  if (outputFormat !== 'text' && outputFormat !== 'json') {
+    exit(2, `invalid value "${outputFormat}" for --output; expected "text" or "json"`)
+  }
+
+  let baseRaw: string
+  try {
+    baseRaw = await readText(basePath)
+  } catch (err) {
+    debugLog({ event: 'compare-receipt.base-read-failed', error: String(err) })
+    exit(8, `failed to read base receipt: ${basePath}`)
+  }
+
+  let targetRaw: string
+  try {
+    targetRaw = await readText(targetPath)
+  } catch (err) {
+    debugLog({ event: 'compare-receipt.target-read-failed', error: String(err) })
+    exit(8, `failed to read target receipt: ${targetPath}`)
+  }
+
+  let baseParsed: unknown
+  try {
+    baseParsed = parseReceiptInput(baseRaw)
+  } catch (err) {
+    debugLog({ event: 'compare-receipt.base-parse-failed', error: String(err) })
+    exit(8, `invalid base receipt: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  let targetParsed: unknown
+  try {
+    targetParsed = parseReceiptInput(targetRaw)
+  } catch (err) {
+    debugLog({ event: 'compare-receipt.target-parse-failed', error: String(err) })
+    exit(8, `invalid target receipt: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  debugLog({
+    event: 'compare-receipt.comparing',
+    base: typeof baseParsed === 'object' && baseParsed !== null ? redactSensitive(baseParsed as Record<string, unknown>) : baseParsed,
+    target: typeof targetParsed === 'object' && targetParsed !== null ? redactSensitive(targetParsed as Record<string, unknown>) : targetParsed,
+  })
+
+  let result: ReceiptComparisonResult
+  try {
+    result = compareReceipts(baseParsed, targetParsed)
+  } catch (err) {
+    debugLog({ event: 'compare-receipt.diff-failed', error: String(err) })
+    exit(8, `comparison failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  if (outputFormat === 'json') {
+    printJson(result)
+  } else {
+    printText(formatComparisonResult(result))
+  }
+
+  if (result.match) {
+    process.exit(0)
+  } else {
+    process.exit(1)
   }
 }
 
@@ -772,8 +860,7 @@ Commands:
   manifest       Create a proof manifest from metadata.
   hash           Compute the SHA-256 hash of a file.
   verify-receipt Verify an offline signed receipt.
-  verify-bundle  Verify receipts, manifests and a trust snapshot from a local
-                 bundle offline; online-only checks are reported as unavailable.
+  compare-receipt Compare two verification receipts and report canonical statement and trust differences.
   c2pa           Export C2PA authenticity assertions from a proof manifest.
   version        Print the CLI version.
   help           Show this help message.
@@ -833,6 +920,13 @@ Verify Receipt options:
   --proof-id        Optional expected proof ID.
   --output, -o      Output format: "text" (default) or "json".
 
+Compare receipt options:
+  --base, -b       Path to base verification receipt file (use "-" for stdin; required, or positional 1).
+  --target, -t     Path to target verification receipt file (use "-" for stdin; required, or positional 2).
+  --output, -o     Output format: "text" (default) or "json".
+  Accepts VerificationReceipt, SignedVerificationReceipt, or QR payload.
+  Exits 0 when identical, 1 when differences detected, 2 on usage error, 8 on read/parse error.
+
 Verify options:
   --contract-id     Contract ID on Stellar (required).
   --manifest        Path to a proof manifest JSON file (use "-" for stdin).
@@ -889,6 +983,11 @@ Exit codes:
   For a full table of every exit code and which commands emit them, see the Exit codes section in cli/README.md.
 `
   return help.trim()
+}
+
+function printVersion(): void {
+  printText(getCliVersion())
+  process.exit(0)
 }
 
 function printHelp(): void {

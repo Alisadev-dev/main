@@ -80,15 +80,16 @@ export {
 export type { LineageNode, LineageTreeResult, LineageFetcher } from './verify-lineage.js'
 export { resolveNetwork, DEFAULT_NETWORK_PASSPHRASE } from './network.js'
 export {
-  checkCompatibility,
-  formatCompatReport,
-  runCheckCompat,
-  COMPAT_EXIT_CODES,
-} from './compat.js'
+  compareReceipts,
+  formatComparisonResult,
+  parseReceiptInput,
+  normalizeReceipt,
+} from './compare-receipt.js'
 export type {
-  CompatConfig,
-  CompatCheckItem,
-  CompatReport,
-  CompatStatus,
-  RunCheckCompatIo,
-} from './compat.js'
+  ReceiptCategory,
+  ReceiptDifference,
+  ReceiptComparisonResult,
+  NormalizedCanonicalStatement,
+  NormalizedTrustProperties,
+  NormalizedReceipt,
+} from './compare-receipt.js'
