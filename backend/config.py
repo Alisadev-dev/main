@@ -68,9 +68,11 @@ class AppConfig:
     retention_blob_gc_enabled: bool = False
     retention_unreferenced_blobs_enabled: bool = False
     retention_dry_run: bool = False
-    # Public receipt signing-key history: bounded number of entries served by the
-    # read-only key-history endpoint. Public keys only; never private material.
-    receipt_key_history_max_entries: int = 100
+    # Two-phase deletion receipts for retained evidence (audit trail only;
+    # never stores media bytes or plaintext keys).
+    deletion_receipts_enabled: bool = False
+    deletion_receipt_salt: str | None = None
+    deletion_receipt_ttl_seconds: int = 2_592_000
     registration_reconcile_state_dir: str = ""
     stellar_network_passphrase: str = ""
 
@@ -88,6 +90,7 @@ class AppConfig:
             "tracing_endpoint",
             "register_api_key",
             "register_api_key_previous",
+            "deletion_receipt_salt",
         }
         raw = asdict(self)
         for field in secret_fields:
@@ -115,6 +118,11 @@ def load_config() -> AppConfig:
         raise RuntimeError(
             "REGISTER_API_KEY_PREVIOUS is required when REGISTER_API_KEY_PREVIOUS_EXPIRES is set"
         )
+
+    deletion_receipts_enabled = _bool_env("HARPOCRATES_DELETION_RECEIPTS_ENABLED", False)
+    deletion_receipt_salt = _str_env("DELETION_RECEIPT_SALT")
+    if deletion_receipts_enabled and deletion_receipt_salt is None:
+        raise RuntimeError("DELETION_RECEIPT_SALT is required when deletion receipts are enabled")
 
     return AppConfig(
         app_env=app_env,
@@ -173,7 +181,9 @@ def load_config() -> AppConfig:
         retention_blob_gc_enabled=_blob_gc_enabled_env(),
         retention_unreferenced_blobs_enabled=_blob_gc_enabled_env(),
         retention_dry_run=_bool_env("HARPOCRATES_RETENTION_DRY_RUN", False),
-        receipt_key_history_max_entries=_int_env("RECEIPT_KEY_HISTORY_MAX_ENTRIES", 100),
+        deletion_receipts_enabled=deletion_receipts_enabled,
+        deletion_receipt_salt=deletion_receipt_salt,
+        deletion_receipt_ttl_seconds=_int_env("DELETION_RECEIPT_TTL_SECONDS", 2_592_000),
         registration_reconcile_state_dir=_str_env("HARPOCRATES_REGISTRATION_RECONCILE_DIR") or "",
         stellar_network_passphrase=(
             _str_env("STELLAR_NETWORK_PASSPHRASE")
@@ -268,22 +278,8 @@ def _datetime_env(name: str) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
+        raise RuntimeError(f"{name} must be an ISO-8601 datetime") from except ValueError as exc:
         raise RuntimeError(f"{name} must be an ISO-8601 timestamp") from exc
     if parsed.tzinfo is None:
-        raise RuntimeError(f"{name} must include a timezone")
-    return parsed.astimezone(timezone.utc)
-
-
-def _float_env(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    parsed = float(value)
-    if parsed <= 0.0:
-        raise RuntimeError(f"{name} must be positive")
+        parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
-
-
-def _sample_ratio_env(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if

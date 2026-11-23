@@ -1,4 +1,5 @@
-import errno
+import hashlib
+import json
 import logging
 import os
 import re
@@ -9,6 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from evidence_storage import assert_safe_destination
+
+RECEIPT_FILENAME = "deletion_receipts.jsonl"
+RECEIPT_PHASE_SELECTED = "selected"
+RECEIPT_PHASE_COMPLETED = "completed"
 
 
 @dataclass(frozen=True)
@@ -84,6 +89,79 @@ def _parse_timestamp(val: Any) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _canonical_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _receipt_digest(file_name: str) -> str:
+    # Only a one-way digest of the file name is stored: no plaintext paths,
+    # media contents or key material ever enter the receipt log.
+    return hashlib.sha256(file_name.encode("utf-8")).hexdigest()
+
+
+def _append_receipt(
+    target_dir: Path,
+    record: dict[str, Any],
+) -> None:
+    receipt_path = target_dir / RECEIPT_FILENAME
+    line = _canonical_json(record) + "\n"
+    fd = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def record_deletion_selection(
+    target_dir: Path,
+    selected: list[Path],
+    receipt_id: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Phase one: durably record the approved selection before any unlink."""
+    record = {
+        "receipt_id": receipt_id,
+        "phase": RECEIPT_PHASE_SELECTED,
+        "recorded_at": now.isoformat(),
+        "selected_digests": sorted(_receipt_digest(p.name) for p in selected),
+        "selected_count": len(selected),
+    }
+    _append_receipt(target_dir, record)
+    return record
+
+
+def record_deletion_completion(
+    target_dir: Path,
+    selection: dict[str, Any],
+    completed: list[Path],
+    failed: list[Path],
+    now: datetime,
+) -> dict[str, Any]:
+    """Phase two: record which selected actions actually completed."""
+    completed_digests = sorted(_receipt_digest(p.name) for p in completed)
+    failed_digests = sorted(_receipt_digest(p.name) for p in failed)
+    record = {
+        "receipt_id": selection["receipt_id"],
+        "phase": RECEIPT_PHASE_COMPLETED,
+        "recorded_at": now.isoformat(),
+        "selection_sha256": hashlib.sha256(
+            _canonical_json(
+                {
+                    "receipt_id": selection["receipt_id"],
+                    "selected_digests": selection["selected_digests"],
+                }
+            ).encode("utf-8")
+        ).hexdigest(),
+        "completed_digests": completed_digests,
+        "failed_digests": failed_digests,
+        "completed_count": len(completed_digests),
+        "failed_count": len(failed_digests),
+    }
+    _append_receipt(target_dir, record)
+    return record
+
+
 def sweep_job_files(
     storage_dir: Path | str | None = None,
     ttl_seconds: int | float | None = None,
@@ -95,6 +173,10 @@ def sweep_job_files(
     with no job row older than TTL.
     Never removes files for running or pending jobs.
     Logs counts only, never file names derived from user input.
+
+    Each sweep writes a two-phase deletion receipt: the approved selection is
+    recorded before any unlink, and the completed/failed outcome after. Receipts
+    hold only SHA-256 digests of file names and counts, never media or keys.
 
     Returns the count of deleted files.
     """
@@ -176,15 +258,13 @@ def sweep_job_files(
         if not storage_root.is_dir():
             return []
 
-        unreferenced: list[Path] = []
-        for entry in storage_root.iterdir():
-            if entry.is_file() and entry.name not in referenced_names:
-                unreferenced.append(entry)
-        return unreferenced
+    terminal_states = {"completed", "failed", "cancelled", "abandoned"}
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
+    # Phase one: select without deleting.
+    selected: list[Path] = []
+    for entry in sorted(target_dir.iterdir()):
+        if not entry.is_file():
+            continue
 
     def _resolve_destination(self, relative_name: str) -> Path:
         """Resolve *relative_name* relative to the storage root.
@@ -204,15 +284,61 @@ def sweep_job_files(
         storage_root = self._config.storage_path.resolve()
         destination = (storage_root / candidate).resolve()
 
-        # Ensure the destination stays inside the storage root.
-        try:
-            destination.relative_to(storage_root)
-        except ValueError:
-            raise ValueError(
-                f"evidence blob name '{relative_name}' escapes the storage root"
-            )
+        if job is None:
+            # Orphaned file with no job row
+            file_age = (now_dt - file_mtime).total_seconds()
+            if file_age >= ttl_seconds:
+                selected.append(entry)
+        else:
+            status = job.get("status")
+            if status in terminal_states:
+                # Determine job completion / terminal timestamp
+                ts_val = (
+                    job.get("completed_at")
+                    or job.get("failed_at")
+                    or job.get("cancelled_at")
+                    or job.get("finished_at")
+                    or job.get("ended_at")
+                    or job.get("updated_at")
+                    or job.get("created_at")
+                )
+                if ts_val is not None:
+                    job_dt = _parse_timestamp(ts_val)
+                else:
+                    job_dt = file_mtime
 
-        return destination
+                job_age = (now_dt - job_dt).total_seconds()
+                if job_age >= ttl_seconds:
+                    selected.append(entry)
+            # If status not in terminal_states (e.g., 'running' or 'pending'), do not remove.
+
+    if not selected:
+        return 0
+
+    receipt_id = hashlib.sha256(
+        f"{now_dt.isoformat()}|{len(selected)}|{os.getpid()}".encode("utf-8")
+    ).hexdigest()[:32]
+
+    # Receipt is durable before the first unlink; if it cannot be written, fail closed.
+    selection = record_deletion_selection(target_dir, selected, receipt_id, now_dt)
+
+    # Phase two: perform the approved actions and record the outcome.
+    completed: list[Path] = []
+    failed: list[Path] = []
+    for entry in selected:
+        try:
+            entry.unlink(missing_ok=True)
+            completed.append(entry)
+        except OSError:
+            failed.append(entry)
+
+    record_deletion_completion(target_dir, selection, completed, failed, now_dt)
+
+    purged_count = len(completed)
+    if purged_count > 0:
+        LOGGER.info("Purged %d stale job files", purged_count)
+
+    return purged_count
 
 
 purge_stale_job_files = sweep_job_files

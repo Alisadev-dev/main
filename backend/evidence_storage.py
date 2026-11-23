@@ -4,12 +4,10 @@ import hashlib
 import json
 import logging
 import os
-from pathlib import Path
-import re
-import tempfile
-from typing import Any, Tuple
+import hashlib
 import uuid
-from cryptography.fernet import Fernet, InvalidToken
+from typing import Tuple
+from cryptography.fernet import Fernet
 import db
 import storage
 from storage import _parse_timestamp
@@ -212,6 +210,34 @@ def remove_tenant_ref(tenant_id: str, content_hash: str) -> bool:
     return True
 
 
+def _audit_ref(content_hash: str) -> str:
+    """Return a non-reversible audit reference for a blob without exposing its hash."""
+    return hashlib.sha256(("audit:" + content_hash).encode("utf-8")).hexdigest()[:32]
+
+
+def record_deletion_receipt(receipt_id: str, phase: str, selected: list, completed: list):
+    """Persist a two-phase deletion receipt.
+
+    phase 'approved' records the selection before any storage action runs.
+    phase 'completed' records audit references for storage actions that finished.
+    Only audit references are stored: no content hashes, storage paths, or keys.
+    """
+    with db.get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                insert into blob_deletion_receipts (receipt_id, phase, selected_refs, completed_refs)
+                values (%s, %s, %s, %s)
+                on conflict (receipt_id) do update
+                set phase = excluded.phase,
+                    completed_refs = excluded.completed_refs,
+                    updated_at = now()
+                """,
+                (receipt_id, phase, ",".join(selected), ",".join(completed))
+            )
+        conn.commit()
+
+
 def collect_unreferenced_blobs(limit: int = 100) -> int:
     """Transactionally delete blob rows and files that have zero references.
 
@@ -231,68 +257,66 @@ def collect_unreferenced_blobs(limit: int = 100) -> int:
         return ENVELOPE_CLASS_LEGACY
     return ENVELOPE_CLASS_UNSUPPORTED
 
-
-def validate_envelope_version(envelope_version: object) -> str:
-    """Validate and return a supported envelope version for new evidence blobs."""
-    if not isinstance(envelope_version, str):
-        raise UnsupportedEnvelopeVersionError("envelope_version must be a supported string identifier")
-    normalized = envelope_version.strip()
-    if normalized in SUPPORTED_ENVELOPE_VERSIONS:
-        return normalized
-    if normalized in KNOWN_LEGACY_ENVELOPE_VERSIONS:
-        raise LegacyEnvelopeVersionError(
-            f"legacy envelope_version {normalized!r} cannot be used for new evidence blobs"
-        )
-    raise UnsupportedEnvelopeVersionError(f"unsupported envelope_version: {envelope_version!r}")
-
-
-def assert_safe_destination(
-    destination: Path,
-    protected_paths: frozenset[Path],
-) -> None:
-    """Raise :class:`ValueError` when *destination* aliases a protected path.
-
-    Parameters
-    ----------
-    destination:
-        The fully-resolved output path that is about to be written.
-        The caller must pass the result of ``Path(...).resolve()`` — a
-        relative or unresolved path will be resolved here as a defensive
-        measure, but the expectation is that the caller has already done
-        this.
-    protected_paths:
-        A frozen set of *resolved* :class:`~pathlib.Path` objects that
-        must never be overwritten or shadowed.  Obtain this set from
-        :func:`storage._collect_protected_paths` or construct it
-        directly in tests.
-
-    Raises
-    ------
-    ValueError
-        When *destination* is equal to, a descendant of, or an ancestor
-        of any path in *protected_paths*.
-
-    Examples
-    --------
-    >>> from pathlib import Path
-    >>> from evidence_storage import assert_safe_destination
-    >>> safe = Path("/var/evidence/abc123.bin").resolve()
-    >>> protected = frozenset({Path("/etc/app/keys.pem").resolve()})
-    >>> assert_safe_destination(safe, protected)  # no exception
-    >>> assert_safe_destination(Path("/etc/app/keys.pem"), protected)
-    Traceback (most recent call last):
-        ...
-    ValueError: destination '/etc/app/keys.pem' aliases protected path '/etc/app/keys.pem'
-    """
-    resolved = destination.resolve()
-
-    for protected in protected_paths:
-        reason = _alias_reason(resolved, protected)
-        if reason is not None:
-            raise ValueError(
-                f"destination '{resolved}' aliases protected path "
-                f"'{protected}': {reason}"
+    collected = 0
+    with db.get_connection() as conn:
+        with conn.cursor() as cursor:
+            receipt_id = uuid.uuid4().hex
+            selected_refs: list = []
+            completed_refs: list = []
+            cursor.execute(
+                """
+                select content_hash, storage_path
+                from blobs
+                where not exists (
+                    select 1 from tenant_blob_refs
+                    where tenant_blob_refs.content_hash = blobs.content_hash
+                      and tenant_blob_refs.ref_count > 0
+                )
+                order by created_at asc
+                limit %s
+                for update
+                """,
+                (limit,)
             )
+            rows = cursor.fetchall()
+            if not rows:
+                conn.commit()
+                return 0
+
+            for row in rows:
+                content_hash = row["content_hash"] if isinstance(row, dict) else row[0]
+                storage_path = row["storage_path"] if isinstance(row, dict) else row[1]
+                selected_refs.append(_audit_ref(content_hash))
+
+                # Attempt file deletion first
+                try:
+                    if storage_path:
+                        try:
+                            os.unlink(storage_path)
+                        except FileNotFoundError:
+                            pass
+                except OSError as err:
+                    # File deletion failed: do not delete the blob row so it is retried next run
+                    logger.warning(
+                        "Failed to delete evidence blob file; will retry on next run: %s",
+                        type(err).__name__,
+                    )
+                    continue
+
+                cursor.execute("delete from blobs where content_hash = %s", (content_hash,))
+                completed_refs.append(_audit_ref(content_hash))
+                collected += 1
+
+        conn.commit()
+
+    if collected > 0:
+        try:
+            from metrics import collector as metrics_collector
+            metrics_collector.record_deleted_blob(collected)
+        except Exception:
+            pass
+
+    return collected
 
 
 def get_blob_info(content_hash: str) -> dict | None:
@@ -304,6 +328,44 @@ def get_blob_info(content_hash: str) -> dict | None:
             )
             row = cursor.fetchone()
             return dict(row) if row else None
+
+def rotate_encryption_key(new_master_key=None, old_master_key=None, key_id=None, *, content_hashes=None):
+    old_key = old_master_key or os.getenv("MASTER_ENCRYPTION_KEY")
+    new_key = new_master_key or os.getenv("MASTER_ENCRYPTION_KEY")
+    if not old_key:
+        raise ValueError("old master key is not set")
+    if not new_key:
+        raise ValueError("new master key is not set")
+    old_f = Fernet(old_key.encode() if isinstance(old_key, str) else old_key)
+    new_f = Fernet(new_key.encode() if isinstance(new_key, str) else new_key)
+    version = key_id or "v2"
+    rotated = []
+    rollback = []
+    hashes = content_hashes
+    if hashes is None:
+        hashes = []
+        try:
+            import db
+            with db.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("select content_hash from blobs")
+                    for row in cursor.fetchall():
+                        hashes.append(row["content_hash"] if isinstance(row, dict) else row[0])
+        except Exception:
+            hashes = []
+    for content_hash in hashes:
+        info = get_blob_info(content_hash)
+        if not info:
+            continue
+        old_wrapped = info["encrypted_dek"]
+        dek = old_f.decrypt(old_wrapped.encode() if isinstance(old_wrapped, str) else old_wrapped)
+        new_wrapped = new_f.encrypt(dek)
+        assert new_f.decrypt(new_wrapped) == dek
+        versioned = (version + ":" + (new_wrapped.decode() if isinstance(new_wrapped, (bytes, bytearray)) else str(new_wrapped))).encode()
+        record_blob(content_hash, versioned, info.get("size_bytes", 0) or 0, info.get("storage_path", ""))
+        rotated.append(content_hash)
+        rollback.append({"content_hash": content_hash, "encrypted_dek": old_wrapped})
+    return {"key_id": version, "rotated": rotated, "rollback": rollback}
 
 
 def clamp_verify_batch_size(batch_size: int | None) -> int:
