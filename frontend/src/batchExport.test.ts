@@ -1,15 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import type { BatchItemResult } from './batchVerifier'
 import {
-  DEFAULT_MAX_ARCHIVE_FILENAME_LENGTH,
-  boundArchiveFilename,
-  buildBatchArchiveEntries,
-  exportBatchArchiveManifest,
+  BATCH_COMPARISON_PROTOCOL,
+  BATCH_COMPARISON_VERSION,
+  BATCH_REPORT_PROTOCOL,
+  BATCH_REPORT_VERSION,
+  compareBatchManifests,
+  deriveStatementIdentity,
   exportBatchCSV,
+  exportBatchComparisonJSON,
   exportBatchJSON,
   exportReceiptCollection,
+  parseBatchResultManifest,
   sanitizeBatchResults,
-  type BatchArchiveManifest,
+  type BatchResultManifest,
+  type CleanBatchReportItem,
 } from './batchExport'
 import { summarizeBatchCompleteness } from './batchVerifier'
 
@@ -34,6 +39,37 @@ function makeItem(overrides: Partial<BatchItemResult> & { id: string; fileName: 
     durationMs: 120,
     failureReason: null,
     ...rest,
+  }
+}
+
+function makeReportItem(overrides: Partial<CleanBatchReportItem> = {}): CleanBatchReportItem {
+  return {
+    fileName: 'evidence.mp4',
+    fileSizeBytes: 1024,
+    status: 'confirmed',
+    videoHash: '1111222233334444555566667777888811112222333344445555666677778888',
+    metadataHash: 'aaaa222233334444555566667777888811112222333344445555666677778888',
+    sourceHash: '1111222233334444555566667777888811112222333344445555666677778888',
+    tier: 'silent',
+    chainStatus: 'Active',
+    message: 'Confirmed evidence',
+    duplicateOf: null,
+    failureReason: null,
+    durationMs: 120,
+    ...overrides,
+  }
+}
+
+function makeManifest(
+  results: CleanBatchReportItem[],
+  exportedAt = '2026-11-19T00:00:00.000Z',
+): BatchResultManifest {
+  return {
+    protocol: BATCH_REPORT_PROTOCOL,
+    version: BATCH_REPORT_VERSION,
+    exportedAt,
+    totalCount: results.length,
+    results,
   }
 }
 
@@ -110,76 +146,189 @@ describe('batchExport', () => {
     expect(parsed.totalItems).toBe(1)
   })
 
-  it('boundArchiveFilename sanitizes traversal, unsafe characters, reserved names, and enforces max length', () => {
-    expect(boundArchiveFilename('../../secret/folder/clip:01?.mp4')).toBe('clip_01.mp4')
-    expect(boundArchiveFilename('..\\..\\CON.mp4')).toBe('item_CON.mp4')
-    expect(boundArchiveFilename('...///...')).toBe('item')
+  describe('deterministic batch comparison export', () => {
+    const hashA = 'aaaa1111222233334444555566667777aaaa1111222233334444555566667777'
+    const hashB = 'bbbb1111222233334444555566667777bbbb1111222233334444555566667777'
+    const hashC = 'cccc1111222233334444555566667777cccc1111222233334444555566667777'
+    const hashD = 'dddd1111222233334444555566667777dddd1111222233334444555566667777'
 
-    const longName = `${'a'.repeat(180)}.mp4`
-    const bounded = boundArchiveFilename(longName)
-    expect(bounded.length).toBeLessThanOrEqual(DEFAULT_MAX_ARCHIVE_FILENAME_LENGTH)
-    expect(bounded.endsWith('.mp4')).toBe(true)
+    it('separates trust-context changes from added and removed files by statement identity', () => {
+      const baseline = makeManifest(
+        [
+          makeReportItem({
+            fileName: 'unchanged.mp4',
+            videoHash: hashA,
+            status: 'confirmed',
+            tier: 'silent',
+            chainStatus: 'Active',
+          }),
+          makeReportItem({
+            fileName: 'revoked-later.mp4',
+            videoHash: hashB,
+            status: 'confirmed',
+            tier: 'source',
+            chainStatus: 'Active',
+          }),
+          makeReportItem({
+            fileName: 'removed.mp4',
+            videoHash: hashC,
+            status: 'confirmed',
+            tier: 'seal',
+            chainStatus: 'Active',
+          }),
+        ],
+        '2026-11-19T01:00:00.000Z',
+      )
 
-    const withDir = boundArchiveFilename('clip.mp4', { directory: '../receipts/2026', extension: 'json' })
-    expect(withDir).toBe('receipts/2026/clip.json')
-  })
+      const candidate = makeManifest(
+        [
+          makeReportItem({
+            fileName: 'unchanged-renamed.mp4',
+            videoHash: hashA.toUpperCase(),
+            status: 'confirmed',
+            tier: 'silent',
+            chainStatus: 'Active',
+            durationMs: 999,
+          }),
+          makeReportItem({
+            fileName: 'revoked-later.mp4',
+            videoHash: hashB,
+            status: 'revoked',
+            tier: 'source',
+            chainStatus: 'Revoked',
+          }),
+          makeReportItem({
+            fileName: 'added.mp4',
+            videoHash: hashD,
+            status: 'confirmed',
+            tier: 'silent',
+            chainStatus: 'Active',
+          }),
+        ],
+        '2026-11-19T02:00:00.000Z',
+      )
 
-  it('boundArchiveFilename fails closed on invalid maxLength bounds', () => {
-    expect(() => boundArchiveFilename('clip.mp4', { maxLength: 0 })).toThrow(RangeError)
-    expect(() => boundArchiveFilename('clip.mp4', { maxLength: 10 })).toThrow(RangeError)
-    expect(() => boundArchiveFilename('clip.mp4', { maxLength: 300 })).toThrow(RangeError)
-    expect(() => boundArchiveFilename('clip.mp4', { maxLength: 32.5 })).toThrow(RangeError)
-  })
+      const report = compareBatchManifests(baseline, candidate)
 
-  it('buildBatchArchiveEntries prevents duplicate output paths deterministically across collisions and truncation', () => {
-    const sharedPrefix = 'x'.repeat(30)
-    const items: BatchItemResult[] = [
-      makeItem({ id: 'src-1', fileName: 'evidence.mp4' }),
-      makeItem({ id: 'src-2', fileName: 'Evidence.mp4' }),
-      makeItem({ id: 'src-3', fileName: 'nested/dir/evidence.mp4' }),
-      makeItem({ id: 'src-4', fileName: `${sharedPrefix}-first.mp4` }),
-      makeItem({ id: 'src-5', fileName: `${sharedPrefix}-second.mp4` }),
-    ]
+      expect(report.protocol).toBe(BATCH_COMPARISON_PROTOCOL)
+      expect(report.version).toBe(BATCH_COMPARISON_VERSION)
+      expect(report.summary).toEqual({
+        baselineCount: 3,
+        candidateCount: 3,
+        addedCount: 1,
+        removedCount: 1,
+        trustContextChangedCount: 1,
+        unchangedCount: 1,
+      })
 
-    const firstRun = buildBatchArchiveEntries(items, { maxLength: 24 })
-    const secondRun = buildBatchArchiveEntries(items, { maxLength: 24 })
+      expect(report.unchanged).toEqual([`video:${hashA}`])
+      expect(report.added).toHaveLength(1)
+      expect(report.added[0].statementId).toBe(`video:${hashD}`)
+      expect(report.added[0].fileName).toBe('added.mp4')
 
-    expect(firstRun.map((e) => e.outputPath)).toEqual(secondRun.map((e) => e.outputPath))
+      expect(report.removed).toHaveLength(1)
+      expect(report.removed[0].statementId).toBe(`video:${hashC}`)
+      expect(report.removed[0].fileName).toBe('removed.mp4')
 
-    const lowerPaths = firstRun.map((e) => e.outputPath.toLowerCase())
-    expect(new Set(lowerPaths).size).toBe(items.length)
+      expect(report.trustContextChanges).toHaveLength(1)
+      expect(report.trustContextChanges[0]).toEqual({
+        statementId: `video:${hashB}`,
+        fileName: 'revoked-later.mp4',
+        baselineFileName: 'revoked-later.mp4',
+        videoHash: hashB,
+        changedFields: ['chainStatus', 'status'],
+        before: {
+          status: 'confirmed',
+          tier: 'source',
+          chainStatus: 'Active',
+          metadataHash: 'aaaa222233334444555566667777888811112222333344445555666677778888',
+          sourceHash: '1111222233334444555566667777888811112222333344445555666677778888',
+        },
+        after: {
+          status: 'revoked',
+          tier: 'source',
+          chainStatus: 'Revoked',
+          metadataHash: 'aaaa222233334444555566667777888811112222333344445555666677778888',
+          sourceHash: '1111222233334444555566667777888811112222333344445555666677778888',
+        },
+      })
+    })
 
-    for (const entry of firstRun) {
-      expect(entry.outputPath.length).toBeLessThanOrEqual(24)
-    }
+    it('produces byte-for-byte deterministic JSON regardless of input item order', () => {
+      const itemA = makeReportItem({ fileName: 'a.mp4', videoHash: hashA })
+      const itemB = makeReportItem({ fileName: 'b.mp4', videoHash: hashB, status: 'confirmed' })
+      const itemBRevoked = makeReportItem({
+        fileName: 'b.mp4',
+        videoHash: hashB,
+        status: 'revoked',
+        chainStatus: 'Revoked',
+      })
+      const itemC = makeReportItem({ fileName: 'c.mp4', videoHash: hashC })
+      const itemD = makeReportItem({ fileName: 'd.mp4', videoHash: hashD })
 
-    expect(firstRun[0].outputPath).toBe('evidence.mp4')
-    expect(firstRun[1].outputPath).toBe('Evidence-2.mp4')
-    expect(firstRun[2].outputPath).toBe('evidence-3.mp4')
+      const jsonOrder1 = exportBatchComparisonJSON(
+        JSON.stringify(makeManifest([itemA, itemB, itemC])),
+        JSON.stringify(makeManifest([itemBRevoked, itemD, itemA])),
+      )
 
-    // Preserves 1:1 association between every exported result and its source item
-    expect(firstRun.map((e) => e.sourceItemId)).toEqual(['src-1', 'src-2', 'src-3', 'src-4', 'src-5'])
-    expect(firstRun.map((e) => e.sourceFileName)).toEqual(items.map((i) => i.fileName))
-    expect(firstRun.map((e) => e.result.sourceItemId)).toEqual(['src-1', 'src-2', 'src-3', 'src-4', 'src-5'])
-    expect(firstRun.map((e) => e.result.archiveFileName)).toEqual(firstRun.map((e) => e.outputPath))
-  })
+      const jsonOrder2 = exportBatchComparisonJSON(
+        JSON.stringify(makeManifest([itemC, itemA, itemB])),
+        JSON.stringify(makeManifest([itemA, itemD, itemBRevoked])),
+      )
 
-  it('exportBatchArchiveManifest serializes bounded collision-safe archive entries without raw media', () => {
-    const items: BatchItemResult[] = [
-      makeItem({ id: 'a', fileName: 'clip.mp4' }),
-      makeItem({ id: 'b', fileName: 'clip.mp4' }),
-    ]
-    const json = exportBatchArchiveManifest(items, { directory: 'reports', extension: '.json', maxLength: 32 })
-    const parsed = JSON.parse(json) as BatchArchiveManifest
+      expect(jsonOrder1).toBe(jsonOrder2)
+    })
 
-    expect(parsed.protocol).toBe('harpocrates-batch-archive')
-    expect(parsed.version).toBe(1)
-    expect(parsed.maxFileNameLength).toBe(32)
-    expect(parsed.totalEntries).toBe(2)
-    expect(parsed.entries[0].outputPath).toBe('reports/clip.json')
-    expect(parsed.entries[1].outputPath).toBe('reports/clip-2.json')
-    expect(parsed.entries[0].sourceItemId).toBe('a')
-    expect(parsed.entries[1].sourceItemId).toBe('b')
-    expect(json).not.toContain('synthetic media')
+    it('derives distinct statement identities for hashed, duplicate, and unhashed items', () => {
+      expect(deriveStatementIdentity(makeReportItem({ videoHash: hashA.toUpperCase() }))).toBe(
+        `video:${hashA}`,
+      )
+      expect(
+        deriveStatementIdentity(
+          makeReportItem({ fileName: 'copy.mp4', status: 'duplicate', videoHash: hashA }),
+        ),
+      ).toBe(`duplicate:${hashA}:copy.mp4`)
+      expect(
+        deriveStatementIdentity(
+          makeReportItem({ fileName: 'oversized.mp4', fileSizeBytes: 500, videoHash: null }),
+        ),
+      ).toBe('file:oversized.mp4:500')
+    })
+
+    it('fails closed on unsupported manifest version, malformed JSON, count mismatch, or duplicate statement identity', () => {
+      expect(() => parseBatchResultManifest('{not valid json')).toThrow(/malformed JSON/)
+
+      expect(() =>
+        parseBatchResultManifest(
+          JSON.stringify({
+            protocol: BATCH_REPORT_PROTOCOL,
+            version: 2,
+            exportedAt: '2026-11-19T00:00:00.000Z',
+            totalCount: 0,
+            results: [],
+          }),
+        ),
+      ).toThrow(/Unsupported batch result manifest version/)
+
+      expect(() =>
+        parseBatchResultManifest(
+          JSON.stringify({
+            protocol: BATCH_REPORT_PROTOCOL,
+            version: 1,
+            exportedAt: '2026-11-19T00:00:00.000Z',
+            totalCount: 2,
+            results: [makeReportItem()],
+          }),
+        ),
+      ).toThrow(/totalCount must match results\.length/)
+
+      const duplicateManifest = makeManifest([
+        makeReportItem({ fileName: 'first.mp4', videoHash: hashA }),
+        makeReportItem({ fileName: 'second.mp4', videoHash: hashA }),
+      ])
+      expect(() =>
+        compareBatchManifests(duplicateManifest, makeManifest([])),
+      ).toThrow(/Duplicate statement identity in baseline manifest/)
+    })
   })
 })

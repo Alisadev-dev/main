@@ -80,17 +80,11 @@ Credential or nullifier seeds, proof witnesses, generated proofs, raw private
 inputs, and every other field are prohibited from both `localStorage` and
 `sessionStorage`. Keep secret proof-generation data in memory only.
 
-### Encrypted credential vault bounds
+## Batch verification exports & comparison
 
-When optional client-side credential vault persistence is used via
-`src/credentialVault.ts`, only an encrypted `VaultEnvelope` (`{ v, salt, iv, ct }`)
-is persisted under `harpocrates:credential-vault`.
+`src/batchExport.ts` exports privacy-safe batch results (`harpocrates-batch-report` v1)
+and supports deterministic comparison of two versioned batch result manifests via:
 
-- `parseVaultEnvelope` / `validateVaultEnvelope` bound serialized envelopes to
-  `MAX_VAULT_ENVELOPE_BYTES` (16 KiB UTF-8) and decoded ciphertext to
-  `MAX_VAULT_CIPHERTEXT_BYTES` (4 KiB / 8,192 hex characters) before JSON
-  parsing, hex decoding, or PBKDF2 key derivation.
-- `CredentialVault.importEnvelope` validates size, structure, and passphrase
-  decryption before replacing stored state; any failure rejects with
-  `VaultEnvelopeSizeError` / validation error (or `false` on decryption failure)
-  while preserving the existing encrypted vault.
+- `parseBatchResultManifest(input)` — validates `harpocrates-batch-report` v1 JSON or objects and fails closed on malformed JSON, unsupported versions, count mismatches, or invalid item fields.
+- `compareBatchManifests(baseline, candidate)` — matches items by canonical statement identity (`video:<hash>` for hashed items, `duplicate:<hash>:<fileName>` for duplicates, `file:<fileName>:<size>` for unhashed items) and separates `trustContextChanges` (`status`, `tier`, `chainStatus`, `metadataHash`, `sourceHash`) from `added`, `removed`, and `unchanged` entries.
+- `exportBatchComparisonJSON(baseline, candidate)` — serializes a canonical, byte-for-byte deterministic `harpocrates-batch-comparison` v1 JSON report with code-unit-sorted collections and no wall-clock timestamps.
