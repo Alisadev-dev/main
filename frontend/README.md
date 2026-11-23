@@ -89,16 +89,14 @@ Credential or nullifier seeds, proof witnesses, generated proofs, raw private
 inputs, and every other field are prohibited from both `localStorage` and
 `sessionStorage`. Keep secret proof-generation data in memory only.
 
-## Upload Admission & Queue State
+## Cross-tab vault change detection & recovery
 
-Evidence Studio exposes backend upload admission and queue limits, mapping backend capacity reasons to actionable UI states:
+The client-side credential vault (`src/credentialVault.ts`) and safe-storage wrappers (`src/safeStorage.ts`) provide explicit cross-tab vault change detection:
 
-- **Queue & Capacity Reasons**:
-  - `queue_full` (HTTP 503): Service concurrency queue is saturated. Displays actionable wait time from `Retry-After` header and provides a single-click Retry button.
-  - `identity_limit` (HTTP 429): Concurrent in-flight uploads for the active identity tier or address exceeded limits. Displays queue timeout and retry button.
-  - `timeout` (HTTP 503): Request queued but timed out waiting for backend processing slot. Actionable retry state.
-  - `rate_limited` (HTTP 429): Standard API rate limiting with retry-after hint.
-- **Distinct from Invalid Evidence**:
-  - Admission rejections (queue / capacity overloads) are treated as transient and retryable, rendering the `.admission-queue-banner`.
-  - Invalid evidence rejections (e.g., 400 Bad Request, 413 Payload Too Large, 415 Unsupported Media Type, or payload integrity mismatches) are distinct failure states representing malformed inputs or integrity violations, rendering the `.invalid-evidence-banner` without falsely attributing capacity limits.
-
+- **Stale view invalidation**: When another browser tab modifies, replaces, or removes the encrypted vault envelope in `localStorage`, any currently unlocked vault view in other tabs is immediately invalidated (`isStale(): true`). Active seeds and cryptographic keys in memory are quarantined and access via `getSeeds()` fails-closed (`null`) to prevent accidental generation of stale proof witnesses.
+- **Active work preservation**: In-progress witness material and user-registered session work are preserved in a quarantined recovery record (`getPreservedWork()`) and protected against inactivity auto-lock until the user selects an explicit recovery action.
+- **Explicit recovery actions**:
+  - `reload`: Discards the local stale session, reloads from storage, and prompts for the new vault passphrase (or unlocks directly if supplied).
+  - `overwrite`: Re-encrypts the preserved active work into browser storage under a new passphrase, restoring the session to a valid unlocked state.
+  - `discard`: Discards and zeroes out the quarantined active work and cleanly locks the vault.
+- **React integration**: `useCredentialVault` and `<VaultRecoveryBanner />` surface real-time stale notifications and recovery controls with accessible ARIA announcements.
