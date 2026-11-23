@@ -81,25 +81,12 @@ Credential or nullifier seeds, proof witnesses, generated proofs, raw private
 inputs, and every other field are prohibited from both `localStorage` and
 `sessionStorage`. Keep secret proof-generation data in memory only.
 
-## Verification Portal Trust Reason Codes
+## Result tabs and statement digest binding
 
-`src/services/verificationFlow.ts` maps stable trust reason codes
-(`TrustReasonCode`) to accessible, privacy-safe copy (`TRUST_REASON_COPY`,
-`getTrustReasonCopy`, `resolveTrustReasonCode`, and `explainVerificationTrust`),
-and `src/views/VerifyView.tsx` renders this explanation separately below the
-underlying proof result so cryptographic proof validity is never obscured by
-issuer registry standing:
-
-| Reason Code | Meaning |
-| :--- | :--- |
-| `TRUSTED_ISSUER` | On-chain registry lists the issuer as active and the endorsement is current. |
-| `UNKNOWN_ISSUER` | Issuer address is absent from the on-chain institutional allowlist. Explained as an issuer trust gap, distinct from an invalid signature; the underlying proof result remains visible. |
-| `REVOKED_ISSUER` | Issuer is revoked in the on-chain registry; institutional endorsement is withdrawn. |
-| `EXPIRED_ENDORSEMENT` | Issuer is active, but the proof record has passed its endorsement expiry window. |
-| `INVALID_SIGNATURE` | Cryptographic signature or proof/metadata envelope binding failed (`INVALID_EVIDENCE` / `METADATA_ENVELOPE_MISMATCH`). Fail-closed: never downgraded to `UNKNOWN_ISSUER`. |
-| `MALFORMED_ISSUER` | Issuer address on the chain record is malformed or oversized and cannot match a Stellar StrKey. |
-| `ISSUER_LOOKUP_UNAVAILABLE` | Registry lookup failed. Fail-closed: neither an unknown issuer nor an invalid signature. |
-| `NO_ISSUER_REQUIRED` | Identity tier (Tier 1 Silent Witness or Tier 2 Consistent Source) does not carry an institutional issuer. |
-| `ISSUER_CHECK_PENDING` | Issuer lookup against the on-chain registry is still in flight. |
-| `OFFLINE_NOT_CHECKED` | Offline local mode ran without querying the Stellar registry; no institutional trust decision was made. |
-
+`VerificationResultTabs` (`src/components/VerificationResultTabs.tsx`) and
+`resolveVerifiedStatementIdentity` (`src/services/verificationFlow.ts`) bind the
+canonical verified statement digest and matching proof identifier across the
+`Summary`, `Chain binding`, and `Event corroboration` result tabs. Switching
+tabs preserves the exact statement identity across panels, while changing the
+underlying statement digest automatically resets active tab selection and
+dependent commitment/event inspection views.

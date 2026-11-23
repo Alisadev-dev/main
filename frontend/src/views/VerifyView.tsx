@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowLeftRight, CheckCircle2, FileText, Loader2, RefreshCw, Upload, WifiOff, XCircle } from 'lucide-react'
+import { useMemo, useRef, useState } from 'react'
+import { CheckCircle2, FileText, Loader2, RefreshCw, Upload, WifiOff, XCircle } from 'lucide-react'
 import type { UseVerificationReturn } from '../hooks/useVerification'
 import { useIssuerTrust } from '../hooks/useIssuerTrust'
 import { explainVerificationTrust } from '../services/verificationFlow'
@@ -10,8 +10,8 @@ import { ReceiptComparisonView } from '../components/ReceiptComparisonView'
 import { ShareVerificationLink } from '../components/ShareVerificationLink'
 import { VerifierSetStatusPanel } from '../components/VerifierSetStatusPanel'
 import VerificationTimeline from '../components/VerificationTimeline'
-import { VerificationDetailExplorer } from '../components/VerificationDetailExplorer'
-import { buildVerificationDetails } from '../services/verificationFlow'
+import { VerificationResultTabs } from '../components/VerificationResultTabs'
+import { resolveVerifiedStatementIdentity } from '../services/verificationFlow'
 import { shortHash } from '../utils'
 import ProvenanceCard from '../provenance/ProvenanceCard'
 import type { ProvenanceRecord } from '../provenance/provenanceModel'
@@ -81,21 +81,14 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
   const [proofIdInput, setProofIdInput] = useState('')
   const [manifestError, setManifestError] = useState<string | null>(null)
 
-  const initialComparison = useMemo(() => {
-    if (typeof window === 'undefined' || !window.location?.hash) return null
-    if (!window.location.hash.includes('compare=')) return null
-    const parsed = parseReceiptComparisonShareUrl(window.location.hash)
-    return parsed.ok ? parsed : null
-  }, [])
-
-  const [showComparison, setShowComparison] = useState(() => initialComparison !== null)
-
-  // Keep videoHashInput synced when verifyHash updates externally
-  useEffect(() => {
-    if (verifyHash && !videoHashInput) {
+  const [prevVerifyHash, setPrevVerifyHash] = useState(verifyHash)
+  if (verifyHash !== prevVerifyHash) {
+    setPrevVerifyHash(verifyHash)
+    if (verifyHash) {
       setVideoHashInput(verifyHash)
+      setProofIdInput('')
     }
-  }, [verifyHash, videoHashInput])
+  }
 
   const handleManifestFile = async (file: File) => {
     const revision = selectionRevisionRef.current.next()
@@ -152,7 +145,18 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
     }
   }
 
+  const statementIdentity = useMemo(() => {
+    return resolveVerifiedStatementIdentity({
+      verifyHash,
+      videoHashInput,
+      proofIdInput,
+      events,
+      chainProof,
+    })
+  }, [verifyHash, videoHashInput, proofIdInput, events, chainProof])
+
   const revocationProofId =
+    statementIdentity.proofId ??
     events.find((event) => event.video_hash === (videoHashInput || verifyHash) && event.proof_id)?.proof_id ??
     proofIdInput ??
     null
@@ -225,12 +229,18 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
     : null
 
   const shareLinkInput = useMemo((): VerificationShareLinkInput | null => {
-    const activeHash = videoHashInput || verifyHash
-    if (effectiveStatus !== 'success' || !activeHash || !CONTRACT_ID) return null
-    const matchedEvent = events.find((event) => event.proof_id && event.video_hash === activeHash)
-      ?? events.find((event) => !!event.proof_id)
-    const proofId = matchedEvent?.proof_id ?? proofIdInput ?? null
-    const metadataHash = chainProof?.metadataHash ?? provenanceRecord?.metadata.metadataHash ?? null
+    const activeHash = statementIdentity.statementDigest || videoHashInput || verifyHash
+    if (status !== 'success' || !activeHash || !CONTRACT_ID) return null
+    const matchedEvent =
+      statementIdentity.matchingEvents[0] ??
+      events.find((event) => event.proof_id && event.video_hash === activeHash) ??
+      events.find((event) => !!event.proof_id)
+    const proofId = statementIdentity.proofId ?? matchedEvent?.proof_id ?? proofIdInput ?? null
+    const metadataHash =
+      statementIdentity.metadataHash ??
+      chainProof?.metadataHash ??
+      provenanceRecord?.metadata.metadataHash ??
+      null
     if (!proofId || !metadataHash) return null
     const tierRaw = matchedEvent?.tier
     const tier =
@@ -244,56 +254,7 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
       transactionRef: provenanceRecord?.ledger.transactionHash || matchedEvent?.tx_hash || undefined,
       tier,
     }
-  }, [effectiveStatus, videoHashInput, verifyHash, events, proofIdInput, chainProof, provenanceRecord])
-
-  const showTrustDimensions =
-    !isStaleSuccess && (status !== 'idle' || !!chainProof || events.length > 0 || !!errorCode)
-
-  const trustModel = useMemo(() => {
-    const hasHarpocratesMetadata =
-      errorCode === 'METADATA_ENVELOPE_MISMATCH'
-        ? false
-        : effectiveStatus === 'success' &&
-          /(Confirmed:|Metadata only:|Locally verified:)/i.test(verifyResult)
-    return buildVerificationDimensions({
-      hasHarpocratesMetadata,
-      metadataEnvelopeMismatch: errorCode === 'METADATA_ENVELOPE_MISMATCH',
-      onChain: chainProof,
-      events,
-      offline,
-      errorCode,
-    })
-  }, [effectiveStatus, verifyResult, chainProof, events, offline, errorCode])
-
-  const verificationDetails = useMemo(() => {
-    const activeHash = videoHashInput || verifyHash
-    return buildVerificationDetails({
-      videoHash: activeHash,
-      hasHarpocratesMetadata:
-        offline
-          ? status === 'success' && !errorCode
-          : status === 'success' || events.length > 0,
-      events,
-      onChain: chainProof,
-      proofId: proofIdInput || revocationProofId,
-      tier: shareLinkInput?.tier,
-      metadataHash: chainProof?.metadataHash || provenanceRecord?.metadata.metadataHash || null,
-      offline,
-      errorCode,
-    })
-  }, [
-    videoHashInput,
-    verifyHash,
-    offline,
-    status,
-    errorCode,
-    events,
-    chainProof,
-    proofIdInput,
-    revocationProofId,
-    shareLinkInput?.tier,
-    provenanceRecord?.metadata.metadataHash,
-  ])
+  }, [status, statementIdentity, videoHashInput, verifyHash, events, proofIdInput, chainProof, provenanceRecord])
 
   return (
     <section className="workspace app-page verify-page" id="verify">
@@ -579,6 +540,13 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
           errorCode={errorCode}
         />
 
+        <VerificationResultTabs
+          identity={statementIdentity}
+          status={status}
+          offline={offline}
+          chainProof={chainProof}
+        />
+
         {/* Action row — reachable on mobile, adequate touch targets */}
         <div className="verify-actions" role="group" aria-label="Verification actions">
           {isVerifying ? (
@@ -638,11 +606,11 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
         <dl className="data-list">
           <div>
             <dt>Received Hash</dt>
-            <dd style={{ overflowWrap: 'anywhere', wordBreak: 'break-all', textAlign: 'right' }}>{shortHash(videoHashInput || verifyHash)}</dd>
+            <dd style={{ overflowWrap: 'anywhere', wordBreak: 'break-all', textAlign: 'right' }}>{shortHash(statementIdentity.statementDigest || videoHashInput || verifyHash)}</dd>
           </div>
           <div>
             <dt>Proof ID</dt>
-            <dd style={{ overflowWrap: 'anywhere', wordBreak: 'break-all', textAlign: 'right' }}>{shortHash(proofIdInput || revocationProofId || '')}</dd>
+            <dd style={{ overflowWrap: 'anywhere', wordBreak: 'break-all', textAlign: 'right' }}>{shortHash(statementIdentity.proofId || proofIdInput || revocationProofId || '')}</dd>
           </div>
           <div>
             <dt>Chain Status</dt>

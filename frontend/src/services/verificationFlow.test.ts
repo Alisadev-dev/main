@@ -1,133 +1,138 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import {
-  createVerificationRevisionGuard,
-  runVerificationFlow,
-  verifyUploadedVideo,
+  resolveVerifiedStatementIdentity,
+  shouldResetDependentTabState,
 } from './verificationFlow'
+import type { ChainProofRecord } from '../stellarTypes'
+import type { ProofEvent } from '../types'
 
-const { extractMetadata, fetchProofEventsByVideo, getOnChainProof } = vi.hoisted(() => ({
-  extractMetadata: vi.fn(),
-  fetchProofEventsByVideo: vi.fn(),
-  getOnChainProof: vi.fn(),
-}))
+const DIGEST_A = '1'.repeat(64)
+const DIGEST_B = '2'.repeat(64)
+const PROOF_A = `0x${'a'.repeat(64)}`
+const PROOF_UNRELATED = `0x${'e'.repeat(64)}`
 
-vi.mock('./verificationService', () => ({
-  extractMetadata,
-  fetchProofEventsByVideo,
-  getOnChainProof,
-}))
+function makeChainProof(overrides: Partial<ChainProofRecord> = {}): ChainProofRecord {
+  return {
+    videoHash: DIGEST_A,
+    metadataHash: 'm'.repeat(64),
+    tier: 1,
+    source: 'GSRC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEF',
+    issuer: 'GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEF',
+    createdAt: '1750000000',
+    expiresAt: 0,
+    status: 1,
+    ...overrides,
+  }
+}
 
-const HASH_A = 'a'.repeat(64)
-const HASH_B = 'b'.repeat(64)
+describe('resolveVerifiedStatementIdentity', () => {
+  it('resolves active verified statement digest and matching event proofId', () => {
+    const events: ProofEvent[] = [
+      {
+        id: 1,
+        video_hash: DIGEST_B,
+        proof_id: PROOF_UNRELATED,
+        tier: 'seal',
+        tx_hash: 'tx1',
+        created_at: '2026-01-01T00:00:00Z',
+      },
+      {
+        id: 2,
+        video_hash: DIGEST_A,
+        proof_id: PROOF_A,
+        tier: 'source',
+        tx_hash: 'tx2',
+        created_at: '2026-01-01T01:00:00Z',
+      },
+    ]
 
-describe('createVerificationRevisionGuard', () => {
-  it('issues monotonically increasing revisions and invalidates previous ones', () => {
-    const guard = createVerificationRevisionGuard()
-    expect(guard.current()).toBe(0)
-    expect(guard.isCurrent(0)).toBe(false)
-    expect(guard.isCurrent(-1)).toBe(false)
+    const result = resolveVerifiedStatementIdentity({
+      verifyHash: DIGEST_A,
+      events,
+      chainProof: makeChainProof(),
+    })
 
-    const rev1 = guard.next()
-    expect(rev1).toBe(1)
-    expect(guard.isCurrent(rev1)).toBe(true)
-
-    const rev2 = guard.next()
-    expect(rev2).toBe(2)
-    expect(guard.isCurrent(rev1)).toBe(false)
-    expect(guard.isCurrent(rev2)).toBe(true)
+    expect(result.statementDigest).toBe(DIGEST_A)
+    expect(result.statementKey).toBe(DIGEST_A)
+    expect(result.proofId).toBe(PROOF_A)
+    expect(result.matchingEvents).toHaveLength(1)
+    expect(result.matchingEvents[0].id).toBe(2)
+    expect(result.chainSource).toBe('GSRC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEF')
+    expect(result.metadataHash).toBe('m'.repeat(64))
   })
 
-  it('invalidates the active revision on cancel/clear', () => {
-    const guard = createVerificationRevisionGuard()
-    const rev1 = guard.next()
-    expect(guard.isCurrent(rev1)).toBe(true)
+  it('never borrows proof ID from an event with a different statement digest', () => {
+    const events: ProofEvent[] = [
+      {
+        id: 1,
+        video_hash: DIGEST_B,
+        proof_id: PROOF_UNRELATED,
+        tier: 'seal',
+        tx_hash: 'tx1',
+        created_at: '2026-01-01T00:00:00Z',
+      },
+    ]
 
-    const invalidated = guard.invalidate()
-    expect(invalidated).toBeGreaterThan(rev1)
-    expect(guard.isCurrent(rev1)).toBe(false)
+    const result = resolveVerifiedStatementIdentity({
+      verifyHash: DIGEST_A,
+      events,
+      chainProof: null,
+    })
+
+    expect(result.statementDigest).toBe(DIGEST_A)
+    expect(result.proofId).toBeNull()
+    expect(result.matchingEvents).toHaveLength(0)
+  })
+
+  it('ignores typed proof ID input if videoHashInput conflicts with verified statement digest', () => {
+    const result = resolveVerifiedStatementIdentity({
+      verifyHash: DIGEST_A,
+      videoHashInput: DIGEST_B,
+      proofIdInput: 'stale-typed-proof-id',
+      events: [],
+      chainProof: null,
+    })
+
+    expect(result.statementDigest).toBe(DIGEST_A)
+    expect(result.proofId).toBeNull()
+  })
+
+  it('normalizes 0x prefixes and lowercase hex digests', () => {
+    const result = resolveVerifiedStatementIdentity({
+      verifyHash: `0x${DIGEST_A.toUpperCase()}`,
+      proofIdInput: `0X${'F'.repeat(64)}`,
+      events: [],
+      chainProof: null,
+    })
+
+    expect(result.statementDigest).toBe(DIGEST_A)
+    expect(result.proofId).toBe(`0x${'f'.repeat(64)}`)
+  })
+
+  it('handles empty statement inputs safely without throwing', () => {
+    const result = resolveVerifiedStatementIdentity({
+      verifyHash: '',
+      events: [],
+      chainProof: null,
+    })
+
+    expect(result.statementDigest).toBe('')
+    expect(result.statementKey).toBe('__empty_statement__')
+    expect(result.proofId).toBeNull()
+    expect(result.metadataHash).toBeNull()
+    expect(result.chainSource).toBeNull()
+    expect(result.matchingEvents).toHaveLength(0)
   })
 })
 
-describe('runVerificationFlow', () => {
-  beforeEach(() => {
-    extractMetadata.mockReset()
-    fetchProofEventsByVideo.mockReset()
-    getOnChainProof.mockReset()
+describe('shouldResetDependentTabState', () => {
+  it('returns true when statementKey changes', () => {
+    expect(shouldResetDependentTabState(DIGEST_A, DIGEST_B)).toBe(true)
+    expect(shouldResetDependentTabState('__empty_statement__', DIGEST_A)).toBe(true)
   })
 
-  it('binds the supplied request revision to the returned result', async () => {
-    fetchProofEventsByVideo.mockResolvedValue([])
-    getOnChainProof.mockResolvedValue(null)
-
-    const result = await runVerificationFlow(HASH_A, { revision: 42 })
-
-    expect(result.videoHash).toBe(HASH_A)
-    expect(result.revision).toBe(42)
-  })
-
-  it('keeps revision undefined when caller does not supply one', async () => {
-    fetchProofEventsByVideo.mockResolvedValue([])
-    getOnChainProof.mockResolvedValue(null)
-
-    const result = await runVerificationFlow(HASH_A)
-
-    expect(result.revision).toBeUndefined()
-  })
-
-  it('rejects with AbortError when signal is already aborted before network calls', async () => {
-    const controller = new AbortController()
-    controller.abort()
-
-    await expect(
-      runVerificationFlow(HASH_A, { signal: controller.signal, revision: 1 }),
-    ).rejects.toMatchObject({ name: 'AbortError' })
-
-    expect(fetchProofEventsByVideo).not.toHaveBeenCalled()
-    expect(getOnChainProof).not.toHaveBeenCalled()
-  })
-
-  it('rejects with AbortError when signal aborts while getOnChainProof is in flight', async () => {
-    const controller = new AbortController()
-    fetchProofEventsByVideo.mockResolvedValue([])
-    getOnChainProof.mockImplementation(async () => {
-      controller.abort()
-      return {
-        videoHash: HASH_A,
-        metadataHash: HASH_B,
-        tier: 1,
-        status: 1,
-        createdAt: '123',
-        expiresAt: 0,
-        source: null,
-        issuer: null,
-      }
-    })
-
-    await expect(
-      runVerificationFlow(HASH_A, { signal: controller.signal, revision: 2 }),
-    ).rejects.toMatchObject({ name: 'AbortError' })
-  })
-})
-
-describe('verifyUploadedVideo', () => {
-  beforeEach(() => {
-    extractMetadata.mockReset()
-    fetchProofEventsByVideo.mockReset()
-    getOnChainProof.mockReset()
-  })
-
-  it('binds revision and aborts cleanly if cancelled after extraction', async () => {
-    const controller = new AbortController()
-    const file = new File(['evidence'], 'evidence.mp4', { type: 'video/mp4' })
-    extractMetadata.mockImplementation(async () => {
-      controller.abort()
-      return { hasHarpocratesMetadata: true }
-    })
-
-    await expect(
-      verifyUploadedVideo(file, HASH_A, { signal: controller.signal, revision: 7 }),
-    ).rejects.toMatchObject({ name: 'AbortError' })
-
-    expect(fetchProofEventsByVideo).not.toHaveBeenCalled()
+  it('returns false when statementKey is identical', () => {
+    expect(shouldResetDependentTabState(DIGEST_A, DIGEST_A)).toBe(false)
+    expect(shouldResetDependentTabState('__empty_statement__', '__empty_statement__')).toBe(false)
   })
 })
