@@ -466,6 +466,7 @@ def create_app() -> Flask:
         default_chunk_size=getattr(config, "upload_chunk_bytes", None),
         default_max_size=getattr(config, "upload_max_bytes", None) if getattr(config, "upload_max_bytes", None) is not None else config.max_video_bytes,
     )
+    upload_session_registry = UploadSessionRegistry()
 
     @app.before_request
     def start_request_context():
@@ -1049,41 +1050,44 @@ def create_app() -> Flask:
     @limiter.limit(config.ratelimit_upload_session)
     def create_upload_session():
         session_id = str(uuid.uuid4())
-        init_session_dir(session_id, temp_dir=getattr(config, "upload_temp_dir", None))
+        session_dir = Path(tempfile.gettempdir()) / f"harpocrates-session-{session_id}"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        session = upload_session_registry.create(session_id, session_dir)
+        ticket = admission_controller.create_ticket(session_id)
+        session.attach_queued_admission(ticket.id if ticket is not None else None)
         return jsonify({"sessionId": session_id})
 
     @app.put("/api/stego/upload-session/<session_id>/chunk/<int:chunk_index>")
     @limiter.limit(config.ratelimit_upload_chunk)
     @require_capacity(admission_controller)
     def upload_chunk(session_id: str, chunk_index: int):
-        session_dir = get_session_dir(session_id, temp_dir=getattr(config, "upload_temp_dir", None))
+        session = upload_session_registry.get(session_id)
+        if session is None:
+            return jsonify({"error": "session not found"}), 404
+        session_dir = session.session_dir
         if not session_dir.exists():
             return jsonify({"error": "session not found"}), 404
-        if is_session_expired(session_dir, ttl_seconds=config.upload_session_ttl_seconds):
-            return error_response(
-                code=GONE,
-                message="upload session has expired",
-                status=410,
-            )
-        
+
         chunk = request.files.get("chunk")
         if chunk is None:
             return jsonify({"error": "chunk is required"}), 400
         if chunk_index < 0:
             return jsonify({"error": "chunk_index must be non-negative"}), 400
 
-        # Persist each session chunk with bounded-chunk hashing for integrity.
-        # Hold an active worker reference so retention sweeps avoid deleting active chunks.
-        with admission_controller.active_session(session_id):
-            g.upload_config = config
-            streaming_chunk = create_streaming_file_storage(chunk)
-            chunk_path = session_dir / f"chunk-{chunk_index}"
-            try:
-                streaming_chunk.save(str(chunk_path))
-            except RequestEntityTooLarge:
-                return jsonify({"error": "chunk exceeds size limit"}), 413
-            touch_session(session_dir)
+        admission_ticket = getattr(g, "admission_ticket", None)
+        if admission_ticket is not None:
+            session.attach_admission(admission_ticket.id)
 
+        g.upload_config = config
+        streaming_chunk = create_streaming_file_storage(chunk, cancellation=session)
+        chunk_path = session_dir / f"chunk-{chunk_index}"
+        try:
+            with session.writer():
+                streaming_chunk.save(str(chunk_path))
+        except UploadCancelledError as exc:
+            return jsonify({"error": str(exc), "code": exc.code}), exc.status_code
+        except RequestEntityTooLarge:
+            return jsonify({"error": "chunk exceeds size limit"}), 413
         return jsonify({
             "ok": True,
             "chunkIndex": progress.index,
@@ -1109,7 +1113,10 @@ def create_app() -> Flask:
     @app.post("/api/stego/upload-session/<session_id>/commit")
     @limiter.limit(config.ratelimit_upload_session)
     def commit_upload_session(session_id: str):
-        session_dir = get_session_dir(session_id, temp_dir=getattr(config, "upload_temp_dir", None))
+        session = upload_session_registry.get(session_id)
+        if session is None:
+            return jsonify({"error": "session not found"}), 404
+        session_dir = session.session_dir
         if not session_dir.exists():
             return jsonify({"error": "session not found"}), 404
         if is_session_expired(session_dir, ttl_seconds=config.upload_session_ttl_seconds):
@@ -1118,6 +1125,15 @@ def create_app() -> Flask:
                 message="upload session has expired",
                 status=410,
             )
+
+        admission_ticket = getattr(g, "admission_ticket", None)
+        if admission_ticket is not None:
+            session.attach_admission(admission_ticket.id)
+        session.mark_committing()
+        try:
+            session.check_cancelled()
+        except UploadCancelledError as exc:
+            return jsonify({"error": str(exc), "code": exc.code}), exc.status_code
 
         metadata_raw = request.form.get("metadata")
         if metadata_raw is None:
@@ -1145,6 +1161,19 @@ def create_app() -> Flask:
             return jsonify({"error": "session has no chunks"}), 400
 
         # Bounded-chunk concat + SHA-256 so commit never buffers whole chunks.
+        try:
+            with session.writer():
+                source_hash, _written = hash_paths_concat(
+                    chunk_files,
+                    combined_path,
+                    chunk_size=getattr(config, "upload_chunk_bytes", None),
+                    max_size=getattr(config, "upload_max_bytes", config.max_video_bytes),
+                    cancellation=session,
+                )
+        except UploadCancelledError as exc:
+            return jsonify({"error": str(exc), "code": exc.code}), exc.status_code
+
+        # Sniff assembled file before handing it to ffmpeg.
         try:
             with session.writer():
                 source_hash, _written = hash_paths_concat(

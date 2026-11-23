@@ -1,4 +1,4 @@
-import contextlib
+import math
 import threading
 import time
 import uuid
@@ -8,6 +8,135 @@ from functools import wraps
 from typing import Dict, List, Optional, Tuple
 
 from flask import g, request, jsonify
+
+
+RETRY_AFTER_MIN_SECONDS = 1
+RETRY_AFTER_MAX_SECONDS = 60
+
+ADMISSION_IDENTITY_QUOTA = "ADMISSION_IDENTITY_QUOTA"
+ADMISSION_QUEUE_SATURATION = "ADMISSION_QUEUE_SATURATION"
+ADMISSION_PROCESSING_CAPACITY = "ADMISSION_PROCESSING_CAPACITY"
+
+ADMISSION_DECISION_SCHEMA = {
+    "title": "UploadAdmissionDecision",
+    "type": "object",
+    "required": [
+        "code",
+        "reason",
+        "message",
+        "retryAfterSeconds",
+        "retryable",
+    ],
+    "properties": {
+        "code": {
+            "type": "string",
+            "enum": [
+                ADMISSION_IDENTITY_QUOTA,
+                ADMISSION_QUEUE_SATURATION,
+                ADMISSION_PROCESSING_CAPACITY,
+            ],
+        },
+        "reason": {
+            "type": "string",
+            "enum": ["identity_quota", "queue_saturation", "processing_capacity"],
+        },
+        "message": {"type": "string"},
+        "retryAfterSeconds": {
+            "type": "integer",
+            "minimum": RETRY_AFTER_MIN_SECONDS,
+            "maximum": RETRY_AFTER_MAX_SECONDS,
+        },
+        "retryable": {"type": "boolean", "const": True},
+        "maxRetryAfterSeconds": RETRY_AFTER_MAX_SECONDS,
+    },
+}
+
+
+class AdmissionReason(str, Enum):
+    IDENTITY_QUOTA = "identity_quota"
+    QUEUE_SATURATION = "queue_saturation"
+    PROCESSING_CAPACITY = "processing_capacity"
+
+
+@dataclass(frozen=True)
+class AdmissionDecision:
+    legacy_reason: str
+    reason: AdmissionReason
+    code: str
+    message: str
+    status: int
+    retry_after_seconds: int
+
+    def as_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "reason": self.reason.value,
+            "message": self.message,
+            "retryAfterSeconds": self.retry_after_seconds,
+            "retryable": True,
+        }
+
+
+_ADMISSION_DECISIONS = {
+    "identity_limit": (
+        AdmissionReason.IDENTITY_QUOTA,
+        ADMISSION_IDENTITY_QUOTA,
+        "upload concurrency quota reached for this client",
+        429,
+    ),
+    "queue_full": (
+        AdmissionReason.QUEUE_SATURATION,
+        ADMISSION_QUEUE_SATURATION,
+        "upload admission queue is full",
+        503,
+    ),
+    "timeout": (
+        AdmissionReason.PROCESSING_CAPACITY,
+        ADMISSION_PROCESSING_CAPACITY,
+        "upload processing capacity is temporarily unavailable",
+        503,
+    ),
+    "cancelled": (
+        AdmissionReason.PROCESSING_CAPACITY,
+        ADMISSION_PROCESSING_CAPACITY,
+        "upload processing capacity is temporarily unavailable",
+        503,
+    ),
+}
+
+
+def admission_decision(reason: str, timeout_seconds: float) -> AdmissionDecision:
+    decision_reason, code, message, status = _ADMISSION_DECISIONS.get(
+        reason,
+        _ADMISSION_DECISIONS["timeout"],
+    )
+    retry_after = math.ceil(max(0.0, float(timeout_seconds)))
+    retry_after = max(RETRY_AFTER_MIN_SECONDS, min(RETRY_AFTER_MAX_SECONDS, retry_after))
+    return AdmissionDecision(
+        legacy_reason=reason,
+        reason=decision_reason,
+        code=code,
+        message=message,
+        status=status,
+        retry_after_seconds=retry_after,
+    )
+
+
+def admission_error_response(decision: AdmissionDecision):
+    payload = decision.as_dict()
+    request_id = getattr(g, "request_id", "unknown")
+    return jsonify({
+        "ok": False,
+        "error": {
+            "code": decision.code,
+            "message": decision.message,
+            "request_id": request_id,
+            "admission": payload,
+        },
+        "reason": decision.legacy_reason,
+        "admissionReason": decision.reason.value,
+        "retryAfterSeconds": decision.retry_after_seconds,
+    })
 
 
 class AdmissionState(str, Enum):
@@ -25,16 +154,6 @@ class AdmissionTicket:
     state: AdmissionState = AdmissionState.QUEUED
     cancel_event: threading.Event = field(default_factory=threading.Event)
     queued: bool = False
-
-
-class AdmissionRejectedError(Exception):
-    """Raised when admission control rejects work due to backpressure."""
-
-    def __init__(self, reason: str, status_code: int, retry_after: int):
-        super().__init__(f"admission rejected: {reason}")
-        self.reason = reason
-        self.status_code = status_code
-        self.retry_after = retry_after
 
 
 class AdmissionController:
@@ -60,21 +179,11 @@ class AdmissionController:
         self._lock = threading.Lock()
         self._current_queue = 0
         self._identity_counts: Dict[str, int] = {}
-        self._active_sessions: Dict[str, int] = {}
+        self._tickets: Dict[str, AdmissionTicket] = {}
+        self._identity_tickets: Dict[str, List[str]] = {}
         self._semaphore = threading.Semaphore(max_concurrent)
 
-    def acquire(self, identity: str, session_id: str | None = None) -> Tuple[bool, str]:
-        """
-        Attempt to acquire a concurrency slot.
-        Optionally associates the execution with an upload session ID.
-        Returns (True, "ok") if successful, or (False, reason) if rejected.
-        """
-        success, reason = self._acquire_slot(identity)
-        if success and session_id:
-            self.acquire_session(session_id)
-        return success, reason
-
-    def _acquire_slot(self, identity: str) -> Tuple[bool, str]:
+    def create_ticket(self, identity: str) -> Optional[AdmissionTicket]:
         with self._lock:
             if self._identity_counts.get(identity, 0) >= self.max_per_identity:
                 return None
@@ -166,60 +275,70 @@ class AdmissionController:
                 ticket.state = AdmissionState.CANCELLED
             return True
 
-    def release(self, identity: str, session_id: str | None = None) -> None:
-        """
-        Release a previously acquired concurrency slot.
-        Optionally releases an associated upload session reference.
-        """
-        if session_id:
-            self.release_session(session_id)
+    def release(self, identity: str) -> None:
         with self._lock:
-            return self._reserved_storage.get(identity, 0)
-
-    def acquire_session(self, session_id: str) -> None:
-        """Register an active worker reference to an upload session.
-
-        While an upload session is referenced by one or more active workers,
-        its chunks are protected from retention cleanup or expiration purges.
-        """
-        if not session_id:
-            return
-        with self._lock:
-            self._active_sessions[session_id] = (
-                self._active_sessions.get(session_id, 0) + 1
+            ticket_ids = list(reversed(self._identity_tickets.get(identity, [])))
+            ticket_id = next(
+                (
+                    candidate
+                    for candidate in ticket_ids
+                    if self._tickets[candidate].state
+                    in (AdmissionState.ACTIVE, AdmissionState.CANCELLING)
+                ),
+                None,
             )
+        if ticket_id is not None:
+            self.release_ticket(ticket_id)
 
-    def release_session(self, session_id: str) -> None:
-        """Release an active worker reference to an upload session."""
-        if not session_id:
+    def release_ticket(self, ticket_id: str) -> bool:
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                return False
+            if ticket.state is AdmissionState.QUEUED:
+                self._leave_queue(ticket)
+                self._finish_ticket(ticket, AdmissionState.CANCELLED)
+                return True
+            if ticket.state is AdmissionState.CANCELLED:
+                if ticket.queued:
+                    self._leave_queue(ticket)
+                    self._finish_ticket(ticket, AdmissionState.CANCELLED)
+                    return True
+                return False
+            if ticket.state not in (
+                AdmissionState.ACTIVE,
+                AdmissionState.CANCELLING,
+            ):
+                return False
+            final_state = (
+                AdmissionState.CANCELLED
+                if ticket.state is AdmissionState.CANCELLING
+                else AdmissionState.RELEASED
+            )
+            self._identity_counts[ticket.identity] -= 1
+            if self._identity_counts[ticket.identity] == 0:
+                del self._identity_counts[ticket.identity]
+            self._finish_ticket(ticket, final_state)
+        self._semaphore.release()
+        return True
+
+    def _leave_queue(self, ticket: AdmissionTicket) -> None:
+        if not ticket.queued:
             return
-        with self._lock:
-            count = self._active_sessions.get(session_id, 0) - 1
-            if count <= 0:
-                self._active_sessions.pop(session_id, None)
-            else:
-                self._active_sessions[session_id] = count
+        ticket.queued = False
+        self._current_queue -= 1
+        self._identity_counts[ticket.identity] -= 1
+        if self._identity_counts[ticket.identity] == 0:
+            del self._identity_counts[ticket.identity]
 
-    def is_session_active(self, session_id: str) -> bool:
-        """Return whether an upload session is currently referenced by active workers."""
-        if not session_id:
-            return False
-        with self._lock:
-            return self._active_sessions.get(session_id, 0) > 0
-
-    def get_active_sessions(self) -> set[str]:
-        """Return a snapshot set of upload session IDs referenced by active workers."""
-        with self._lock:
-            return set(self._active_sessions.keys())
-
-    @contextlib.contextmanager
-    def active_session(self, session_id: str):
-        """Context manager to hold an active worker session reference."""
-        self.acquire_session(session_id)
-        try:
-            yield
-        finally:
-            self.release_session(session_id)
+    def _finish_ticket(self, ticket: AdmissionTicket, state: AdmissionState) -> None:
+        ticket.state = state
+        self._tickets.pop(ticket.id, None)
+        identity_tickets = self._identity_tickets.get(ticket.identity, [])
+        if ticket.id in identity_tickets:
+            identity_tickets.remove(ticket.id)
+        if not identity_tickets:
+            self._identity_tickets.pop(ticket.identity, None)
 
 
 def _get_client_identity() -> str:
@@ -243,31 +362,28 @@ def require_capacity(controller: AdmissionController):
         @wraps(f)
         def wrapped(*args, **kwargs):
             identity = _get_client_identity()
-            session_id = kwargs.get("session_id")
-            if not session_id and hasattr(request, "view_args") and request.view_args:
-                session_id = request.view_args.get("session_id")
+            acquired, reason, ticket = controller.acquire_ticket(identity)
+            g.admission_ticket = ticket
 
-            acquired, reason = controller.acquire(identity, session_id=session_id)
-            
             if not acquired:
                 from metrics import collector as metrics_collector
 
                 endpoint = request.url_rule.rule if request.url_rule else request.path
                 metrics_collector.record_rejection(reason, endpoint)
 
-                status_code = 429 if reason == "identity_limit" else 503
-                response = jsonify({
-                    "error": "service overloaded",
-                    "reason": reason,
-                })
-                response.status_code = status_code
-                response.headers["Retry-After"] = str(int(controller.timeout_seconds * 2) or 5)
+                decision = admission_decision(reason, controller.timeout_seconds)
+                response = admission_error_response(decision)
+                response.status_code = decision.status
+                response.headers["Retry-After"] = str(decision.retry_after_seconds)
                 return response
 
             try:
                 return f(*args, **kwargs)
             finally:
-                controller.release(identity, session_id=session_id)
+                if ticket is not None:
+                    controller.release_ticket(ticket.id)
+                else:
+                    controller.release(identity)
         return wrapped
     return decorator
 

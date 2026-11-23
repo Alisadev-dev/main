@@ -19,11 +19,12 @@ import re
 import secrets
 import shutil
 import tempfile
-import time
-from dataclasses import dataclass
-from datetime import datetime
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, Optional, Tuple, Union
+from typing import BinaryIO, Iterable, Iterator, Optional, Tuple, Union
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
