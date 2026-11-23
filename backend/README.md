@@ -428,47 +428,33 @@ changes: it orphans every previously cached entry instead of silently reusing
 results derived under a different scheme. Keys are digests only — proof
 material is never stored in plaintext or logged.
 
-## Registration Reconciliation Checkpoint
+## Verified Indexer Checkpoint Manifest
 
-`registration_reconcile.py` persists a single checkpoint containing the last
-trusted Stellar ledger, the network name/passphrase identity, and a fingerprint
-of the deployment configuration (`HARPOCRATES_RELEASE_ID`,
-`HARPOCRATES_RELEASE_NETWORK`, and the passphrase). The file is written atomically
-under `HARPOCRATES_REGISTRATION_RECONCILE_DIR` with owner-only permissions.
+The Soroban event indexer (`chain_indexer.py`) binds each persisted checkpoint
+to a canonical, SHA-256-verified manifest (`IndexerCheckpointManifest`) that
+records:
 
-`CheckpointStore.record()` is idempotent for the same ledger and rejects lower
-ledgers. `load()`, `save()`, and `reconcile_registration()` refuse a checkpoint
-whose network or deployment fingerprint differs from the current configuration,
-so a stale or cross-network state file cannot advance confirmed registration
-state. The passphrase defaults to the known value for the configured release
-network; set `STELLAR_NETWORK_PASSPHRASE` explicitly for local or forked
-networks.
+- `manifest_version` (`1`)
+- `indexer_id` (default `soroban_events`)
+- `network` (canonical Stellar network, e.g. `testnet`, `mainnet`, `futurenet`, `standalone`)
+- `contract_id` (registry contract ID)
+- `schema_version` (projection schema version, default `"1"`)
+- `cursor` (Soroban RPC paging cursor)
+- `observed_ledger` (non-negative observed ledger sequence)
+- `manifest_hash` (domain-separated SHA-256 digest of the canonical JSON payload)
 
-```python
-from registration_reconcile import CheckpointStore, DeploymentIdentity
+On resume, `poll_indexer_once()` verifies the manifest digest and checks
+compatibility against the active `network`, `contract_id`, `schema_version`,
+and `observed_ledger` monotonicity before fetching events or mutating
+`proof_events`. Any tampered manifest, target mismatch, or ledger regression
+fails closed with `CheckpointVerificationError` or `IncompatibleCheckpointError`
+without mutating the trusted projection.
 
-deployment = DeploymentIdentity.from_config()
-store = CheckpointStore(deployment=deployment)
-checkpoint = store.record(1_250)
-```
+Optional environment variables:
 
-## Encryption Envelope Versions
-
-`evidence_storage.py` records an explicit `envelope_version` column on `blobs`
-(default `fernet-v1`, added in migration 13):
-
-- `classify_envelope_version()` distinguishes supported versions (`fernet-v1`),
-  known legacy envelopes (`None` for pre-versioning rows, `legacy-v0`,
-  `fernet-v0`), and unsupported formats (any unrecognized, empty, or non-string
-  identifier).
-- `record_blob()` validates and stores `envelope_version`, rejecting known
-  legacy or unsupported values on write.
-- `decrypt_blob_ciphertext()` dispatches strictly on the recorded
-  `envelope_version` and never guesses a decryption algorithm from malformed
-  ciphertext. Known legacy versions raise `LegacyEnvelopeVersionError`, while
-  unsupported formats fail closed with `UnsupportedEnvelopeVersionError`.
-  Pre-versioning rows with `envelope_version IS NULL` remain compatible with
-  Fernet.
+- `STELLAR_NETWORK` / `HARPOCRATES_NETWORK`: Explicit network name bound to the checkpoint (inferred from `SOROBAN_RPC_URL` if unset).
+- `INDEXER_SCHEMA_VERSION`: Projection schema version bound to the checkpoint (default `"1"`).
+- `INDEXER_CHECKPOINT_MANIFEST_PATH`: Optional file path for atomic on-disk checkpoint manifest persistence.
 
 ## Test
 
