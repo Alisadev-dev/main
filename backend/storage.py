@@ -171,7 +171,8 @@ def sweep_job_files(
 
     Deletes files for jobs in terminal states older than TTL, and orphaned files
     with no job row older than TTL.
-    Never removes files for running or pending jobs.
+    Never removes files for running or pending jobs, nor for a job whose
+    process is still writing after a deadline closed it (``_writer_active``).
     Logs counts only, never file names derived from user input.
 
     Each sweep writes a two-phase deletion receipt: the approved selection is
@@ -288,7 +289,15 @@ def sweep_job_files(
             # Orphaned file with no job row
             file_age = (now_dt - file_mtime).total_seconds()
             if file_age >= ttl_seconds:
-                selected.append(entry)
+                try:
+                    entry.unlink(missing_ok=True)
+                    purged_count += 1
+                except OSError:
+                    pass
+        elif job.get("_writer_active"):
+            # The job was closed by a deadline while its process was still
+            # running: never remove artifacts that may still be written.
+            continue
         else:
             status = job.get("status")
             if status in terminal_states:

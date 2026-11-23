@@ -88,34 +88,29 @@ they reach the logger or the job-failure record:
 Sanitized diagnostics are stored in the job's `result` error fields; the raw
 exception is never persisted.
 
-## `attempts` (worker attempt history)
+## Processing deadlines
 
-Every lease opens an attempt; the job keeps the newest
-`JOB_ATTEMPT_HISTORY_LIMIT` (10) attempts, oldest dropped first. The field is
-absent until the first lease.
+Two separate limits, both off by default (`0`), so existing deployments keep
+today's behaviour:
+
+| Setting | Measured from | When exceeded |
+| --- | --- | --- |
+| `HARPOCRATES_JOB_QUEUE_TTL_SECONDS` | when the job entered the queue (enqueue, or a retryable release back to `pending`) | the `pending` job ends `failed` with `"failure_reason": "queue_expired"` and is never leased |
+| `HARPOCRATES_JOB_EXECUTION_TIMEOUT_SECONDS` | the lease (time waiting in the queue does not count) | the `running` job ends `failed` with `"failure_reason": "execution_timeout"` and is not retried |
+
+Both values are non-negative integers; anything else fails config loading.
+A job closed by a deadline is final: a late result or error from the process
+that overran it is dropped and logged as `job_deadline_final`.
 
 ```json
-"attempts": [
-  { "attempt": 1, "worker_id": "worker-4182", "leased_at": "2026-10-18T16:00:01+00:00",
-    "ended_at": "2026-10-18T16:01:10+00:00", "outcome": "released",
-    "reason": "shutdown_grace_exceeded", "progress": { "phase": "embedding", "percent": 63.0 } },
-  { "attempt": 2, "worker_id": "worker-4190", "leased_at": "2026-10-18T16:01:12+00:00",
-    "ended_at": null, "outcome": null, "reason": null, "progress": null }
-]
+{ "id": 12, "status": "failed", "failure_reason": "execution_timeout",
+  "error": "Execution timeout exceeded", "progress": { "phase": "embedding", "percent": 63.0 } }
 ```
 
-| Field | Meaning |
-| --- | --- |
-| `attempt` | 1-based attempt number. It keeps counting past the limit, so dropped attempts show as a gap. |
-| `worker_id` | Worker that held the lease. |
-| `leased_at` / `ended_at` | ISO 8601 UTC; `ended_at` is `null` while the attempt runs. |
-| `outcome` | `null` (running), `completed`, `failed` (fatal) or `released` (back to the queue for a retry). |
-| `reason` | Machine code for a failure or release: the exception class name (`ValueError`) or `shutdown_grace_exceeded`. |
-| `progress` | Last stored `{"phase", "percent"}` of that attempt, same rules as `progress` above. |
+### Artifact cleanup after a timeout
 
-The history holds metadata only. It never contains the request payload,
-uploaded media bytes, file paths, proof secrets or free-text error messages:
-`reason` and `worker_id` are stored only when they are plain codes
-(`[A-Za-z_][A-Za-z0-9_]*` and `[A-Za-z0-9_.-]+`, at most 64 characters) and
-are otherwise recorded as `null`. `fail_job(..., reason=...)` takes that code;
-the free-text `error` field is unchanged and never copied into the history.
+A Python worker thread cannot be killed, so a timed-out job's process may keep
+writing for a while. Until it returns, the job is marked as having an active
+writer and `sweep_job_files` keeps its files even past
+`HARPOCRATES_JOB_FILE_TTL_SECONDS`. When the process returns, the worker
+removes the partial output; the input follows the normal retention sweep.

@@ -1199,9 +1199,14 @@ def purge_expired_events(batch_size: int = RETENTION_BATCH_DEFAULT_SIZE) -> list
 
 
 _JOBS: dict[int, dict[str, Any]] = {}
-# Guards check-then-write on job records: a worker's main loop and its work
-# thread can touch the same job concurrently (release vs. late completion).
+# Guards check-then-write on job records: a worker's main loop (deadlines) and
+# its work thread (completion) can touch the same job concurrently.
 _JOBS_LOCK = threading.RLock()
+
+# Terminal reasons set when a processing deadline closes a job.
+JOB_QUEUE_EXPIRED = "queue_expired"
+JOB_EXECUTION_TIMEOUT = "execution_timeout"
+_DEADLINE_REASONS = frozenset({JOB_QUEUE_EXPIRED, JOB_EXECUTION_TIMEOUT})
 _next_job_id = 1
 _TENANT_LAST_LEASED_SEQ: dict[str, int] = {}
 _lease_seq = 0
@@ -1276,8 +1281,9 @@ def enqueue_job(job_type: str, payload: dict[str, Any]) -> int:
         "status": "pending",
         "result": None,
         "progress": None,
-        "retry_count": 0,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": current.isoformat(),
+        # Queue expiry is measured from when the job (re)entered the queue.
+        "_queued_at": time.time(),
     }
     if resolved_deadline is not None:
         record["deadline_at"] = resolved_deadline.isoformat()
@@ -1456,11 +1462,99 @@ def lease_job(
         chosen["heartbeat_at"] = current_iso
         chosen["lease_duration_seconds"] = lease_seconds
         chosen.pop("processing_state", None)
-        chosen["_claim_generation"] = chosen.get("_claim_generation", 0) + 1
+        # Execution timeout is measured from the lease.
+        chosen["_started_at"] = time.time()
         if chosen.get("type") in EXPENSIVE_VIDEO_JOB_TYPES:
             _lease_seq += 1
             _TENANT_LAST_LEASED_SEQ[chosen.get("tenant_id", DEFAULT_TENANT_ID)] = _lease_seq
         return dict(chosen)
+
+
+def _close_by_deadline(job: dict[str, Any], reason: str, message: str) -> None:
+    job["status"] = "failed"
+    job["failure_reason"] = reason
+    job["error"] = message
+    job["failed_at"] = datetime.now(UTC).isoformat()
+    job.pop("worker_id", None)
+    logger.warning("job_deadline_exceeded job_id=%s reason=%s", job.get("id"), reason)
+
+
+def expire_queued_jobs(queue_ttl_seconds: float, *, now: float | None = None) -> int:
+    """Fail ``pending`` jobs that waited in the queue for ``queue_ttl_seconds``.
+
+    Queue expiry is measured from when the job last entered the queue (enqueue
+    or a retryable release), never from its execution. Expired jobs end as
+    ``failed`` with ``failure_reason`` ``"queue_expired"``. A limit of 0 or
+    less disables expiry. Returns the number of jobs expired.
+    """
+    if not queue_ttl_seconds or queue_ttl_seconds <= 0:
+        return 0
+    current = time.time() if now is None else now
+    expired = 0
+    with _JOBS_LOCK:
+        for job in _JOBS.values():
+            if job.get("status") != "pending":
+                continue
+            queued_at = job.get("_queued_at")
+            if queued_at is None or current - queued_at < queue_ttl_seconds:
+                continue
+            _close_by_deadline(job, JOB_QUEUE_EXPIRED, "Queue expiry exceeded")
+            expired += 1
+    return expired
+
+
+def time_out_job(job_id: int, execution_timeout_seconds: float, *, now: float | None = None) -> bool:
+    """Fail a ``running`` job whose execution exceeded ``execution_timeout_seconds``.
+
+    Execution time is measured from the lease, independently of how long the
+    job waited in the queue. The job ends as ``failed`` with ``failure_reason``
+    ``"execution_timeout"`` and is not retried. Because the process that holds
+    it may still be writing, the job is marked as having an active writer
+    until :func:`release_job_writer` is called; artifact cleanup waits for
+    that. Returns True when the job was timed out.
+    """
+    if not execution_timeout_seconds or execution_timeout_seconds <= 0:
+        return False
+    current = time.time() if now is None else now
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job or job.get("status") != "running":
+            return False
+        started_at = job.get("_started_at")
+        if started_at is None or current - started_at < execution_timeout_seconds:
+            return False
+        _close_by_deadline(job, JOB_EXECUTION_TIMEOUT, "Execution timeout exceeded")
+        job["_writer_active"] = True
+        return True
+
+
+def job_writer_active(job_id: int | str) -> bool:
+    """Return whether a process may still be writing this job's artifacts."""
+    job = _JOBS.get(job_id)
+    return bool(job and job.get("_writer_active"))
+
+
+def release_job_writer(job_id: int) -> bool:
+    """Record that the process working on ``job_id`` stopped writing.
+
+    Returns True when the job had been closed by a deadline while its process
+    was still active, i.e. its partial artifacts can now be cleaned.
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        return bool(job and job.pop("_writer_active", False))
+
+
+def _closed_by_deadline(job: dict[str, Any], action: str) -> bool:
+    if job.get("failure_reason") not in _DEADLINE_REASONS:
+        return False
+    logger.warning(
+        "job_deadline_final job_id=%s action=%s reason=%s",
+        job.get("id"),
+        action,
+        job.get("failure_reason"),
+    )
+    return True
 
 
 def heartbeat_job(
@@ -1574,30 +1668,35 @@ def reclaim_stale_jobs(
     current_iso = current.isoformat()
 
     reclaimed: list[dict[str, Any]] = []
-    with _JOBS_LOCK:
-        for job in _JOBS.values():
-            if job.get("status") != "running":
-                continue
-            state = get_job_heartbeat_state(
-                job,
-                now=current,
-                stale_after_seconds=stale_after_seconds,
-            )
-            if not state["stale"]:
-                continue
-            job["status"] = "pending"
-            job.pop("worker_id", None)
-            # Reclaiming releases the claim: fence late writes from the
-            # worker whose heartbeat went stale.
-            job["_claim_generation"] = job.get("_claim_generation", 0) + 1
-            job["processing_state"] = {
-                "reason": STALE_HEARTBEAT_REASON,
-                "retryable": True,
-                "category": PROCESSING_STATE_CATEGORY,
-                "cryptographic_failure": False,
-                "detected_at": current_iso,
-                "heartbeat_age_seconds": state["heartbeat_age_seconds"],
-                "stale_after_seconds": state["stale_after_seconds"],
+    for job in _JOBS.values():
+        if job.get("status") != "running":
+            continue
+        state = get_job_heartbeat_state(
+            job,
+            now=current,
+            stale_after_seconds=stale_after_seconds,
+        )
+        if not state["stale"]:
+            continue
+        job["status"] = "pending"
+        job.pop("worker_id", None)
+        # Back in the queue: queue expiry restarts, as for a retryable release.
+        job["_queued_at"] = current.timestamp()
+        job["processing_state"] = {
+            "reason": STALE_HEARTBEAT_REASON,
+            "retryable": True,
+            "category": PROCESSING_STATE_CATEGORY,
+            "cryptographic_failure": False,
+            "detected_at": current_iso,
+            "heartbeat_age_seconds": state["heartbeat_age_seconds"],
+            "stale_after_seconds": state["stale_after_seconds"],
+        }
+        reclaimed.append(
+            {
+                "id": job["id"],
+                "type": job["type"],
+                "status": job["status"],
+                "processing_state": dict(job["processing_state"]),
             }
             reclaimed.append(
                 {
@@ -1661,52 +1760,25 @@ def report_job_progress(
         return True
 
 
-def complete_job(job_id: int, result: Any = None, *, generation: int | None = None) -> bool:
-    """Mark an in-memory job completed.
-
-    With ``generation``, the result is committed only if that claim is still
-    the current one, so a replaced worker cannot overwrite a newer result.
-    Returns True when the result was committed.
-    """
+def complete_job(job_id: int, result: Any = None) -> None:
+    """Mark an in-memory job completed."""
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
-        if not job or not _claim_is_current(job, generation, "complete"):
-            return False
-        if generation is not None and job.get("status") != "running":
-            # The claim was already settled (for example failed by its
-            # processing deadline): a late result must not overwrite it.
-            logger.warning("job_claim_settled job_id=%s status=%s", job_id, job.get("status"))
-            return False
+        if not job or _closed_by_deadline(job, "complete"):
+            # A job closed by a processing deadline is final: a late result
+            # from the process that overran it is dropped.
+            return
         job["status"] = "completed"
         job["result"] = result
         job["completed_at"] = datetime.now(timezone.utc).isoformat()
-        return True
 
 
-def fail_job(
-    job_id: int,
-    error: str,
-    *,
-    is_fatal: bool = False,
-    generation: int | None = None,
-) -> bool:
-    """Mark an in-memory job failed (fatal) or pending for retry.
-
-    A retryable failure releases the claim: the job goes back to ``pending``
-    and its ``_claim_generation`` is bumped, which fences any late write from
-    the worker that held it. With ``generation``, a failure reported by a
-    stale claim, or for a job that is no longer running, is ignored. Returns
-    True when the job was updated.
-    """
+def fail_job(job_id: int, error: str, *, is_fatal: bool = False) -> None:
+    """Mark an in-memory job failed (fatal) or pending for retry."""
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
-        if not job or not _claim_is_current(job, generation, "fail"):
-            return False
-        if generation is not None and job.get("status") != "running":
-            # The claim already finished (for example it completed just as the
-            # grace period expired): never turn a settled job back into pending.
-            logger.warning("job_claim_settled job_id=%s status=%s", job_id, job.get("status"))
-            return False
+        if not job or _closed_by_deadline(job, "fail"):
+            return
         job["error"] = sanitize_job_error(error)
         job["failed_at"] = datetime.now(timezone.utc).isoformat()
         if is_fatal:
@@ -1714,8 +1786,7 @@ def fail_job(
         else:
             job["status"] = "pending"
             job.pop("worker_id", None)
-            job["_claim_generation"] = job.get("_claim_generation", 0) + 1
-        return True
+            job["_queued_at"] = time.time()  # back in the queue: queue expiry restarts
 
 
 def get_job_queue_metrics() -> dict[str, Any]:
