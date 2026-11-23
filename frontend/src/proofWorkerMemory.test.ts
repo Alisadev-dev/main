@@ -3,7 +3,10 @@ import benchLock from '../../zk/bench/bench.lock.json'
 import browserArtifactManifest from '../../zk/browser.artifacts.manifest.json'
 import { CircuitInputError } from './circuitInputSchema'
 import {
+  PROOF_MEMORY_ACCOUNTING_LIMITS,
+  PROOF_MEMORY_BUFFER_CLASSES,
   PROOF_WORKER_MEMORY_LIMITS,
+  createProofOperationMemoryAccountant,
   assertProofWorkerMemoryBudget,
   browserArtifactByteLimit,
   byteLengthOfProofWorkerValue,
@@ -146,89 +149,94 @@ describe('proof worker memory limits', () => {
   })
 })
 
-describe('proof worker resource admission decisions', () => {
-  it('admits multithreaded proving and clamps threads to 8 when resources are healthy', () => {
-    const decision = evaluateProofWorkerResourceAdmission({
-      usage: {
-        witnessBytes: PROOF_WORKER_MEMORY_LIMITS.maxWitnessBytes,
-        proofBytes: PROOF_WORKER_MEMORY_LIMITS.maxProofBytes,
-        publicInputBytes: PROOF_WORKER_MEMORY_LIMITS.maxPublicInputBytes,
-      },
-      crossOriginIsolated: true,
-      hardwareConcurrency: 16,
-      deviceMemoryGB: 8,
-      activeTasks: 0,
-      maxConcurrentTasks: 1,
+
+describe('per-operation proof memory accounting', () => {
+  it('tracks allocated and released buffer classes with explicit operation-level precision', () => {
+    const accountant = createProofOperationMemoryAccountant('op-1', 'prove')
+    accountant.allocate('artifact', 1024)
+    accountant.allocate('witness', 512)
+    accountant.allocate('proof', 256)
+    accountant.allocate('publicInput', 64)
+    accountant.allocate('secret', 32)
+
+    const active = accountant.snapshot()
+    expect(active.operationId).toBe('op-1')
+    expect(active.operation).toBe('prove')
+    expect(active.status).toBe('active')
+    expect(active.precision).toBe('operation-buffer-estimate')
+    expect(active.browserWidePrecision).toBe(false)
+    expect(Object.keys(active.classes).sort()).toEqual([...PROOF_MEMORY_BUFFER_CLASSES].sort())
+    expect(active.classes.witness).toEqual({
+      allocatedCount: 1,
+      releasedCount: 0,
+      allocatedBytes: 512,
+      releasedBytes: 0,
+      activeBytes: 512,
+      peakBytes: 512,
+    })
+    expect(active.totals).toEqual({
+      allocatedCount: 5,
+      releasedCount: 0,
+      allocatedBytes: 1888,
+      releasedBytes: 0,
+      activeBytes: 1888,
+      peakBytes: 1888,
     })
 
-    expect(decision.admitted).toBe(true)
-    expect(decision.mode).toBe('multithreaded')
-    expect(decision.fallbackApplied).toBe(false)
-    expect(decision.reasonCodes).toEqual(['admitted'])
-    expect(decision.threads.admitted).toBe(8)
-    expect(decision.threads.fallbackSingleThread).toBe(false)
-    expect(decision.memory.admitted).toBe(true)
-    expect(decision.concurrency.admitted).toBe(true)
-    expect(decision.concurrency.availableSlots).toBe(1)
-    expect(decision.summary).toContain('Multithreaded WASM proving admitted with 8 threads.')
+    accountant.release('secret', 32)
+    accountant.releaseAll('completed')
+
+    const completed = accountant.snapshot()
+    expect(completed.status).toBe('completed')
+    expect(completed.totals.activeBytes).toBe(0)
+    expect(completed.totals.allocatedBytes).toBe(1888)
+    expect(completed.totals.releasedBytes).toBe(1888)
+    expect(completed.totals.allocatedCount).toBe(5)
+    expect(completed.totals.releasedCount).toBe(5)
+    expect(completed.totals.peakBytes).toBe(1888)
   })
 
-  it('preserves a safe single-threaded fallback when not cross-origin isolated', () => {
-    const decision = evaluateProofWorkerResourceAdmission({
-      crossOriginIsolated: false,
-      hardwareConcurrency: 8,
-      deviceMemoryGB: 8,
-      activeTasks: 0,
-      maxConcurrentTasks: 1,
+  it('enforces bounded allocation counters and per-class byte budgets fail-closed', () => {
+    const accountant = createProofOperationMemoryAccountant('op-bounded', 'verify', {
+      maxClassAllocations: 2,
     })
 
-    expect(decision.admitted).toBe(true)
-    expect(decision.mode).toBe('single-threaded-fallback')
-    expect(decision.fallbackApplied).toBe(true)
-    expect(decision.reasonCodes).toEqual(['fallback_single_thread_not_isolated'])
-    expect(decision.threads.admitted).toBe(1)
-    expect(decision.threads.fallbackSingleThread).toBe(true)
-    expect(decision.threads.detail).toContain('Cross-origin isolation unavailable')
+    accountant.allocate('witness', 16)
+    accountant.allocate('witness', 16)
+    expect(() => accountant.allocate('witness', 16)).toThrowError(
+      new CircuitInputError('proof_worker_memory_exceeded'),
+    )
+
+    const overBudget = createProofOperationMemoryAccountant('op-over-budget', 'verify')
+    expect(() =>
+      overBudget.allocate('witness', PROOF_WORKER_MEMORY_LIMITS.maxWitnessBytes + 1),
+    ).toThrowError(new CircuitInputError('proof_worker_memory_exceeded'))
+
+    expect(() =>
+      createProofOperationMemoryAccountant('op-bad-cap', 'verify', {
+        maxClassAllocations: PROOF_MEMORY_ACCOUNTING_LIMITS.maxClassAllocations + 1,
+      }),
+    ).toThrowError(new CircuitInputError('proof_worker_memory_exceeded'))
   })
 
-  it('preserves a safe single-threaded fallback on memory-constrained browsers', () => {
-    const decision = evaluateProofWorkerResourceAdmission({
-      crossOriginIsolated: true,
-      hardwareConcurrency: 8,
-      deviceMemoryGB: 2,
-      activeTasks: 0,
-      maxConcurrentTasks: 1,
-    })
+  it('rejects releasing more than allocated or unknown buffer classes without exposing witness data', () => {
+    const accountant = createProofOperationMemoryAccountant('op-release-guard', 'verify')
+    accountant.allocate('proof', 64)
 
-    expect(decision.admitted).toBe(true)
-    expect(decision.mode).toBe('single-threaded-fallback')
-    expect(decision.fallbackApplied).toBe(true)
-    expect(decision.reasonCodes).toEqual(['fallback_single_thread_memory_constrained'])
-    expect(decision.memory.constrained).toBe(true)
-    expect(decision.threads.admitted).toBe(1)
-  })
+    expect(() => accountant.release('proof', 65)).toThrowError(
+      new CircuitInputError('proof_worker_memory_exceeded'),
+    )
+    accountant.release('proof', 64)
+    expect(() => accountant.release('proof', 0)).toThrowError(
+      new CircuitInputError('proof_worker_memory_exceeded'),
+    )
 
-  it('rejects when memory budget or concurrency limit is exceeded', () => {
-    const decision = evaluateProofWorkerResourceAdmission({
-      usage: {
-        witnessBytes: PROOF_WORKER_MEMORY_LIMITS.maxWitnessBytes + 1,
-      },
-      crossOriginIsolated: true,
-      hardwareConcurrency: 4,
-      activeTasks: 1,
-      maxConcurrentTasks: 1,
-    })
+    expect(() =>
+      accountant.allocate('unknown' as never, 8),
+    ).toThrowError(new CircuitInputError('invalid_input'))
 
-    expect(decision.admitted).toBe(false)
-    expect(decision.mode).toBe('rejected')
-    expect(decision.fallbackApplied).toBe(false)
-    expect(decision.reasonCodes).toEqual([
-      'memory_budget_exceeded',
-      'concurrency_limit_reached',
-    ])
-    expect(decision.memory.admitted).toBe(false)
-    expect(decision.concurrency.admitted).toBe(false)
-    expect(decision.concurrency.availableSlots).toBe(0)
-    expect(decision.threads.admitted).toBe(0)
+    expect(() => createProofOperationMemoryAccountant('', 'verify')).toThrowError(
+      new CircuitInputError('invalid_input'),
+    )
   })
 })

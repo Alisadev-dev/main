@@ -237,13 +237,22 @@ cd frontend
 npx vitest run src/workers/multiBrowserWorkerSupport.test.ts src/proofWorkerMemory.test.ts src/workers/proofWorkerClient.test.ts src/workers/proof-worker-manager.test.ts
 ```
 
-## Resource admission decisions
 
-Before proving starts, callers can inspect memory, thread, and concurrency restrictions via `evaluateProofWorkerResourceAdmission()` (`src/proofWorkerMemory.ts`) or `ProofWorkerManager.getResourceAdmissionDecision()` (`src/workers/proof-worker-manager.ts`).
 
-The returned `ProofWorkerResourceAdmissionDecision` is privacy-safe (byte counts, thread counts, concurrency slots, and reason codes only — never witness or secret material) and reports:
+## Worker / Main-Thread Protocol Versioning
 
-- **Memory**: estimated bytes vs. canonical `PROOF_WORKER_MEMORY_LIMITS` runtime ceiling and optional CSP `maxMemoryMB` cap, plus whether `deviceMemoryGB` (`<= 2 GB`) marks the browser as memory-constrained.
-- **Threads**: multithreaded WASM (`1–8` threads) when `crossOriginIsolated` is true and the device is not memory-constrained; otherwise preserves a safe `single-threaded-fallback` (`1` thread) with explicit reason codes (`fallback_single_thread_not_isolated`, `fallback_single_thread_memory_constrained`, or `fallback_single_thread_low_concurrency`).
-- **Concurrency**: active tasks vs. `maxConcurrentTasks` (default `1`), failing closed with `concurrency_limit_reached` when no slot is available.
+`ProofWorkerManager` (`frontend/src/workers/proof-worker-manager.ts`) and `proof.worker.ts` enforce a strict integer protocol version (`PROOF_WORKER_PROTOCOL_VERSION = 1` in `frontend/src/workers/proof.worker.types.ts`) on worker/main-thread messages:
 
+- **Fail-closed before buffer transfer**: `validateWorkerProtocolVersion()` and `ProofWorkerManager.handleWorkerMessage()` check `protocolVersion` before invoking buffer-acceptance callbacks or parsing payload fields.
+- **No unsafe fallback parsing**: Missing, non-integer, stringified (e.g. `"1"`), zero, negative, `NaN`, or mismatched versions are rejected immediately without coercion.
+- **Clear reload-required result**: Mismatches return a privacy-safe `ProofWorkerResponse` with `type: 'error'`, `error.code = 'PROTOCOL_VERSION_MISMATCH'`, `error.reloadRequired = true`, and `error.privacySafe = true`, settling any matching pending request immediately.
+
+
+## Per-Operation Proof Memory Accounting
+
+`frontend/src/proofWorkerMemory.ts` (`ProofOperationMemoryAccountant` / `createProofOperationMemoryAccountant`) and `ProofWorkerManager` (`frontend/src/workers/proof-worker-manager.ts`) track allocated and released buffer classes per operation with bounded counters:
+
+- **Buffer classes**: `artifact`, `witness`, `proof`, `publicInput`, and `secret` (`PROOF_MEMORY_BUFFER_CLASSES`). Each class reports `allocatedCount`, `releasedCount`, `allocatedBytes`, `releasedBytes`, `activeBytes`, and `peakBytes`.
+- **Bounded counters & history**: Per-class allocations are bounded by `PROOF_MEMORY_ACCOUNTING_LIMITS.maxClassAllocations` (`1024`) and per-class/runtime byte budgets from `PROOF_WORKER_MEMORY_LIMITS`. `ProofWorkerManager` retains at most `PROOF_MEMORY_ACCOUNTING_LIMITS.maxTrackedOperations` (`32`) operation reports, evicting the oldest settled entries first.
+- **Fail-closed accounting**: Over-budget allocations, counter cap overflows, negative/non-integer byte counts, unknown buffer classes, and releases exceeding active bytes or allocation counts fail closed with `CircuitInputError`.
+- **Privacy & precision boundary**: Reports (`getOperationMemoryReport(id)`, `getMemoryAccountingSnapshot()`) never include witness, proof, or secret contents. Every report explicitly sets `precision: 'operation-buffer-estimate'` and `browserWidePrecision: false` to avoid claiming browser-wide heap, WASM, or OS-level memory precision.
