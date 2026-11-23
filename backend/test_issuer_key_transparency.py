@@ -13,7 +13,8 @@ from capture_attestation import (
 from issuer_key_transparency import (
     DEFAULT_FRESHNESS_SECONDS,
     HIGH_ASSURANCE_FRESHNESS_SECONDS,
-    CheckpointLineage,
+    SNAPSHOT_PROTOCOL,
+    CheckpointReference,
     DirectoryCache,
     DirectoryCheckpoint,
     DirectoryEvent,
@@ -25,11 +26,11 @@ from issuer_key_transparency import (
     IssuerDirectory,
     IssuerKey,
     IssuerManifest,
-    KeyLifecycleChange,
+    IssuerTrustSnapshot,
     KeyStatus,
-    LifecycleEventRef,
+    PolicyVersion,
     TransparencyError,
-    apply_directory_import,
+    canonicalize_trust_snapshot,
     checkpoint_hash,
     compute_tree_head,
     create_activation_event,
@@ -37,17 +38,17 @@ from issuer_key_transparency import (
     detect_rollback,
     evaluate_captured_evidence,
     event_hash,
-    explain_historical_key_validity,
+    export_offline_trust_snapshot,
+    import_offline_trust_snapshot,
     key_valid_for_historical_signature,
     key_was_compromised_at,
     manifest_hash,
     preview_directory_import,
     rebuild_directory,
     require_fresh_checkpoint,
-    simulate_trust_policy,
-    simulation_report_hash,
-    trust_policy_hash,
+    trust_snapshot_hash,
     verify_checkpoint_consistency,
+    verify_offline_trust_snapshot,
 )
 
 ORG = "a" * 64
@@ -392,190 +393,165 @@ class PrivacyTests(unittest.TestCase):
         self.assertIn("organizationIdentityHash", encoded)
 
 
-class DirectoryImportPreviewTests(unittest.TestCase):
-    def _base_directory(self) -> tuple[IssuerDirectory, IssuerManifest, DirectoryCheckpoint]:
+class OfflineTrustSnapshotTests(unittest.TestCase):
+    def _build_directory_and_checkpoints(
+        self,
+    ) -> tuple[IssuerDirectory, list[DirectoryCheckpoint]]:
         e0 = create_activation_event(ORG, "k1", KEY_A, 0, 1000)
         d = rebuild_directory(ORG, [e0])
-        m1 = _manifest([IssuerKey("k1", KEY_A, "ed25519", 1000)])
-        d.publish_manifest(m1)
+        m1 = _manifest([IssuerKey("k1", KEY_A, "ed25519", 1000)], valid_from=1000)
+        h1 = d.publish_manifest(m1)
         cp1 = d.make_checkpoint(timestamp=1500, signature_hash=SIG)
-        return d, m1, cp1
 
-    def test_preview_reports_key_lifecycle_and_lineage_without_mutating_state(self) -> None:
-        d, m1, cp1 = self._base_directory()
-        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(d.events[0]))
-        e2 = DirectoryEvent(
-            event_type=EventType.COMPROMISE,
-            sequence=2,
-            timestamp=2500,
-            organization_identity_hash=ORG,
-            key_id="k1",
-            public_key_hash=KEY_A,
-            previous_event_hash=event_hash(e1),
-            reason_hash="1" * 64,
-        )
-        m2 = _manifest(
-            [IssuerKey("k2", KEY_B, "ed25519", 2000)],
-            predecessor=manifest_hash(m1),
-            valid_from=2000,
-        )
-        expected_dir = rebuild_directory(ORG, [d.events[0], e1, e2], [m1, m2])
-        cp2 = expected_dir.make_checkpoint(timestamp=2600, signature_hash=SIG)
-
-        before_head = d.tree_head()
-        before_events = list(d.events)
-        before_keys = dict(d.keys)
-        before_manifest = d.current_manifest
-
-        preview = preview_directory_import(
-            d,
-            [e1, e2],
-            incoming_manifests=[m2],
-            incoming_checkpoint=cp2,
-            previously_seen_checkpoint=cp1,
-        )
-
-        # Trust state must NOT be mutated by preview.
-        self.assertEqual(d.tree_head(), before_head)
-        self.assertEqual(d.events, before_events)
-        self.assertEqual(d.keys, before_keys)
-        self.assertIs(d.current_manifest, before_manifest)
-
-        self.assertIsInstance(preview, DirectoryImportPreview)
-        self.assertTrue(preview.acceptable)
-        self.assertEqual(preview.errors, ())
-
-        # Verify proposed key lifecycle changes.
-        changes_by_id = {c.key_id: c for c in preview.key_changes}
-        self.assertEqual(set(changes_by_id.keys()), {"k1", "k2"})
-        self.assertEqual(changes_by_id["k1"].previous_status, KeyStatus.ACTIVE)
-        self.assertEqual(changes_by_id["k1"].proposed_status, KeyStatus.COMPROMISED)
-        self.assertEqual(
-            changes_by_id["k1"].event_types, (EventType.ROTATION, EventType.COMPROMISE)
-        )
-        self.assertEqual(changes_by_id["k2"].previous_status, None)
-        self.assertEqual(changes_by_id["k2"].proposed_status, KeyStatus.ACTIVE)
-        self.assertEqual(changes_by_id["k2"].related_key_id, "k1")
-
-        # Verify checkpoint lineage.
-        lineage = preview.checkpoint_lineage
-        self.assertIsInstance(lineage, CheckpointLineage)
-        self.assertTrue(lineage.extends_current_head)
-        self.assertEqual(lineage.current_event_count, 1)
-        self.assertEqual(lineage.proposed_event_count, 3)
-        self.assertEqual(lineage.added_event_count, 2)
-        self.assertEqual(lineage.current_tree_head_hash, before_head)
-        self.assertEqual(lineage.proposed_tree_head_hash, expected_dir.tree_head())
-        self.assertEqual(lineage.current_manifest_hash, manifest_hash(m1))
-        self.assertEqual(lineage.proposed_manifest_hash, manifest_hash(m2))
-        self.assertEqual(lineage.manifest_chain_hashes, (manifest_hash(m2),))
-        self.assertEqual(lineage.previously_seen_checkpoint_hash, checkpoint_hash(cp1))
-        self.assertEqual(lineage.incoming_checkpoint_hash, checkpoint_hash(cp2))
-
-        # Apply accepted preview and verify mutation now occurs.
-        apply_directory_import(d, preview)
-        self.assertEqual(len(d.events), 3)
-        self.assertEqual(d.tree_head(), expected_dir.tree_head())
-        self.assertEqual(d.keys["k1"].status, KeyStatus.COMPROMISED)
-        self.assertEqual(d.keys["k2"].status, KeyStatus.ACTIVE)
-        self.assertEqual(manifest_hash(d.current_manifest), manifest_hash(m2))  # type: ignore[arg-type]
-
-    def test_preview_accepts_full_log_with_matching_prefix(self) -> None:
-        d, m1, cp1 = self._base_directory()
-        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(d.events[0]))
-        preview = preview_directory_import(
-            d,
-            [d.events[0], e1],
-            incoming_manifests=[m1],
-            previously_seen_checkpoint=cp1,
-        )
-        self.assertTrue(preview.acceptable)
-        self.assertEqual(preview.checkpoint_lineage.added_event_count, 1)
-        self.assertEqual(len(preview.proposed_events), 1)
-        self.assertEqual(len(preview.proposed_manifests), 0)
-
-    def test_preview_noop_import_reports_no_changes(self) -> None:
-        d, m1, cp1 = self._base_directory()
-        preview = preview_directory_import(
-            d,
-            [],
-            incoming_manifests=[m1],
-            incoming_checkpoint=cp1,
-            previously_seen_checkpoint=cp1,
-        )
-        self.assertTrue(preview.acceptable)
-        self.assertEqual(preview.key_changes, ())
-        self.assertEqual(preview.checkpoint_lineage.added_event_count, 0)
-        self.assertTrue(preview.checkpoint_lineage.extends_current_head)
-
-    def test_preview_rejects_rollback_and_split_view_without_mutating(self) -> None:
-        d, m1, cp1 = self._base_directory()
-        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(d.events[0]))
+        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(e0))
         d.append_event(e1)
         m2 = _manifest(
             [IssuerKey("k2", KEY_B, "ed25519", 2000)],
-            predecessor=manifest_hash(m1),
+            predecessor=h1,
             valid_from=2000,
         )
         d.publish_manifest(m2)
         cp2 = d.make_checkpoint(timestamp=2500, signature_hash=SIG)
+        return d, [cp1, cp2]
 
-        # Rollback: incoming full log is shorter than current directory
-        rb_preview = preview_directory_import(
-            d,
-            [d.events[0]],
-            incoming_checkpoint=cp1,
-            previously_seen_checkpoint=cp2,
+    def test_export_roundtrip_and_deterministic_hash(self) -> None:
+        d, checkpoints = self._build_directory_and_checkpoints()
+        policies = [
+            PolicyVersion(policy_version="2026.1", policy_hash=POLICY, effective_from=1000),
+            PolicyVersion(policy_version="2026.2", policy_hash="1" * 64, effective_from=2000),
+        ]
+
+        snap_a = export_offline_trust_snapshot(
+            [d], checkpoints, policies, exported_at=3000
         )
-        self.assertFalse(rb_preview.acceptable)
-        self.assertFalse(rb_preview.checkpoint_lineage.extends_current_head)
-        self.assertTrue(any("rollback" in e.lower() for e in rb_preview.errors))
-        with self.assertRaises(TransparencyError):
-            apply_directory_import(d, rb_preview)
+        # Reversed input order must yield identical canonical encoding and hash
+        snap_b = export_offline_trust_snapshot(
+            [d], list(reversed(checkpoints)), list(reversed(policies)), exported_at=3000
+        )
 
-        # Split view: forged checkpoint tree head
+        self.assertEqual(snap_a.protocol, SNAPSHOT_PROTOCOL)
+        self.assertEqual(len(snap_a.manifests), 2)
+        self.assertEqual(len(snap_a.checkpoint_references), 2)
+        self.assertEqual(len(snap_a.policy_versions), 2)
+        self.assertEqual(canonicalize_trust_snapshot(snap_a), canonicalize_trust_snapshot(snap_b))
+        self.assertEqual(trust_snapshot_hash(snap_a), trust_snapshot_hash(snap_b))
+        self.assertEqual(snap_a.checkpoint_references[0].checkpoint_hash, checkpoint_hash(checkpoints[0]))
+
+        # Round-trip import and verify
+        raw = canonicalize_trust_snapshot(snap_a)
+        reloaded = import_offline_trust_snapshot(raw)
+        self.assertEqual(trust_snapshot_hash(reloaded), trust_snapshot_hash(snap_a))
+        self.assertEqual(verify_offline_trust_snapshot(reloaded), [])
+
+    def test_snapshot_excludes_evidence_private_identifiers(self) -> None:
+        d, checkpoints = self._build_directory_and_checkpoints()
+        policies = [PolicyVersion(policy_version="2026.1", policy_hash=POLICY)]
+        snap = export_offline_trust_snapshot([d], checkpoints, policies, exported_at=3000)
+
+        raw = canonicalize_trust_snapshot(snap).lower()
+        for forbidden in (
+            "evidencedigestbinding",
+            "capturenonce",
+            "devicecommitment",
+            "evidenceid",
+            "sealid",
+            "proofid",
+            "nullifier",
+            "email",
+            "legalname",
+        ):
+            self.assertNotIn(forbidden, raw)
+
+        # Injecting evidence-specific private identifiers must fail closed on import
+        tampered_top = snap.to_dict()
+        tampered_top["evidenceDigestBinding"] = "a" * 64
+        with self.assertRaises(TransparencyError) as ctx:
+            import_offline_trust_snapshot(tampered_top)
+        self.assertIn("forbidden private field", str(ctx.exception).lower())
+
+        tampered_cp = snap.to_dict()
+        tampered_cp["checkpointReferences"][0]["captureNonce"] = "b" * 64
+        with self.assertRaises(TransparencyError) as ctx:
+            import_offline_trust_snapshot(tampered_cp)
+        self.assertIn("forbidden private field", str(ctx.exception).lower())
+
+        tampered_manifest = snap.to_dict()
+        tampered_manifest["manifests"][0]["deviceCommitment"] = "c" * 64
+        with self.assertRaises(TransparencyError) as ctx:
+            import_offline_trust_snapshot(tampered_manifest)
+        self.assertIn("forbidden private field", str(ctx.exception).lower())
+
+        tampered_policy = snap.to_dict()
+        tampered_policy["policyVersions"][0]["evidenceId"] = "ev-123"
+        with self.assertRaises(TransparencyError) as ctx:
+            import_offline_trust_snapshot(tampered_policy)
+        self.assertIn("forbidden private field", str(ctx.exception).lower())
+
+    def test_export_rejects_inconsistent_checkpoint(self) -> None:
+        d, checkpoints = self._build_directory_and_checkpoints()
         forged_cp = DirectoryCheckpoint(
             tree_head_hash="9" * 64,
-            event_count=cp2.event_count,
-            timestamp=cp2.timestamp,
+            event_count=checkpoints[-1].event_count,
+            timestamp=2500,
             organization_identity_hash=ORG,
-            manifest_hash=cp2.manifest_hash,
+            manifest_hash=checkpoints[-1].manifest_hash,
             signature_hash=SIG,
         )
-        sv_preview = preview_directory_import(
-            d,
-            [],
-            incoming_checkpoint=forged_cp,
-            previously_seen_checkpoint=cp2,
-        )
-        self.assertFalse(sv_preview.acceptable)
-        self.assertTrue(
-            any("split view" in e.lower() or "equivocat" in e.lower() for e in sv_preview.errors)
-        )
-        self.assertEqual(len(d.events), 2)
-
-    def test_apply_rejects_stale_preview_after_directory_mutation(self) -> None:
-        d, m1, _ = self._base_directory()
-        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(d.events[0]))
-        preview = preview_directory_import(d, [e1])
-        self.assertTrue(preview.acceptable)
-
-        # Mutate directory before applying preview (TOCTOU guard)
-        d.append_event(e1)
         with self.assertRaises(TransparencyError) as ctx:
-            apply_directory_import(d, preview)
-        self.assertIn("changed since preview", str(ctx.exception).lower())
+            export_offline_trust_snapshot(
+                [d],
+                [forged_cp],
+                [PolicyVersion(policy_version="2026.1", policy_hash=POLICY)],
+                exported_at=3000,
+            )
+        self.assertIn("inconsistent checkpoint", str(ctx.exception).lower())
 
-    def test_preview_to_dict_preserves_privacy(self) -> None:
-        d, _, cp1 = self._base_directory()
-        e1 = create_rotation_event(ORG, "k2", KEY_B, "k1", 1, 2000, event_hash(d.events[0]))
-        preview = preview_directory_import(d, [e1], previously_seen_checkpoint=cp1)
-        payload = preview.to_dict()
-        blob = str(payload).lower()
-        for forbidden in ("email", "legalname", "phone", "street", "employee"):
-            self.assertNotIn(forbidden, blob)
-        self.assertIn("checkpointLineage", payload)
-        self.assertIn("keyChanges", payload)
+    def test_export_rejects_conflicting_policy_versions(self) -> None:
+        d, checkpoints = self._build_directory_and_checkpoints()
+        with self.assertRaises(TransparencyError) as ctx:
+            export_offline_trust_snapshot(
+                [d],
+                checkpoints,
+                [
+                    PolicyVersion(policy_version="2026.1", policy_hash=POLICY),
+                    PolicyVersion(policy_version="2026.1", policy_hash="2" * 64),
+                ],
+                exported_at=3000,
+            )
+        self.assertIn("conflicting policyhash", str(ctx.exception).lower())
+
+    def test_export_rejects_directory_without_manifest(self) -> None:
+        empty_dir = IssuerDirectory(ORG)
+        with self.assertRaises(TransparencyError) as ctx:
+            export_offline_trust_snapshot([empty_dir], [], [], exported_at=3000)
+        self.assertIn("without a published manifest", str(ctx.exception).lower())
+
+    def test_verify_flags_checkpoint_referencing_missing_manifest(self) -> None:
+        d, checkpoints = self._build_directory_and_checkpoints()
+        snap = IssuerTrustSnapshot(
+            exported_at=3000,
+            manifests=[d.current_manifest],  # type: ignore[list-item]
+            checkpoint_references=[CheckpointReference.from_checkpoint(checkpoints[0])],
+            policy_versions=[PolicyVersion(policy_version="2026.1", policy_hash=POLICY)],
+        )
+        errors = verify_offline_trust_snapshot(snap)
+        self.assertTrue(any("missing manifest" in e.lower() for e in errors))
+
+    def test_import_rejects_unsupported_protocol_and_unknown_fields(self) -> None:
+        d, checkpoints = self._build_directory_and_checkpoints()
+        snap = export_offline_trust_snapshot(
+            [d], checkpoints, [PolicyVersion("2026.1", POLICY)], exported_at=3000
+        )
+        bad_proto = snap.to_dict()
+        bad_proto["protocol"] = "unknown-protocol"
+        with self.assertRaises(TransparencyError):
+            import_offline_trust_snapshot(bad_proto)
+
+        extra_field = snap.to_dict()
+        extra_field["unexpectedKey"] = "value"
+        with self.assertRaises(TransparencyError) as ctx:
+            import_offline_trust_snapshot(extra_field)
+        self.assertIn("unsupported field", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":

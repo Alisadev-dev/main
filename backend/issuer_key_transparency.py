@@ -25,6 +25,7 @@ from capture_attestation import (
 )
 
 PROTOCOL = "harpocrates-issuer-key-transparency"
+SNAPSHOT_PROTOCOL = "harpocrates-issuer-trust-snapshot"
 VERSION = 1
 SUPPORTED_VERSIONS = {1}
 
@@ -33,10 +34,38 @@ MAX_EVENTS = 10_000
 MAX_SIMULATION_ITEMS = 1_000
 MAX_MANIFEST_BYTES = 8_192
 MAX_CHECKPOINT_BYTES = 16_384
-MAX_EXPLANATION_EVENTS = 16
-MAX_EXPLANATION_BYTES = 4_096
+MAX_SNAPSHOT_BYTES = 131_072
+MAX_SNAPSHOT_MANIFESTS = 256
+MAX_SNAPSHOT_CHECKPOINTS = 256
+MAX_SNAPSHOT_POLICY_VERSIONS = 64
 DEFAULT_FRESHNESS_SECONDS = 86_400  # 24h
 HIGH_ASSURANCE_FRESHNESS_SECONDS = 3_600  # 1h fail-closed window
+
+# Evidence-specific private identifiers and private org fields that must never
+# appear in offline issuer trust snapshots.
+FORBIDDEN_SNAPSHOT_FIELDS: frozenset[str] = frozenset(
+    {
+        "evidencedigestbinding",
+        "capturenonce",
+        "devicecommitment",
+        "evidenceid",
+        "evidencehash",
+        "mediahash",
+        "sealid",
+        "proofid",
+        "submissionid",
+        "witnessid",
+        "nullifier",
+        "persessiondevicekey",
+        "privatekey",
+        "secret",
+        "email",
+        "legalname",
+        "phone",
+        "street",
+        "employee",
+    }
+)
 
 
 class KeyStatus(str, Enum):
@@ -1006,13 +1035,14 @@ class DirectoryImportPreview:
 
 
 def _clone_directory(directory: IssuerDirectory) -> IssuerDirectory:
-    return IssuerDirectory(
+    clone = IssuerDirectory(
         organization_identity_hash=directory.organization_identity_hash,
         events=list(directory.events),
         keys=dict(directory.keys),
         current_manifest=directory.current_manifest,
         manifests_by_hash=dict(directory.manifests_by_hash),
     )
+    return clone
 
 
 def preview_directory_import(
@@ -1220,3 +1250,437 @@ def apply_directory_import(
     for manifest in preview.proposed_manifests:
         directory.publish_manifest(manifest)
     return directory
+
+
+# ── Offline issuer trust snapshot exports ──────────────────────────────────
+
+_SNAPSHOT_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {
+        "protocol",
+        "version",
+        "exportedAt",
+        "manifests",
+        "checkpointReferences",
+        "policyVersions",
+    }
+)
+_MANIFEST_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {
+        "protocol",
+        "version",
+        "organizationIdentityHash",
+        "issuerAddress",
+        "activeKeys",
+        "policyHash",
+        "validFrom",
+        "validUntil",
+        "predecessorManifestHash",
+        "successorManifestHash",
+        "signatureHash",
+    }
+)
+_KEY_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {
+        "keyId",
+        "publicKeyHash",
+        "algorithm",
+        "validFrom",
+        "validUntil",
+        "status",
+    }
+)
+_CHECKPOINT_REF_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {
+        "checkpointHash",
+        "treeHeadHash",
+        "eventCount",
+        "timestamp",
+        "organizationIdentityHash",
+        "manifestHash",
+        "signatureHash",
+    }
+)
+_POLICY_VERSION_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {
+        "policyVersion",
+        "policyHash",
+        "effectiveFrom",
+    }
+)
+
+
+def _reject_forbidden_and_unknown_keys(
+    obj: Any,
+    allowed: frozenset[str],
+    context: str,
+) -> None:
+    if not isinstance(obj, dict):
+        raise TransparencyError(f"{context} must be a JSON object")
+    for key in obj:
+        normalized = str(key).lower().replace("_", "")
+        if normalized in FORBIDDEN_SNAPSHOT_FIELDS:
+            raise TransparencyError(f"{context} contains forbidden private field: {key}")
+        if key not in allowed:
+            raise TransparencyError(f"{context} contains unsupported field: {key}")
+
+
+@dataclass(frozen=True)
+class PolicyVersion:
+    """Public policy version identifier and canonical policy digest."""
+
+    policy_version: str
+    policy_hash: str
+    effective_from: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.policy_version, str) or not self.policy_version.strip():
+            raise TransparencyError("policyVersion must be a non-empty string")
+        _require_hex("policyHash", self.policy_hash)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "policyHash": self.policy_hash.lower(),
+            "policyVersion": self.policy_version,
+        }
+        if self.effective_from is not None:
+            d["effectiveFrom"] = self.effective_from
+        return d
+
+    @staticmethod
+    def from_dict(obj: dict[str, Any]) -> "PolicyVersion":
+        _reject_forbidden_and_unknown_keys(obj, _POLICY_VERSION_ALLOWED_KEYS, "policyVersion")
+        if "policyVersion" not in obj or "policyHash" not in obj:
+            raise TransparencyError("policyVersion and policyHash are required")
+        return PolicyVersion(
+            policy_version=str(obj["policyVersion"]),
+            policy_hash=_require_hex("policyHash", str(obj["policyHash"])),
+            effective_from=(
+                int(obj["effectiveFrom"]) if obj.get("effectiveFrom") is not None else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class CheckpointReference:
+    """Public reference to a signed directory checkpoint for offline verification."""
+
+    checkpoint_hash: str
+    tree_head_hash: str
+    event_count: int
+    timestamp: int
+    organization_identity_hash: str
+    manifest_hash: str
+    signature_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_hex("checkpointHash", self.checkpoint_hash)
+        _require_hex("treeHeadHash", self.tree_head_hash)
+        _require_hex("organizationIdentityHash", self.organization_identity_hash)
+        _require_hex("manifestHash", self.manifest_hash)
+        if self.signature_hash is not None:
+            _require_hex("signatureHash", self.signature_hash)
+        if self.event_count < 0:
+            raise TransparencyError("checkpointReference eventCount must be non-negative")
+
+    @staticmethod
+    def from_checkpoint(checkpoint: DirectoryCheckpoint) -> "CheckpointReference":
+        return CheckpointReference(
+            checkpoint_hash=checkpoint_hash(checkpoint),
+            tree_head_hash=checkpoint.tree_head_hash,
+            event_count=checkpoint.event_count,
+            timestamp=checkpoint.timestamp,
+            organization_identity_hash=checkpoint.organization_identity_hash,
+            manifest_hash=checkpoint.manifest_hash,
+            signature_hash=checkpoint.signature_hash,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "checkpointHash": self.checkpoint_hash.lower(),
+            "eventCount": self.event_count,
+            "manifestHash": self.manifest_hash.lower(),
+            "organizationIdentityHash": self.organization_identity_hash.lower(),
+            "timestamp": self.timestamp,
+            "treeHeadHash": self.tree_head_hash.lower(),
+        }
+        if self.signature_hash:
+            d["signatureHash"] = self.signature_hash.lower()
+        return d
+
+    @staticmethod
+    def from_dict(obj: dict[str, Any]) -> "CheckpointReference":
+        _reject_forbidden_and_unknown_keys(
+            obj, _CHECKPOINT_REF_ALLOWED_KEYS, "checkpointReference"
+        )
+        required = (
+            "checkpointHash",
+            "treeHeadHash",
+            "eventCount",
+            "timestamp",
+            "organizationIdentityHash",
+            "manifestHash",
+        )
+        for req in required:
+            if req not in obj:
+                raise TransparencyError(f"checkpointReference missing required field: {req}")
+        return CheckpointReference(
+            checkpoint_hash=_require_hex("checkpointHash", str(obj["checkpointHash"])),
+            tree_head_hash=_require_hex("treeHeadHash", str(obj["treeHeadHash"])),
+            event_count=int(obj["eventCount"]),
+            timestamp=int(obj["timestamp"]),
+            organization_identity_hash=_require_hex(
+                "organizationIdentityHash", str(obj["organizationIdentityHash"])
+            ),
+            manifest_hash=_require_hex("manifestHash", str(obj["manifestHash"])),
+            signature_hash=(
+                _require_hex("signatureHash", str(obj["signatureHash"]))
+                if obj.get("signatureHash")
+                else None
+            ),
+        )
+
+
+@dataclass
+class IssuerTrustSnapshot:
+    """Offline-exportable public issuer trust snapshot.
+
+    Contains only public manifests, checkpoint references, and policy versions.
+    Evidence-specific private identifiers are never included.
+    """
+
+    exported_at: int
+    manifests: list[IssuerManifest]
+    checkpoint_references: list[CheckpointReference]
+    policy_versions: list[PolicyVersion]
+    version: int = VERSION
+    protocol: str = SNAPSHOT_PROTOCOL
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "checkpointReferences": [c.to_dict() for c in self.checkpoint_references],
+            "exportedAt": self.exported_at,
+            "manifests": [m.to_dict() for m in self.manifests],
+            "policyVersions": [p.to_dict() for p in self.policy_versions],
+            "protocol": self.protocol,
+            "version": self.version,
+        }
+
+    @staticmethod
+    def from_dict(obj: dict[str, Any]) -> "IssuerTrustSnapshot":
+        _reject_forbidden_and_unknown_keys(obj, _SNAPSHOT_ALLOWED_KEYS, "trust snapshot")
+        if obj.get("protocol") != SNAPSHOT_PROTOCOL:
+            raise TransparencyError("unsupported issuer trust snapshot protocol")
+        if int(obj.get("version", 0)) not in SUPPORTED_VERSIONS:
+            raise TransparencyError("unsupported issuer trust snapshot version")
+        if "exportedAt" not in obj:
+            raise TransparencyError("trust snapshot missing required field: exportedAt")
+
+        raw_manifests = obj.get("manifests")
+        raw_checkpoints = obj.get("checkpointReferences")
+        raw_policies = obj.get("policyVersions")
+        if not isinstance(raw_manifests, list):
+            raise TransparencyError("trust snapshot manifests must be a list")
+        if not isinstance(raw_checkpoints, list):
+            raise TransparencyError("trust snapshot checkpointReferences must be a list")
+        if not isinstance(raw_policies, list):
+            raise TransparencyError("trust snapshot policyVersions must be a list")
+
+        manifests: list[IssuerManifest] = []
+        for m_obj in raw_manifests:
+            _reject_forbidden_and_unknown_keys(m_obj, _MANIFEST_ALLOWED_KEYS, "manifest")
+            for k_obj in m_obj.get("activeKeys", []):
+                _reject_forbidden_and_unknown_keys(k_obj, _KEY_ALLOWED_KEYS, "activeKey")
+            manifests.append(IssuerManifest.from_dict(m_obj))
+
+        checkpoints = [CheckpointReference.from_dict(c) for c in raw_checkpoints]
+        policies = [PolicyVersion.from_dict(p) for p in raw_policies]
+
+        return IssuerTrustSnapshot(
+            exported_at=int(obj["exportedAt"]),
+            manifests=manifests,
+            checkpoint_references=checkpoints,
+            policy_versions=policies,
+            version=int(obj["version"]),
+            protocol=str(obj["protocol"]),
+        )
+
+
+def canonicalize_trust_snapshot(snapshot: IssuerTrustSnapshot) -> str:
+    """Deterministic JSON encoding for an offline issuer trust snapshot."""
+    if snapshot.protocol != SNAPSHOT_PROTOCOL:
+        raise TransparencyError("unsupported issuer trust snapshot protocol")
+    if snapshot.version not in SUPPORTED_VERSIONS:
+        raise TransparencyError("unsupported issuer trust snapshot version")
+    if len(snapshot.manifests) > MAX_SNAPSHOT_MANIFESTS:
+        raise TransparencyError("trust snapshot manifest count exceeds bound")
+    if len(snapshot.checkpoint_references) > MAX_SNAPSHOT_CHECKPOINTS:
+        raise TransparencyError("trust snapshot checkpoint count exceeds bound")
+    if len(snapshot.policy_versions) > MAX_SNAPSHOT_POLICY_VERSIONS:
+        raise TransparencyError("trust snapshot policy version count exceeds bound")
+    for manifest in snapshot.manifests:
+        canonicalize_manifest(manifest)
+    encoded = _canonical_json(snapshot.to_dict())
+    if len(encoded) > MAX_SNAPSHOT_BYTES:
+        raise TransparencyError("trust snapshot exceeds size bound")
+    return encoded.decode("utf-8")
+
+
+def trust_snapshot_hash(snapshot: IssuerTrustSnapshot) -> str:
+    """Compute the canonical SHA-256 digest of an offline issuer trust snapshot."""
+    return _sha256_hex(canonicalize_trust_snapshot(snapshot).encode("utf-8"))
+
+
+def export_offline_trust_snapshot(
+    directories: Iterable[IssuerDirectory],
+    checkpoints: Iterable[DirectoryCheckpoint],
+    policy_versions: Iterable[PolicyVersion],
+    *,
+    exported_at: int | None = None,
+    include_historical_manifests: bool = True,
+) -> IssuerTrustSnapshot:
+    """Export a canonical offline issuer trust snapshot.
+
+    Includes only public manifests, checkpoint references, and policy versions.
+    Fails closed if any checkpoint is inconsistent with its directory or if
+    conflicting policy versions are supplied.
+    """
+    dirs_by_org: dict[str, IssuerDirectory] = {}
+    manifests_by_digest: dict[str, IssuerManifest] = {}
+
+    for directory in directories:
+        if directory.organization_identity_hash in dirs_by_org:
+            raise TransparencyError("duplicate directory for organizationIdentityHash")
+        if directory.current_manifest is None:
+            raise TransparencyError(
+                "cannot export trust snapshot for directory without a published manifest"
+            )
+        dirs_by_org[directory.organization_identity_hash] = directory
+        if include_historical_manifests and directory.manifests_by_hash:
+            for mh, manifest in directory.manifests_by_hash.items():
+                manifests_by_digest[mh] = manifest
+        else:
+            mh = manifest_hash(directory.current_manifest)
+            manifests_by_digest[mh] = directory.current_manifest
+
+    checkpoint_refs_by_hash: dict[str, CheckpointReference] = {}
+    for cp in checkpoints:
+        directory = dirs_by_org.get(cp.organization_identity_hash)
+        if directory is None:
+            raise TransparencyError(
+                "checkpoint references unknown organizationIdentityHash not in export"
+            )
+        consistency_errors = verify_checkpoint_consistency(directory, cp)
+        if consistency_errors:
+            raise TransparencyError(
+                "inconsistent checkpoint in trust snapshot export: "
+                + "; ".join(consistency_errors)
+            )
+        if cp.manifest_hash not in manifests_by_digest:
+            raise TransparencyError(
+                "checkpoint manifestHash is not present in exported manifests"
+            )
+        ref = CheckpointReference.from_checkpoint(cp)
+        checkpoint_refs_by_hash[ref.checkpoint_hash] = ref
+
+    policies_by_version: dict[str, PolicyVersion] = {}
+    for pv in policy_versions:
+        existing = policies_by_version.get(pv.policy_version)
+        if existing is not None and existing.policy_hash.lower() != pv.policy_hash.lower():
+            raise TransparencyError(
+                f"conflicting policyHash for policyVersion {pv.policy_version}"
+            )
+        policies_by_version[pv.policy_version] = pv
+
+    sorted_manifests = sorted(
+        manifests_by_digest.values(),
+        key=lambda m: (m.organization_identity_hash, m.valid_from, manifest_hash(m)),
+    )
+    sorted_checkpoints = sorted(
+        checkpoint_refs_by_hash.values(),
+        key=lambda c: (c.organization_identity_hash, c.event_count, c.checkpoint_hash),
+    )
+    sorted_policies = sorted(
+        policies_by_version.values(),
+        key=lambda p: (p.policy_version, p.policy_hash.lower()),
+    )
+
+    ts = int(time.time()) if exported_at is None else exported_at
+    snapshot = IssuerTrustSnapshot(
+        exported_at=ts,
+        manifests=sorted_manifests,
+        checkpoint_references=sorted_checkpoints,
+        policy_versions=sorted_policies,
+    )
+    canonicalize_trust_snapshot(snapshot)
+    return snapshot
+
+
+def import_offline_trust_snapshot(
+    raw: str | bytes | dict[str, Any],
+) -> IssuerTrustSnapshot:
+    """Decode and validate an offline issuer trust snapshot (fail-closed)."""
+    if isinstance(raw, (str, bytes)):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise TransparencyError(f"invalid trust snapshot JSON: {exc}") from exc
+    elif isinstance(raw, dict):
+        obj = raw
+    else:
+        raise TransparencyError("trust snapshot input must be JSON string, bytes, or dict")
+
+    snapshot = IssuerTrustSnapshot.from_dict(obj)
+    canonicalize_trust_snapshot(snapshot)
+    return snapshot
+
+
+def verify_offline_trust_snapshot(snapshot: IssuerTrustSnapshot) -> list[str]:
+    """Return consistency errors for an offline trust snapshot (empty = valid)."""
+    errors: list[str] = []
+    try:
+        canonicalize_trust_snapshot(snapshot)
+    except TransparencyError as exc:
+        errors.append(str(exc))
+
+    manifests_by_digest: dict[str, IssuerManifest] = {}
+    for manifest in snapshot.manifests:
+        try:
+            mh = manifest_hash(manifest)
+            manifests_by_digest[mh] = manifest
+            if manifest.successor_manifest_hash is not None:
+                unlinked = IssuerManifest(
+                    organization_identity_hash=manifest.organization_identity_hash,
+                    issuer_address=manifest.issuer_address,
+                    active_keys=list(manifest.active_keys),
+                    policy_hash=manifest.policy_hash,
+                    valid_from=manifest.valid_from,
+                    valid_until=manifest.valid_until,
+                    predecessor_manifest_hash=manifest.predecessor_manifest_hash,
+                    successor_manifest_hash=None,
+                    signature_hash=manifest.signature_hash,
+                    version=manifest.version,
+                    protocol=manifest.protocol,
+                )
+                manifests_by_digest[manifest_hash(unlinked)] = manifest
+        except TransparencyError as exc:
+            errors.append(f"invalid manifest: {exc}")
+
+    for ref in snapshot.checkpoint_references:
+        manifest = manifests_by_digest.get(ref.manifest_hash)
+        if manifest is None:
+            errors.append(
+                f"checkpoint {ref.checkpoint_hash} references missing manifest {ref.manifest_hash}"
+            )
+        elif manifest.organization_identity_hash != ref.organization_identity_hash:
+            errors.append(
+                f"checkpoint {ref.checkpoint_hash} organizationIdentityHash mismatch with manifest"
+            )
+
+    seen_policy_versions: dict[str, str] = {}
+    for pv in snapshot.policy_versions:
+        prev_hash = seen_policy_versions.get(pv.policy_version)
+        if prev_hash is not None and prev_hash != pv.policy_hash.lower():
+            errors.append(f"conflicting policyHash for policyVersion {pv.policy_version}")
+        seen_policy_versions[pv.policy_version] = pv.policy_hash.lower()
+
+    return errors

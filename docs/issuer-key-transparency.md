@@ -49,14 +49,16 @@ A checkpoint binds:
 
 Clients detect **split views** (diverging heads at the same count), **rollback** (shrinking `eventCount` after a higher head was observed), **stale checkpoints**, **broken rotation links**, **conflicting manifests**, and **compromised keys**.
 
-## Directory import preview
+## Offline issuer trust snapshots
 
-Before applying an incoming event log, manifest update, or checkpoint to local trust state, callers can run `preview_directory_import(current_directory, incoming_events, incoming_manifests=..., incoming_checkpoint=..., previously_seen_checkpoint=...)`:
+For air-gapped or offline verification, `export_offline_trust_snapshot` produces a deterministic canonical JSON snapshot (`protocol: harpocrates-issuer-trust-snapshot`, `version: 1`) containing **only**:
 
-- Replays the proposed delta (or full log after verifying prefix equality) against an isolated clone so `current_directory` is **never mutated** during preview.
-- Reports proposed `KeyLifecycleChange` transitions (previous/proposed status, lifecycle event types, validity windows, and rotation links) and `CheckpointLineage` (before/after event counts, tree head hashes, manifest chain hashes, and checkpoint hashes).
-- Fails closed on rollback, split views, broken event/rotation/manifest links, or checkpoint equivocation (`acceptable=False`, populated `errors`).
-- Only `apply_directory_import(directory, preview)` mutates trust state, and it refuses rejected previews or directories whose state diverged after the preview was generated.
+- `manifests` — public issuer manifests (current and, optionally, historical rotation manifests)
+- `checkpointReferences` — public `CheckpointReference` entries (`checkpointHash`, `treeHeadHash`, `eventCount`, `timestamp`, `organizationIdentityHash`, `manifestHash`, optional `signatureHash`)
+- `policyVersions` — public `PolicyVersion` entries (`policyVersion`, `policyHash`, optional `effectiveFrom`)
+- `exportedAt` — snapshot export timestamp
+
+Evidence-specific private identifiers (such as `evidenceDigestBinding`, `captureNonce`, `deviceCommitment`, `evidenceId`, `sealId`, `proofId`, `nullifier`) and private organization fields are excluded on export and rejected fail-closed by `import_offline_trust_snapshot`. Use `verify_offline_trust_snapshot` to validate manifest references, bounds, and policy-version consistency before trusting an imported snapshot.
 
 ## Caching & freshness (fail-closed)
 
