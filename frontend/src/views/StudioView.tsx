@@ -1,5 +1,5 @@
-import { useMemo, useRef, useState } from 'react'
-import { BadgeCheck, CheckCircle2, Loader2, Upload, XCircle } from 'lucide-react'
+import { useMemo, useRef } from 'react'
+import { BadgeCheck, CheckCircle2, Loader2, RotateCcw, Upload, XCircle } from 'lucide-react'
 import type { UseEvidenceReturn } from '../hooks/useEvidence'
 import { EVIDENCE_REPLACED_MESSAGE, TIERS } from '../hooks/useEvidence'
 import type { UseVerificationReturn } from '../hooks/useVerification'
@@ -41,6 +41,8 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
     setCredentialSeed,
     nullifierSeed,
     setNullifierSeed,
+    evidenceNotes,
+    setEvidenceNotes,
     message,
     proofPreparation,
     acknowledgedSensitiveFields = [],
@@ -54,6 +56,7 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
     isInvalidEvidence = false,
     retryUpload = async () => {},
     handleEvidence,
+    retryEvidence,
     registerProof,
     revalidateNetworkMismatch,
     cancelEvidence,
@@ -364,6 +367,20 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
           </div>
         ) : null}
 
+        {stage === 'error' ? (
+          <div className="verify-actions" role="group" aria-label="Evidence studio error actions">
+            <button
+              type="button"
+              className="hero-secondary retry-action-btn"
+              onClick={() => void retryEvidence()}
+              aria-label="Retry evidence processing"
+            >
+              <RotateCcw size={14} aria-hidden="true" />
+              Retry evidence processing
+            </button>
+          </div>
+        ) : null}
+
         {isCancellable ? (
           <div className="verify-actions" role="group" aria-label="Evidence studio actions">
             <button
@@ -377,6 +394,20 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
             </button>
           </div>
         ) : null}
+
+        <div className="evidence-notes-panel">
+          <label htmlFor="evidence-notes">
+            <span>Evidence Notes</span>
+            <textarea
+              id="evidence-notes"
+              aria-label="Evidence notes"
+              placeholder="Enter notes or context for this evidence…"
+              value={evidenceNotes}
+              onChange={(event) => setEvidenceNotes(event.target.value)}
+              rows={3}
+            />
+          </label>
+        </div>
 
         <dl className="data-list" aria-label="Evidence data">
           <div>
@@ -425,6 +456,12 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
             <dt>Tx Status</dt>
             <dd>{registration?.status ?? 'Not submitted'}</dd>
           </div>
+          {proof?.evidenceNotes ? (
+            <div>
+              <dt>Evidence Notes</dt>
+              <dd>{proof.evidenceNotes}</dd>
+            </div>
+          ) : null}
         </dl>
 
         {selectedTier === 'silent' && proof ? (

@@ -9,7 +9,7 @@
  * docs/proof-worker.md).
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Building2, Fingerprint, KeyRound } from 'lucide-react'
 import type {
   IdentityTier,
@@ -110,6 +110,10 @@ export type UseEvidenceReturn = {
   setCredentialSeed: (v: string) => void
   nullifierSeed: string
   setNullifierSeed: (v: string) => void
+  /** Original user-entered notes associated with this evidence. */
+  evidenceNotes: string
+  /** Update user-entered notes without clobbering by stale server responses. */
+  setEvidenceNotes: (notes: string) => void
   message: string
   /** Read-only preview of the canonical proof inputs and policy version. */
   proofPreparation: ProofPreparationPreviewResult
@@ -127,7 +131,8 @@ export type UseEvidenceReturn = {
   isRejectedUpload: boolean
   isInvalidEvidence: boolean
   handleEvidence: (nextFile: File | null) => Promise<void>
-  retryUpload: () => Promise<void>
+  /** Retry evidence processing tied to the reviewed file identity. */
+  retryEvidence: () => Promise<void>
   registerProof: (wallet: string) => Promise<void>
   /** Re-validate the wallet network and selected evidence intent before allowing registration to resume. */
   revalidateNetworkMismatch: (wallet: string) => Promise<boolean>
@@ -153,7 +158,15 @@ export function useEvidence(): UseEvidenceReturn {
   const [credentialSeed, setCredentialSeed] = useState<string>('')
   const [nullifierSeed, setNullifierSeed] = useState<string>('')
   const [message, setMessage] = useState<string>('Upload evidence to begin.')
-  const [evidenceChangeNotice, setEvidenceChangeNotice] = useState<string | null>(null)
+  const [evidenceNotes, setEvidenceNotesState] = useState<string>('')
+  const evidenceNotesRef = useRef<string>('')
+  const notesEditSeqRef = useRef<number>(0)
+  const reviewedFileRef = useRef<{
+    file: File
+    name: string
+    size: number
+    lastModified: number
+  } | null>(null)
   const [registration, setRegistration] = useState<RegisterProofResult | null>(null)
   const [networkMismatch, setNetworkMismatch] = useState<string | null>(null)
   const [admissionState, setAdmissionState] = useState<UploadAdmissionState | null>(null)
@@ -277,11 +290,48 @@ export function useEvidence(): UseEvidenceReturn {
     proofRequestIdRef.current = null
   }
 
+  const setEvidenceNotes = useCallback((notes: string) => {
+    notesEditSeqRef.current += 1
+    evidenceNotesRef.current = notes
+    setEvidenceNotesState(notes)
+  }, [])
+
   async function handleEvidence(nextFile: File | null) {
     if (!nextFile) return
 
-    setAdmissionState(null)
-    setUploadErrorKind('none')
+    const prevReviewed = reviewedFileRef.current
+    const isSameReviewedFile =
+      prevReviewed !== null &&
+      (prevReviewed.file === nextFile ||
+        (prevReviewed.name === nextFile.name &&
+          prevReviewed.size === nextFile.size &&
+          prevReviewed.lastModified === nextFile.lastModified))
+
+    if (!prevReviewed) {
+      reviewedFileRef.current = {
+        file: nextFile,
+        name: nextFile.name,
+        size: nextFile.size,
+        lastModified: nextFile.lastModified,
+      }
+    } else if (!isSameReviewedFile) {
+      // Selecting a different file resets the reviewed file identity and clears previous notes
+      reviewedFileRef.current = {
+        file: nextFile,
+        name: nextFile.name,
+        size: nextFile.size,
+        lastModified: nextFile.lastModified,
+      }
+      notesEditSeqRef.current += 1
+      evidenceNotesRef.current = ''
+      setEvidenceNotesState('')
+    } else {
+      // Retrying or re-submitting the same reviewed file identity:
+      // keep the updated File instance and preserve user-entered evidence notes
+      reviewedFileRef.current.file = nextFile
+    }
+
+    const editSeqAtStart = notesEditSeqRef.current
 
     evidenceFlowAbortRef.current?.abort()
     const controller = new AbortController()
@@ -385,6 +435,7 @@ export function useEvidence(): UseEvidenceReturn {
         proofId,
         timestamp,
         tier: selectedTier,
+        evidenceNotes: evidenceNotesRef.current || undefined,
       })
       setAdmissionState({
         status: 'admitted',
@@ -429,6 +480,23 @@ export function useEvidence(): UseEvidenceReturn {
         evidenceFlowAbortRef.current = null
       }
     }
+  }
+
+  async function retryEvidence() {
+    const reviewed = reviewedFileRef.current
+    if (!reviewed || !reviewed.file) {
+      return
+    }
+    // Keep the retry action strictly tied to the reviewed file identity
+    if (
+      file &&
+      (file.name !== reviewed.name ||
+        file.size !== reviewed.size ||
+        file.lastModified !== reviewed.lastModified)
+    ) {
+      return
+    }
+    await handleEvidence(reviewed.file)
   }
 
   async function registerProof(wallet: string) {
@@ -776,6 +844,8 @@ export function useEvidence(): UseEvidenceReturn {
     setCredentialSeed,
     nullifierSeed,
     setNullifierSeed,
+    evidenceNotes,
+    setEvidenceNotes,
     message,
     proofPreparation,
     acknowledgedSensitiveFields,
@@ -789,7 +859,7 @@ export function useEvidence(): UseEvidenceReturn {
     isRejectedUpload,
     isInvalidEvidence,
     handleEvidence,
-    retryUpload,
+    retryEvidence,
     registerProof,
     revalidateNetworkMismatch,
     cancelEvidence,
