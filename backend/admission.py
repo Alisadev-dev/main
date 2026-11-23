@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+import contextlib
 import threading
 import time
 import uuid
@@ -60,11 +60,21 @@ class AdmissionController:
         self._lock = threading.Lock()
         self._current_queue = 0
         self._identity_counts: Dict[str, int] = {}
-        self._tickets: Dict[str, AdmissionTicket] = {}
-        self._identity_tickets: Dict[str, List[str]] = {}
+        self._active_sessions: Dict[str, int] = {}
         self._semaphore = threading.Semaphore(max_concurrent)
 
-    def create_ticket(self, identity: str) -> Optional[AdmissionTicket]:
+    def acquire(self, identity: str, session_id: str | None = None) -> Tuple[bool, str]:
+        """
+        Attempt to acquire a concurrency slot.
+        Optionally associates the execution with an upload session ID.
+        Returns (True, "ok") if successful, or (False, reason) if rejected.
+        """
+        success, reason = self._acquire_slot(identity)
+        if success and session_id:
+            self.acquire_session(session_id)
+        return success, reason
+
+    def _acquire_slot(self, identity: str) -> Tuple[bool, str]:
         with self._lock:
             if self._identity_counts.get(identity, 0) >= self.max_per_identity:
                 return None
@@ -156,116 +166,60 @@ class AdmissionController:
                 ticket.state = AdmissionState.CANCELLED
             return True
 
-    def release(self, identity: str) -> None:
-        with self._lock:
-            ticket_ids = list(reversed(self._identity_tickets.get(identity, [])))
-            ticket_id = next(
-                (
-                    candidate
-                    for candidate in ticket_ids
-                    if self._tickets[candidate].state
-                    in (AdmissionState.ACTIVE, AdmissionState.CANCELLING)
-                ),
-                None,
-            )
-        if ticket_id is not None:
-            self.release_ticket(ticket_id)
-
-    def release_ticket(self, ticket_id: str) -> bool:
-        with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None:
-                return False
-            if ticket.state is AdmissionState.QUEUED:
-                self._leave_queue(ticket)
-                self._finish_ticket(ticket, AdmissionState.CANCELLED)
-                return True
-            if ticket.state is AdmissionState.CANCELLED:
-                if ticket.queued:
-                    self._leave_queue(ticket)
-                    self._finish_ticket(ticket, AdmissionState.CANCELLED)
-                    return True
-                return False
-            if ticket.state not in (
-                AdmissionState.ACTIVE,
-                AdmissionState.CANCELLING,
-            ):
-                return False
-            final_state = (
-                AdmissionState.CANCELLED
-                if ticket.state is AdmissionState.CANCELLING
-                else AdmissionState.RELEASED
-            )
-            self._identity_counts[ticket.identity] -= 1
-            if self._identity_counts[ticket.identity] == 0:
-                del self._identity_counts[ticket.identity]
-            self._finish_ticket(ticket, final_state)
-        self._semaphore.release()
-        return True
-
-    def _leave_queue(self, ticket: AdmissionTicket) -> None:
-        if not ticket.queued:
-            return
-        ticket.queued = False
-        self._current_queue -= 1
-        self._identity_counts[ticket.identity] -= 1
-        if self._identity_counts[ticket.identity] == 0:
-            del self._identity_counts[ticket.identity]
-
-    def _finish_ticket(self, ticket: AdmissionTicket, state: AdmissionState) -> None:
-        ticket.state = state
-        self._tickets.pop(ticket.id, None)
-        identity_tickets = self._identity_tickets.get(ticket.identity, [])
-        if ticket.id in identity_tickets:
-            identity_tickets.remove(ticket.id)
-        if not identity_tickets:
-            self._identity_tickets.pop(ticket.identity, None)
-
-    def reserve_storage(self, identity: str, bytes_needed: int) -> Tuple[bool, str]:
+    def release(self, identity: str, session_id: str | None = None) -> None:
         """
-        Reserve temporary upload storage for an identity.
-        
-        Returns (True, "ok") if reservation succeeds, or (False, reason) if budget exceeded.
+        Release a previously acquired concurrency slot.
+        Optionally releases an associated upload session reference.
         """
-        if self.max_temp_storage_per_identity is None:
-            # No budget limit configured
-            return True, "ok"
-        
-        if bytes_needed < 0:
-            return False, "invalid_size"
-        
-        with self._lock:
-            current_reserved = self._reserved_storage.get(identity, 0)
-            if current_reserved + bytes_needed > self.max_temp_storage_per_identity:
-                return False, "storage_budget_exceeded"
-            
-            self._reserved_storage[identity] = current_reserved + bytes_needed
-            return True, "ok"
-
-    def release_storage(self, identity: str, bytes_to_release: int) -> None:
-        """
-        Release previously reserved temporary upload storage for an identity.
-        """
-        if self.max_temp_storage_per_identity is None:
-            return
-        
-        if bytes_to_release < 0:
-            return
-        
-        with self._lock:
-            current_reserved = self._reserved_storage.get(identity, 0)
-            new_reserved = max(0, current_reserved - bytes_to_release)
-            if new_reserved == 0:
-                self._reserved_storage.pop(identity, None)
-            else:
-                self._reserved_storage[identity] = new_reserved
-
-    def get_reserved_storage(self, identity: str) -> int:
-        """
-        Get the currently reserved storage for an identity.
-        """
+        if session_id:
+            self.release_session(session_id)
         with self._lock:
             return self._reserved_storage.get(identity, 0)
+
+    def acquire_session(self, session_id: str) -> None:
+        """Register an active worker reference to an upload session.
+
+        While an upload session is referenced by one or more active workers,
+        its chunks are protected from retention cleanup or expiration purges.
+        """
+        if not session_id:
+            return
+        with self._lock:
+            self._active_sessions[session_id] = (
+                self._active_sessions.get(session_id, 0) + 1
+            )
+
+    def release_session(self, session_id: str) -> None:
+        """Release an active worker reference to an upload session."""
+        if not session_id:
+            return
+        with self._lock:
+            count = self._active_sessions.get(session_id, 0) - 1
+            if count <= 0:
+                self._active_sessions.pop(session_id, None)
+            else:
+                self._active_sessions[session_id] = count
+
+    def is_session_active(self, session_id: str) -> bool:
+        """Return whether an upload session is currently referenced by active workers."""
+        if not session_id:
+            return False
+        with self._lock:
+            return self._active_sessions.get(session_id, 0) > 0
+
+    def get_active_sessions(self) -> set[str]:
+        """Return a snapshot set of upload session IDs referenced by active workers."""
+        with self._lock:
+            return set(self._active_sessions.keys())
+
+    @contextlib.contextmanager
+    def active_session(self, session_id: str):
+        """Context manager to hold an active worker session reference."""
+        self.acquire_session(session_id)
+        try:
+            yield
+        finally:
+            self.release_session(session_id)
 
 
 def _get_client_identity() -> str:
@@ -280,15 +234,21 @@ def require_capacity(controller: AdmissionController):
     """
     Flask decorator to enforce admission control on a route.
     Returns 429 or 503 with a Retry-After header on rejection.
+    If the decorated route processes an upload session (session_id in kwargs or
+    view_args), marks the session as active while processing so retention
+    sweeps avoid deleting chunks referenced by active workers.
     """
 
     def decorator(f):
         @wraps(f)
         def wrapped(*args, **kwargs):
             identity = _get_client_identity()
-            acquired, reason, ticket = controller.acquire_ticket(identity)
-            g.admission_ticket = ticket
+            session_id = kwargs.get("session_id")
+            if not session_id and hasattr(request, "view_args") and request.view_args:
+                session_id = request.view_args.get("session_id")
 
+            acquired, reason = controller.acquire(identity, session_id=session_id)
+            
             if not acquired:
                 from metrics import collector as metrics_collector
 
@@ -307,10 +267,7 @@ def require_capacity(controller: AdmissionController):
             try:
                 return f(*args, **kwargs)
             finally:
-                if ticket is not None:
-                    controller.release_ticket(ticket.id)
-                else:
-                    controller.release(identity)
+                controller.release(identity, session_id=session_id)
         return wrapped
     return decorator
 

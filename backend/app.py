@@ -117,13 +117,8 @@ from metadata_errors import (
     metadata_error_response,
 )
 from schema import discover_schemas, resolve_schema, validate_selective_disclosure_input
-from verification_receipt import build_verification_receipt, signing_key_history
-from stego import canonical_metadata_hash, embed_metadata, extract_metadata, sha256_file
-try:
-    from stego import StegoLimitExceededError
-except (ImportError, AttributeError):
-    class StegoLimitExceededError(RuntimeError):  # type: ignore[no-redef]
-        pass
+from verification_receipt import build_verification_receipt
+from stego import canonical_metadata_hash, embed_metadata, extract_metadata, sha256_file, StegoLimitExceededError
 from capture_attestation import (
     build_assurance_schema,
     canonical_attestation_hash,
@@ -140,6 +135,7 @@ from c2pa import (
 )
 from logging_utils import log_structured, redact_sensitive
 from errors import (
+    GONE,
     INTERNAL_ERROR,
     NOT_FOUND,
     PAYLOAD_TOO_LARGE,
@@ -179,8 +175,11 @@ from streaming_upload import (
     UploadSessionRegistry,
     UploadState,
     create_streaming_file_storage,
+    get_session_dir,
     hash_paths_concat,
-    resolve_temp_dir,
+    init_session_dir,
+    is_session_expired,
+    touch_session,
 )
 from werkzeug.datastructures import ImmutableMultiDict
 
@@ -1050,63 +1049,40 @@ def create_app() -> Flask:
     @limiter.limit(config.ratelimit_upload_session)
     def create_upload_session():
         session_id = str(uuid.uuid4())
-        session_dir = Path(tempfile.gettempdir()) / f"harpocrates-session-{session_id}"
-        session_dir.mkdir(parents=True, exist_ok=True)
-        session = upload_session_registry.create(session_id, session_dir)
-        ticket = admission_controller.create_ticket(session_id)
-        session.attach_queued_admission(ticket.id if ticket is not None else None)
+        init_session_dir(session_id, temp_dir=getattr(config, "upload_temp_dir", None))
         return jsonify({"sessionId": session_id})
 
     @app.put("/api/stego/upload-session/<session_id>/chunk/<int:chunk_index>")
     @limiter.limit(config.ratelimit_upload_chunk)
     @require_capacity(admission_controller)
     def upload_chunk(session_id: str, chunk_index: int):
-        session = upload_session_registry.get(session_id)
-        if session is None:
-            return jsonify({"error": "session not found"}), 404
-        session_dir = session.session_dir
+        session_dir = get_session_dir(session_id, temp_dir=getattr(config, "upload_temp_dir", None))
         if not session_dir.exists():
             return jsonify({"error": "session not found"}), 404
-
+        if is_session_expired(session_dir, ttl_seconds=config.upload_session_ttl_seconds):
+            return error_response(
+                code=GONE,
+                message="upload session has expired",
+                status=410,
+            )
+        
         chunk = request.files.get("chunk")
         if chunk is None:
             return jsonify({"error": "chunk is required"}), 400
         if chunk_index < 0:
             return jsonify({"error": "chunk_index must be non-negative"}), 400
 
-        admission_ticket = getattr(g, "admission_ticket", None)
-        if admission_ticket is not None:
-            session.attach_admission(admission_ticket.id)
-
-        g.upload_config = config
-        streaming_chunk = create_streaming_file_storage(chunk, cancellation=session)
-        chunk_path = session_dir / f"chunk-{chunk_index}"
-        try:
-            with session.writer():
-                streaming_chunk.save(str(chunk_path))
-        except UploadCancelledError as exc:
-            return jsonify({"error": str(exc), "code": exc.code}), exc.status_code
-        except RequestEntityTooLarge:
-            return jsonify({"error": "chunk exceeds size limit"}), 413
-
-        # Update total uploaded bytes if tracking
-        if metadata_path.exists():
+        # Persist each session chunk with bounded-chunk hashing for integrity.
+        # Hold an active worker reference so retention sweeps avoid deleting active chunks.
+        with admission_controller.active_session(session_id):
+            g.upload_config = config
+            streaming_chunk = create_streaming_file_storage(chunk)
+            chunk_path = session_dir / f"chunk-{chunk_index}"
             try:
-                with metadata_path.open("r") as f:
-                    session_meta = json.load(f)
-                session_meta["total_uploaded"] = session_meta.get("total_uploaded", 0) + streaming_chunk.bytes_written
-                # Check if total exceeds declared size
-                declared = session_meta.get("declared_size")
-                if declared is not None and session_meta["total_uploaded"] > declared:
-                    return jsonify({
-                        "error": "total uploaded bytes exceeds declared size",
-                        "declared": declared,
-                        "uploaded": session_meta["total_uploaded"]
-                    }), 400
-                with metadata_path.open("w") as f:
-                    json.dump(session_meta, f)
-            except (json.JSONDecodeError, OSError):
-                pass  # Non-critical
+                streaming_chunk.save(str(chunk_path))
+            except RequestEntityTooLarge:
+                return jsonify({"error": "chunk exceeds size limit"}), 413
+            touch_session(session_dir)
 
         return jsonify({
             "ok": True,
@@ -1133,23 +1109,15 @@ def create_app() -> Flask:
     @app.post("/api/stego/upload-session/<session_id>/commit")
     @limiter.limit(config.ratelimit_upload_session)
     def commit_upload_session(session_id: str):
-        session = upload_session_registry.get(session_id)
-        if session is None:
-            return jsonify({"error": "session not found"}), 404
-        session_dir = session.session_dir
+        session_dir = get_session_dir(session_id, temp_dir=getattr(config, "upload_temp_dir", None))
         if not session_dir.exists():
             return jsonify({"error": "session not found"}), 404
-        except UploadSessionError as exc:
-            return error_response(code=exc.code, message=str(exc), status=exc.status_code)
-
-        admission_ticket = getattr(g, "admission_ticket", None)
-        if admission_ticket is not None:
-            session.attach_admission(admission_ticket.id)
-        session.mark_committing()
-        try:
-            session.check_cancelled()
-        except UploadCancelledError as exc:
-            return jsonify({"error": str(exc), "code": exc.code}), exc.status_code
+        if is_session_expired(session_dir, ttl_seconds=config.upload_session_ttl_seconds):
+            return error_response(
+                code=GONE,
+                message="upload session has expired",
+                status=410,
+            )
 
         metadata_raw = request.form.get("metadata")
         if metadata_raw is None:
