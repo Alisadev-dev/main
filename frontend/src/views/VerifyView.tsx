@@ -1,6 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { CheckCircle2, FileText, Loader2, RefreshCw, Upload, WifiOff, XCircle } from 'lucide-react'
+import {
+  CheckCircle2,
+  FileText,
+  Info,
+  Loader2,
+  RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
+  ShieldQuestion,
+  Upload,
+  WifiOff,
+  XCircle,
+} from 'lucide-react'
 import type { UseVerificationReturn } from '../hooks/useVerification'
+import { useIssuerTrust } from '../hooks/useIssuerTrust'
+import { explainVerificationTrust } from '../services/verificationFlow'
 import { ChainProofPanel } from '../components/ChainProofPanel'
 import { DisputePanel } from '../components/DisputePanel'
 import { EventList } from '../components/EventList'
@@ -656,6 +670,7 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
                 chainProof={chainProof}
                 proofId={revocationProofId}
                 sourceAddress={wallet || undefined}
+                issuerTrust={issuerTrust}
               />
               <DisputePanel
                 proofId={revocationProofId}

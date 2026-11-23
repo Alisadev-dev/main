@@ -1,5 +1,6 @@
 /**
- * verificationFlow — orchestrates the verification portal flow.
+ * verificationFlow — orchestrates the verification portal flow and maps
+ * stable trust reason codes to accessible, privacy-safe copy.
  *
  * Responsibility: combine the Flask extraction, NeonDB lookup, and the
  * Soroban on-chain registry into a single structured result with independent
@@ -10,6 +11,11 @@
 
 import type { ChainProofRecord, IssuerRecord } from '../stellarTypes'
 import type { ProofEvent } from '../types'
+import type { VerificationErrorCode, VerificationStatus } from '../hooks/useVerification'
+import {
+  isLookupEligibleIssuer,
+  type IssuerTrustState,
+} from '../provenance/issuerTrust'
 import { assertValidVideoHash } from './videoHash'
 import {
   extractMetadata,
