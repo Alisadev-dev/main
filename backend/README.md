@@ -428,33 +428,14 @@ changes: it orphans every previously cached entry instead of silently reusing
 results derived under a different scheme. Keys are digests only — proof
 material is never stored in plaintext or logged.
 
-## Verified Indexer Checkpoint Manifest
+## Proof Identifier Normalization
 
-The Soroban event indexer (`chain_indexer.py`) binds each persisted checkpoint
-to a canonical, SHA-256-verified manifest (`IndexerCheckpointManifest`) that
-records:
+`tx_verification.normalize_proof_id` and `chain_indexer` validate and normalize
+on-chain proof identifiers before inserting them into read views:
 
-- `manifest_version` (`1`)
-- `indexer_id` (default `soroban_events`)
-- `network` (canonical Stellar network, e.g. `testnet`, `mainnet`, `futurenet`, `standalone`)
-- `contract_id` (registry contract ID)
-- `schema_version` (projection schema version, default `"1"`)
-- `cursor` (Soroban RPC paging cursor)
-- `observed_ledger` (non-negative observed ledger sequence)
-- `manifest_hash` (domain-separated SHA-256 digest of the canonical JSON payload)
-
-On resume, `poll_indexer_once()` verifies the manifest digest and checks
-compatibility against the active `network`, `contract_id`, `schema_version`,
-and `observed_ledger` monotonicity before fetching events or mutating
-`proof_events`. Any tampered manifest, target mismatch, or ledger regression
-fails closed with `CheckpointVerificationError` or `IncompatibleCheckpointError`
-without mutating the trusted projection.
-
-Optional environment variables:
-
-- `STELLAR_NETWORK` / `HARPOCRATES_NETWORK`: Explicit network name bound to the checkpoint (inferred from `SOROBAN_RPC_URL` if unset).
-- `INDEXER_SCHEMA_VERSION`: Projection schema version bound to the checkpoint (default `"1"`).
-- `INDEXER_CHECKPOINT_MANIFEST_PATH`: Optional file path for atomic on-disk checkpoint manifest persistence.
+- **Exact Decimal IDs**: Non-negative integers and digit strings (including large 64-bit, 128-bit, and 256-bit values exceeding standard IEEE-754 precision) are preserved as exact decimal strings across JSON and database boundaries without floating-point precision loss.
+- **Hexadecimal Identifiers**: Standard 32-byte hex strings (with or without `0x`/`0X` prefix) and raw 32-byte values are normalized to 64 lowercase hexadecimal characters.
+- **Fail-Closed Unsafe Coercion Rejection**: Floating-point numbers, fractional notation (e.g. `123.45`, `1.0`), exponent/scientific notation (e.g. `1e10`, `1.5e3`), booleans (`True`/`False`), negative values, and malformed strings are strictly rejected with `ValueError`. In the chain indexer event loop, events with malformed or coerced proof IDs are rejected fail-closed and tracked under the skipped/unknown topic metrics without corrupting the read view.
 
 ## Test
 
